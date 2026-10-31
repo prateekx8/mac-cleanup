@@ -67,8 +67,12 @@ await maybe("cleaned", () => scrollTo(".stats", LONG ? 330 : 150));
 await page.click("#checkAll");
 await page.waitForSelector("#sec .f", { timeout: 15000 });
 await page.waitForSelector("#net .f", { timeout: 15000 });
+await page.waitForSelector("#apps .f", { timeout: 20000 });
+await page.waitForSelector("#traffic .tr:not(.h)", { timeout: 20000 });
 await maybe("security", () => scrollTo(panel(2), 90));
 await maybe("network", () => scrollTo(panel(3), 90));
+await maybe("apps", () => scrollTo(panel(4), 90));
+await maybe("traffic", () => scrollTo(panel(5), 90));
 await maybe("watcher", async () => {
   await page.click(".switch span");
   await page.waitForSelector("#toast.show");

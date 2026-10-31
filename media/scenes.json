@@ -11,6 +11,8 @@
     {"shot": "cleaned",  "say": "Twenty five gigabytes back, in seconds. The free space ring updates right away."},
     {"shot": "security", "say": "Next, security. One click audits your firewall, disk encryption, sharing services, startup items, and even private keys left lying in Downloads."},
     {"shot": "network",  "say": "The network check lists every service open to your network, with the program behind it, and flags risky ones like an exposed Redis, or Screen Sharing."},
+    {"shot": "apps",     "say": "The Applications check looks at every installed app. It catches broken code signatures, end of life software, remote access tools, and anything Homebrew says is out of date."},
+    {"shot": "traffic",  "say": "Live traffic measures who is sending data right now. Here, an unsigned program hidden in a cache folder is uploading four megabytes a second. Exactly what you want to catch."},
     {"shot": "watcher",  "say": "Want ongoing protection? Turn on the background watcher. It alerts you when something new opens a port, or your router or DNS changes. It's off by default."},
     {"shot": "light",    "say": "It follows your system theme, and looks just as good in light mode."},
     {"shot": "cli",      "say": "Prefer the terminal? Everything is also a command, with dry runs by default."},
@@ -24,7 +26,8 @@
     {"shot": "results",  "say": "Safe caches are pre-selected. Anything risky waits for you."},
     {"shot": "cleaned",  "say": "Clean, and twenty five gigabytes are back."},
     {"shot": "security", "say": "It audits your security too,"},
-    {"shot": "network",  "say": "and shows what's exposed on your network."},
+    {"shot": "network",  "say": "shows what's exposed on your network,"},
+    {"shot": "traffic",  "say": "and catches apps secretly uploading your data."},
     {"shot": "outro",    "say": "Mac Cleanup. Local, private, free."}
   ]
 }

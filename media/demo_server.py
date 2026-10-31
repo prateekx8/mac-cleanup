@@ -72,6 +72,39 @@ SNAP = dict(listeners=[L(5000, "ControlCenter"), L(7000, "ControlCenter"), L(590
             conns=[], arp=[], gateway="192.168.1.1", iface="en0", gateway_mac="a4:2b:b0:12:34:56",
             dns=["1.1.1.1", "9.9.9.9"], hosts=[], time=0)
 
+APP_FINDINGS = [
+    ("high", "App signature broken (modified after signing)", "PhotoTool 3.2 - /Applications/PhotoTool.app"),
+    ("high", "End-of-life software - no security updates any more", "Adobe Flash Player 32.0"),
+    ("medium", "Remote-access tool - a common attack vector; remove it if you don't use it", "AnyDesk 8.1"),
+    ("medium", "Outdated app (Homebrew cask)", "zoom 6.0.2 -> 6.4.1  (brew upgrade --cask zoom)"),
+    ("medium", "Outdated app (Homebrew cask)", "visual-studio-code 1.89.1 -> 1.97.2  (brew upgrade --cask visual-studio-code)"),
+    ("medium", "Orphaned root helper (its app is gone, it still runs as root if loaded)", "/Library/PrivilegedHelperTools/com.oldvpn.helper"),
+    ("low", "Intel-only app (likely unmaintained; needs Rosetta)", "Legacy Utility 1.4"),
+    ("low", "42 outdated Homebrew packages", "openssl@3, curl, git, node, python@3.12, sqlite ...  (brew upgrade)"),
+    ("info", "Network extension can see all traffic", "WireGuard (ABCDE12345) 1.0.16"),
+]
+K = 1024
+
+
+def P(proc, pid, rx, tx, hosts, ports, exe):
+    return dict(proc=proc, pid=pid, exe=exe, rx=rx * 6, tx=tx * 6, rx_rate=rx, tx_rate=tx, hosts=set(f"203.0.113.{i}" for i in range(hosts)),
+                ports=set(ports), syn=0, port_hosts={}, new=0)
+
+
+TRAFFIC = [
+    P("updater", 4821, 9 * K, int(4.2 * K * K), 1, [443], "~/Library/Application Support/.cache/updater"),
+    P("Google Chrome", 611, int(3.1 * K * K), 84 * K, 14, [443], "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    P("Dropbox", 733, 40 * K, 610 * K, 3, [443], "/Applications/Dropbox.app/Contents/MacOS/Dropbox"),
+    P("Slack", 902, 120 * K, 22 * K, 4, [443], "/Applications/Slack.app/Contents/MacOS/Slack"),
+    P("node", 2210, 18 * K, 9 * K, 1, [8888], "/opt/homebrew/bin/node"),
+    P("Spotify", 812, 310 * K, 6 * K, 2, [443, 4070], "/Applications/Spotify.app/Contents/MacOS/Spotify"),
+]
+TRAFFIC_FINDINGS = [
+    ("high", "Heavy upload (possible data exfiltration)", "updater (pid 4821) sent 25.2M in 6s (4.2M/s) to 203.0.113.0"),
+    ("medium", "Unsigned program is using the internet", "updater (pid 4821) ~/Library/Application Support/.cache/updater"),
+    ("low", "Traffic on uncommon ports", "node (pid 2210) -> ports 8888"),
+]
+
 settings = dict(mg.DEFAULT_SETTINGS)
 
 
@@ -107,6 +140,9 @@ def main():
     mg.disk_info = fake_disk
     mg.cmd_security = lambda *a, **k: list(SECURITY)
     mg.net_snapshot = lambda: SNAP
+    mg.apps_report = lambda online=False: (time.sleep(2.2), ([None] * 64, list(APP_FINDINGS)))[1]
+    mg.traffic_sample = lambda seconds=6: (time.sleep(2.0), [dict(p) for p in TRAFFIC])[1]
+    mg.analyze_traffic = lambda procs, seconds: list(TRAFFIC_FINDINGS)
     mg.signature = lambda path: "apple" if "redis" not in path else "developer:Redis Ltd"
     mg.load_settings = lambda: dict(settings)
     mg.save_settings = lambda s: settings.update(s)

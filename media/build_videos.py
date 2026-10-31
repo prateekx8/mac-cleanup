@@ -3,9 +3,10 @@
 
   /usr/bin/python3 media/build_videos.py            (after capture; see make_videos.sh)
 
-Needs ffmpeg/ffprobe and macOS `say`. Voice: MC_VOICE env (default "Samantha"),
-rate: MC_RATE (default 182 wpm). All audio is generated locally (TTS + synthesized pad),
-so there is no third-party music or licensing to worry about.
+Narration engine: MC_TTS=kokoro (default when media/models exist; natural neural voice,
+Kokoro-82M, Apache-2.0, offline) or MC_TTS=say (macOS voice MC_VOICE, rate MC_RATE; Apple's
+voices are licensed for personal, non-commercial use only). Kokoro voice: MC_KOKORO_VOICE
+(default af_heart). All audio is generated locally (TTS + synthesized pad).
 """
 import json
 import os
@@ -16,6 +17,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out")
 DIST = os.path.join(os.path.dirname(HERE), "dist", "videos")
 VOICE = os.environ.get("MC_VOICE", "Samantha")
+KOKORO_READY = os.path.exists(os.path.join(HERE, "models", "kokoro-v1.0.onnx")) and os.path.exists(os.path.join(HERE, ".venv"))
+TTS = os.environ.get("MC_TTS", "kokoro" if KOKORO_READY else "say")
+KOKORO_VOICE = os.environ.get("MC_KOKORO_VOICE", "af_heart")
 RATE = os.environ.get("MC_RATE", "182")
 FPS = 30
 FORMATS = {
@@ -40,6 +44,26 @@ def ts(t, srt=False):
     return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",") if srt else (f"{m}:{int(s):02d}" if not h else f"{h}:{m:02d}:{int(s):02d}")
 
 
+def synthesize(scenes, work):
+    """Narration file per scene, with the configured engine."""
+    if TTS == "kokoro":
+        jobs = [dict(text=sc["say"], out=os.path.join(work, f"{i:02d}.wav")) for i, sc in enumerate(scenes)]
+        jf = os.path.join(work, "tts.json")
+        with open(jf, "w") as fh:
+            json.dump(jobs, fh)
+        r = subprocess.run([os.path.join(HERE, ".venv", "bin", "python"), os.path.join(HERE, "tts_kokoro.py"), jf],
+                           env=dict(os.environ, MC_KOKORO_VOICE=KOKORO_VOICE), capture_output=True, text=True)
+        if r.returncode:
+            sys.exit("kokoro failed:\n" + r.stderr[-2000:])
+        return [j["out"] for j in jobs]
+    out = []
+    for i, sc in enumerate(scenes):
+        aiff = os.path.join(work, f"{i:02d}.aiff")
+        sh("say", "-v", VOICE, "-r", RATE, "-o", aiff, sc["say"])
+        out.append(aiff)
+    return out
+
+
 def build(fmt):
     cfg = FORMATS[fmt]
     scenes = json.load(open(os.path.join(HERE, "scenes.json")))[fmt]
@@ -47,9 +71,9 @@ def build(fmt):
     os.makedirs(work, exist_ok=True)
     W, H = cfg["w"], cfg["h"]
     clips, timeline, t = [], [], 0.0
+    speech = synthesize(scenes, work)
     for i, sc in enumerate(scenes):
-        aiff = os.path.join(work, f"{i:02d}.aiff")
-        sh("say", "-v", VOICE, "-r", RATE, "-o", aiff, sc["say"])
+        aiff = speech[i]
         d = duration(aiff) + 0.25 + cfg["pad"]
         img = os.path.join(OUT, fmt, "shots", sc["shot"] + ".png")
         cap = os.path.join(OUT, fmt, "captions", f"{i:02d}.png")
@@ -84,7 +108,7 @@ def build(fmt):
     sh("ffmpeg", "-y", "-loglevel", "error", "-i", voice, "-f", "lavfi", "-t", f"{total:.3f}", "-i", pad,
        "-filter_complex",
        f"[1:a]lowpass=f=900,volume=0.35,afade=t=in:d=2,afade=t=out:st={total - 2.5:.3f}:d=2.5[m];"
-       f"[0:a][m]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]",
+       f"[0:a][m]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a]",
        "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", final)
 
     # subtitles for upload
@@ -102,7 +126,7 @@ def main():
 
     chapters_map = {"title": "Intro", "problem": "The problem", "hero": "Tour", "scanning": "Scan your Mac",
                     "results": "Safe vs review", "cleaning": "Clean", "security": "Security audit",
-                    "network": "Network check", "watcher": "Background watcher", "cli": "CLI",
+                    "network": "Network check", "apps": "Vulnerable apps", "traffic": "Unusual traffic", "watcher": "Background watcher", "cli": "CLI",
                     "app": "Install", "privacy": "Privacy", "outro": "Wrap up"}
     chapters = [f"{ts(a)} {chapters_map[sc['shot']]}" for a, _, sc in long_tl if sc["shot"] in chapters_map]
     chapters[0] = "0:00 Intro"
@@ -120,6 +144,8 @@ What it does:
 - One-click scan. Safe caches are pre-selected, and risky items wait for you
 - Security audit: firewall, FileVault, SIP, Gatekeeper, sharing services, startup items, stray private keys
 - Network check: every open port and the program behind it, exposed services, port scans, ARP spoofing
+- Applications: broken signatures, end-of-life and remote-access software, outdated apps (Homebrew), orphaned root helpers
+- Live traffic: who is uploading right now, outbound scanning, unsigned programs online, odd ports
 - Optional background watcher: alerts on new open ports or router/DNS changes
 - Native Mac app, glass web UI, and a `macguard` CLI
 
@@ -142,7 +168,7 @@ Chapters:
 **Captions:** {os.path.basename(short_path).replace('.mp4', '.srt')}
 
 ---
-Narration: macOS "{VOICE}" voice (on-device). Music: synthesized pad generated by the build script. All UI footage uses demo data, so no real files, paths or network details appear.
+Narration: {("Kokoro-82M neural TTS, voice " + KOKORO_VOICE + " (Apache-2.0, generated offline)") if TTS == "kokoro" else ("macOS " + VOICE + " voice (on-device; Apple licenses system voices for personal, non-commercial use)")}. Music: synthesized pad generated by the build script. All UI footage uses demo data, so no real files, paths or network details appear.
 """
     with open(os.path.join(DIST, "UPLOAD_KIT.md"), "w") as fh:
         fh.write(md)
