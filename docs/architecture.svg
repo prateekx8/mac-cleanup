@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 640" font-family="JetBrains Mono, Menlo, monospace" role="img" aria-labelledby="t d">
+  <title id="t">mac-cleanup architecture</title>
+  <desc id="d">Entry points (CLI, web UI, setup, opt-in launchd agent) call one Python module, macguard.py. The module holds the cleanup, network, security, watch, settings, doctor and report engines. They call read-only macOS tools and write state to ~/.macguard.</desc>
+  <style>
+    .bg{fill:#f2f0eb}.line{stroke:#d6d2c9;stroke-width:1;fill:none}.ink{fill:#141414}.mute{fill:#8b877f}.mid{fill:#55524c}
+    .box{fill:#f2f0eb;stroke:#141414;stroke-width:1}.soft{fill:#e9e6df;stroke:#d6d2c9;stroke-width:1}
+    .lab{font-size:10px;letter-spacing:1.2px;text-transform:uppercase}.h{font:800 15px Archivo,Helvetica,Arial,sans-serif}
+    .s{font-size:11px}.arrow{stroke:#141414;stroke-width:1.2;fill:none;marker-end:url(#a)}.dash{stroke-dasharray:4 4}
+    @media (prefers-color-scheme:dark){.bg,.box{fill:#121212}.box{stroke:#ecebe6}.soft{fill:#1b1b1a;stroke:#2c2b29}.line{stroke:#2c2b29}
+      .ink{fill:#ecebe6}.mid{fill:#a9a69f}.mute{fill:#6f6c66}.arrow{stroke:#ecebe6}#a path{fill:#ecebe6}}
+  </style>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="#141414"/></marker></defs>
+  <rect class="bg" width="1060" height="640"/>
+
+  <!-- column labels -->
+  <text class="lab mute" x="30" y="34">01 / Entry points</text>
+  <text class="lab mute" x="300" y="34">02 / macguard.py (single module, stdlib only)</text>
+  <text class="lab mute" x="770" y="34">03 / macOS (read-only tools)</text>
+  <line class="line" x1="0" y1="48" x2="1060" y2="48"/>
+  <line class="line" x1="270" y1="0" x2="270" y2="560"/>
+  <line class="line" x1="740" y1="0" x2="740" y2="560"/>
+
+  <!-- entry points -->
+  <rect class="box" x="30" y="72" width="210" height="64"/>
+  <text class="h ink" x="44" y="98">CLI</text><text class="s mid" x="44" y="118">macguard scan|clean|net|…</text>
+  <rect class="box" x="30" y="156" width="210" height="80"/>
+  <text class="h ink" x="44" y="182">Web UI</text><text class="s mid" x="44" y="202">ui.html ⇄ 127.0.0.1:8787</text><text class="s mid" x="44" y="220">per-launch token + Host check</text>
+  <rect class="box" x="30" y="256" width="210" height="64"/>
+  <text class="h ink" x="44" y="282">Mac Cleanup.app</text><text class="s mid" x="44" y="302">WKWebView → launchd job</text>
+  <rect class="box dash" x="30" y="340" width="210" height="64"/>
+  <text class="h ink" x="44" y="366">Watcher agent</text><text class="s mid" x="44" y="386">opt-in · watch --agent</text>
+
+  <!-- engines -->
+  <g>
+    <rect class="soft" x="300" y="72" width="200" height="96"/>
+    <text class="h ink" x="314" y="98">Cleanup</text>
+    <text class="s mid" x="314" y="118">JUNK registry → resolve()</text><text class="s mid" x="314" y="136">scan_junk → clean_item</text><text class="s mid" x="314" y="154">safe vs review · HOME guard</text>
+
+    <rect class="soft" x="510" y="72" width="200" height="96"/>
+    <text class="h ink" x="524" y="98">Network</text>
+    <text class="s mid" x="524" y="118">sockets · arp · dns</text><text class="s mid" x="524" y="136">net_snapshot → analyze_net</text><text class="s mid" x="524" y="154">ports · scans · spoofing</text>
+
+    <rect class="soft" x="300" y="184" width="200" height="80"/>
+    <text class="h ink" x="314" y="210">Security</text>
+    <text class="s mid" x="314" y="230">firewall · SIP · FileVault</text><text class="s mid" x="314" y="248">launch items · stray keys</text>
+
+    <rect class="soft" x="510" y="184" width="200" height="80"/>
+    <text class="h ink" x="524" y="210">Watch</text>
+    <text class="s mid" x="524" y="230">fingerprint ⇄ baseline</text><text class="s mid" x="524" y="248">diff → log + notify</text>
+
+    <rect class="soft" x="300" y="280" width="130" height="64"/>
+    <text class="h ink" x="314" y="306">Settings</text><text class="s mid" x="314" y="326">watcher on/off</text>
+    <rect class="soft" x="440" y="280" width="130" height="64"/>
+    <text class="h ink" x="454" y="306">Doctor</text><text class="s mid" x="454" y="326">prereqs · bundle</text>
+    <rect class="soft" x="580" y="280" width="130" height="64"/>
+    <text class="h ink" x="594" y="306">Report</text><text class="s mid" x="594" y="326">HTML dashboard</text>
+
+    <rect class="box" x="300" y="364" width="410" height="40"/>
+    <text class="s ink" x="314" y="389">run() · du() · signature() (codesign cache) · exe_path()</text>
+  </g>
+
+  <!-- macOS tools -->
+  <rect class="box" x="770" y="72" width="262" height="64"/><text class="h ink" x="784" y="98">Disk</text><text class="s mid" x="784" y="118">du · df · xcrun simctl</text>
+  <rect class="box" x="770" y="152" width="262" height="64"/><text class="h ink" x="784" y="178">Network</text><text class="s mid" x="784" y="198">netstat -anv · arp · route · scutil</text>
+  <rect class="box" x="770" y="232" width="262" height="64"/><text class="h ink" x="784" y="258">Trust</text><text class="s mid" x="784" y="278">codesign · plutil · csrutil · spctl</text>
+  <rect class="box" x="770" y="312" width="262" height="64"/><text class="h ink" x="784" y="338">Services</text><text class="s mid" x="784" y="358">launchctl · osascript · fdesetup</text>
+  <rect class="box dash" x="770" y="392" width="262" height="48"/><text class="s mid" x="784" y="421">optional: docker · brew · npm</text>
+
+  <!-- arrows: entry -> engines -->
+  <path class="arrow" d="M240 104 H292"/>
+  <path class="arrow" d="M240 196 H292"/>
+  <path class="arrow" d="M240 288 H292"/>
+  <path class="arrow dash" d="M240 372 H270 V420 H610 V272"/>
+  <!-- engines -> helpers -> tools -->
+  <path class="arrow" d="M710 384 H740 V250 H762"/>
+
+  <!-- state -->
+  <line class="line" x1="0" y1="560" x2="1060" y2="560"/>
+  <text class="lab mute" x="30" y="590">04 / State · ~/.macguard</text>
+  <text class="s ink" x="300" y="590">settings.json   baseline.json   events.log   report.html   support-*.txt</text>
+  <path class="arrow" d="M505 404 V572" opacity=".6"/>
+  <text class="s mute" x="300" y="620">Nothing leaves the machine. Deletes only with --apply / UI confirm, and only inside $HOME.</text>
+</svg>

@@ -8,11 +8,15 @@ Commands:
   security             Security posture audit (firewall, SIP, launch agents, ...)
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
+  ui                   Small local web UI: scan, pick categories, clean, run checks
+  doctor               Check prerequisites; --bundle writes a support file
   settings             Show/change settings; `settings background_watcher on` runs
                        `watch` in the background at login (off by default)
 
 Stdlib only. Nothing is deleted without `clean --apply` and a confirmation.
 """
+__version__ = "1.0.0"
+
 import argparse
 import datetime as dt
 import glob
@@ -206,18 +210,18 @@ def resolve(item, stale_days=30):
         n = docker_reclaimable()
         return [("docker system prune", n, "docker images/containers/build cache")] if n else []
     elif sp == "jetbrains":
-        paths = old_versions(f"{H}/Library/Application Support/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
-            old_versions(f"{H}/Library/Caches/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
-            old_versions(f"{H}/Library/Logs/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+")
+        paths = old_versions(f"{HOME}/Library/Application Support/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
+            old_versions(f"{HOME}/Library/Caches/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
+            old_versions(f"{HOME}/Library/Logs/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+")
     elif sp == "ndk":
-        paths = old_versions(f"{H}/Library/Android/sdk/ndk/*", r"(\d+)\.")  # keep newest per major
+        paths = old_versions(f"{HOME}/Library/Android/sdk/ndk/*", r"(\d+)\.")  # keep newest per major
     elif sp == "projects":
         return [(a["path"], a["size"], f"last edited {a['last_touched']}")
                 for a in find_project_artifacts(stale_days) if a["stale"] and a["size"] > 1 << 20]
     elif sp == "downloads":
         cutoff = time.time() - 90 * 86400
         out = []
-        for p in glob.glob(f"{H}/Downloads/*"):
+        for p in glob.glob(f"{HOME}/Downloads/*"):
             try:
                 if os.lstat(p).st_mtime < cutoff:
                     out.append((p, du(p), ""))
@@ -262,7 +266,7 @@ def scan_junk(stale_days=30, verbose=False):
 
 
 def big_dirs():
-    cands = [f"{H}/Library/Application Support/*", f"{H}/Library/Containers/*", f"{H}/Library/Group Containers/*", f"{H}/.[!.]*"]
+    cands = [f"{HOME}/Library/Application Support/*", f"{HOME}/Library/Containers/*", f"{HOME}/Library/Group Containers/*", f"{HOME}/.[!.]*"]
     sizes = []
     for pat in cands:
         for p in glob.glob(pat):
@@ -444,7 +448,7 @@ def dns_servers():
 
 def hosts_overrides():
     try:
-        lines = open("/etc/hosts").read().splitlines()
+        lines = read_text("/etc/hosts").splitlines()
     except OSError:
         return []
     default = {"localhost", "broadcasthost", "ip6-localhost", "ip6-loopback"}
@@ -605,7 +609,7 @@ def cmd_security(args, quiet=False):
     if out.strip() == "0":
         f.append(("low", "Automatic macOS updates are off", ""))
     # launch agents / daemons
-    for d in (f"{H}/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"):
+    for d in (f"{HOME}/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"):
         for p in sorted(glob.glob(d + "/*.plist")):
             prog = plist_program(p)
             name = os.path.basename(p)
@@ -622,7 +626,7 @@ def cmd_security(args, quiet=False):
                 f.append(("info", "Third-party 'cleaner' with background daemons", f"{name} - consider uninstalling; macguard replaces it"))
     # secrets left in easily-synced/shared folders
     for d in ("Downloads", "Desktop", "Documents"):
-        for p in glob.glob(f"{H}/{d}/*") + glob.glob(f"{H}/{d}/*/*"):
+        for p in glob.glob(f"{HOME}/{d}/*") + glob.glob(f"{HOME}/{d}/*/*"):
             name = os.path.basename(p).lower()
             if not os.path.isfile(p) or not (name.endswith((".key", ".pem", ".p12", ".pfx", ".ppk")) or name in ("id_rsa", "id_ed25519", ".env")):
                 continue
@@ -646,6 +650,16 @@ def cmd_security(args, quiet=False):
 
 
 # ---------------------------------------------------------------- watch mode
+
+def read_text(path):
+    with open(path) as fh:
+        return fh.read()
+
+
+def write_json(path, data):
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=1)
+
 
 def log_event(kind, msg):
     ensure_state()
@@ -673,10 +687,10 @@ def cmd_watch(args):
         remove_agent()  # stale agent from before the setting was turned off
         return
     ensure_state()
-    base = json.load(open(BASELINE)) if os.path.exists(BASELINE) else None
+    base = json.loads(read_text(BASELINE)) if os.path.exists(BASELINE) else None
     if base is None or args.reset:
         base = fingerprint(net_snapshot())
-        json.dump(base, open(BASELINE, "w"), indent=1)
+        write_json(BASELINE, base)
         print(f"Baseline learned: {len(base['listeners'])} listeners, {len(base['talkers'])} programs using the internet.")
     reported = set()
     print(f"Watching every {args.interval}s. Events -> {EVENTS_LOG}  (Ctrl-C to stop)")
@@ -716,7 +730,7 @@ def cmd_watch(args):
                 if sev in ("high", "medium"):
                     notify(title, detail)
             if events:
-                json.dump(base, open(BASELINE, "w"), indent=1)
+                write_json(BASELINE, base)
             if args.once:
                 return
             time.sleep(args.interval)
@@ -806,6 +820,188 @@ def cmd_settings(args):
         print("Background watcher OFF. Run `macguard watch` to monitor on demand.")
 
 
+# ---------------------------------------------------------------- doctor
+
+def doctor_checks():
+    """Prerequisite / environment checks: list of (ok: bool|None, name, detail). None = optional, missing."""
+    checks = []
+    checks.append((sys.platform == "darwin", "macOS", os.uname().release if sys.platform == "darwin" else sys.platform))
+    checks.append((sys.version_info >= (3, 8), "Python >= 3.8", f"{sys.version.split()[0]} at {sys.executable}"))
+    sysp = os.path.exists("/usr/bin/python3") and run(["/usr/bin/python3", "-c", "print(1)"])[0] == 0
+    checks.append((sysp, "System python (/usr/bin/python3)", "ok" if sysp else "install Xcode Command Line Tools: xcode-select --install"))
+    rc, out, _ = run(["netstat", "-anv", "-p", "tcp"])
+    visible = sum(1 for l in out.splitlines() if l.startswith("tcp"))
+    checks.append((visible > 0, "Socket visibility (netstat)", f"{visible} TCP sockets visible" if visible else
+                   "no sockets visible - run with /usr/bin/python3, not Homebrew/pyenv python"))
+    for tool in ("du", "df", "codesign", "launchctl", "lsof", "arp", "route", "scutil", "osascript"):
+        checks.append((bool(shutil.which(tool)), f"tool: {tool}", shutil.which(tool) or "missing"))
+    for tool, why in (("xcrun", "simulator cleanup"), ("docker", "Docker cleanup"), ("brew", "Homebrew cleanup"), ("npm", "npm cache cleanup")):
+        checks.append((True if shutil.which(tool) else None, f"optional: {tool}", shutil.which(tool) or f"not installed ({why} skipped)"))
+    try:
+        ensure_state()
+        test = os.path.join(STATE_DIR, ".write-test")
+        open(test, "w").close()
+        os.remove(test)
+        checks.append((True, "State dir writable", STATE_DIR))
+    except OSError as e:
+        checks.append((False, "State dir writable", f"{STATE_DIR}: {e}"))
+    ui = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html"))
+    checks.append((ui, "UI page (ui.html)", "ok" if ui else "missing next to macguard.py"))
+    return checks
+
+
+def cmd_doctor(args):
+    checks = doctor_checks()
+    for ok, name, detail in checks:
+        mark = f"{C['g']}✔{C['x']}" if ok else (f"{C['d']}–{C['x']}" if ok is None else f"{C['r']}✘{C['x']}")
+        print(f"  {mark} {name:<36} {C['d']}{detail}{C['x']}")
+    failed = [c for c in checks if c[0] is False]
+    print(f"\n{C['g']}All required checks passed.{C['x']}" if not failed else f"\n{C['r']}{len(failed)} required check(s) failed.{C['x']}")
+    if args.bundle:
+        ensure_state()
+        path = os.path.join(STATE_DIR, f"support-{dt.datetime.now():%Y%m%d-%H%M%S}.txt")
+        with open(path, "w") as fh:
+            fh.write(f"mac-cleanup support bundle {dt.datetime.now().isoformat()}\n\n")
+            fh.writelines(f"{'OK  ' if ok else ('--  ' if ok is None else 'FAIL')} {n}: {d}\n" for ok, n, d in checks)
+            fh.write(f"\nsettings: {json.dumps(load_settings())}\n\nlast events:\n")
+            if os.path.exists(EVENTS_LOG):
+                fh.writelines(read_text(EVENTS_LOG).splitlines(True)[-50:])
+        print(f"Support bundle (no file contents, no secrets): {path}")
+    sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------- web UI
+
+def disk_info():
+    _, out, _ = run(["df", "-k", "/System/Volumes/Data"])
+    f = out.splitlines()[-1].split()
+    return {"total": int(f[1]) * 1024, "used": int(f[2]) * 1024, "free": int(f[3]) * 1024}
+
+
+def junk_json(results):
+    return [{"id": r["id"], "name": r["name"], "risk": r["risk"], "note": r.get("note", ""), "size": r["size"],
+             "entries": [{"path": p.replace(HOME, "~"), "size": s, "label": l} for p, s, l in sorted(r["entries"], key=lambda e: -e[1])[:12]]}
+            for r in sorted(results, key=lambda r: -r["size"]) if r["size"] > 0]
+
+
+def findings_json(fl):
+    order = {"high": 0, "medium": 1, "low": 2, "info": 3, "ok": 4}
+    return [{"sev": s, "title": t, "detail": d} for s, t, d in sorted(fl, key=lambda x: order[x[0]])]
+
+
+def cmd_ui(args):
+    import secrets
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    token = secrets.token_urlsafe(24)
+    page_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+    state = {"scan": None}
+    lock = threading.Lock()
+    hosts = set()  # filled once the port is bound (port 0 = pick a free one)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def allowed(self):
+            # localhost only, and every API call must carry the per-launch token
+            # (blocks other websites / DNS rebinding from triggering deletes)
+            return self.headers.get("Host") in hosts and \
+                self.headers.get("X-Token") == token
+
+        def do_GET(self):
+            if self.path == "/":
+                if self.headers.get("Host") not in hosts:
+                    return self.send(403, {"error": "forbidden"})
+                with open(page_path, "rb") as fh:
+                    return self.send(200, fh.read().replace(b"__TOKEN__", token.encode()), "text/html; charset=utf-8")
+            if not self.allowed():
+                return self.send(403, {"error": "forbidden"})
+            if self.path == "/api/disk":
+                return self.send(200, disk_info())
+            if self.path == "/api/scan":
+                with lock:
+                    state["scan"] = scan_junk(args.stale_days)
+                return self.send(200, {"disk": disk_info(), "items": junk_json(state["scan"])})
+            if self.path == "/api/security":
+                return self.send(200, findings_json(cmd_security(args, quiet=True)))
+            if self.path == "/api/net":
+                snap = net_snapshot()
+                seen, listeners = set(), []
+                for s in sorted(snap["listeners"], key=lambda s: s["lport"] or 0):
+                    if (s["proc"], s["lport"]) not in seen:
+                        seen.add((s["proc"], s["lport"]))
+                        listeners.append({"port": s["lport"], "proc": s["proc"], "exe": s["exe"], "sig": signature(s["exe"]),
+                                          "exposed": not (s["lhost"].startswith("127.") or s["lhost"] == "::1")})
+                return self.send(200, {"gateway": snap["gateway"], "gateway_mac": snap["gateway_mac"], "dns": snap["dns"],
+                                       "listeners": listeners, "findings": findings_json(analyze_net(snap))})
+            if self.path == "/api/settings":
+                s = load_settings()
+                s["running"] = run(["launchctl", "print", f"gui/{os.getuid()}/{AGENT_LABEL}"])[0] == 0
+                return self.send(200, s)
+            self.send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self.allowed():
+                return self.send(403, {"error": "forbidden"})
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except ValueError:
+                return self.send(400, {"error": "bad json"})
+            if self.path == "/api/clean":
+                ids = set(body.get("ids") or [])
+                with lock:
+                    if state["scan"] is None:
+                        return self.send(409, {"error": "Run a scan first"})
+                    plan = [r for r in state["scan"] if r["id"] in ids and r["size"] > 0]
+                    freed = sum(clean_item(r) for r in plan)
+                    state["scan"] = None
+                log_event("clean", f"[ui] freed ~{human(freed)} ({', '.join(r['id'] for r in plan)})")
+                return self.send(200, {"freed": freed, "cleaned": [r["id"] for r in plan]})
+            if self.path == "/api/settings":
+                s = load_settings()
+                if "background_watcher" in body:
+                    s["background_watcher"] = bool(body["background_watcher"])
+                save_settings(s)
+                if s["background_watcher"]:
+                    install_agent(s["watch_interval"])
+                else:
+                    remove_agent()
+                return self.send(200, s)
+            self.send(404, {"error": "not found"})
+
+    if args.parent_pid:
+        # launched by the app: exit when the app goes away
+        def watchdog():
+            while True:
+                time.sleep(2)
+                try:
+                    os.kill(args.parent_pid, 0)
+                except OSError:
+                    os._exit(0)
+        threading.Thread(target=watchdog, daemon=True).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    port = srv.server_address[1]
+    hosts.update({f"127.0.0.1:{port}", f"localhost:{port}"})
+    url = f"http://127.0.0.1:{port}/"
+    print(f"macguard UI on {url}  (Ctrl-C to stop)", flush=True)
+    if not args.no_open:
+        run(["open", url])
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 # ---------------------------------------------------------------- HTML report
 
 def cmd_report(args):
@@ -820,7 +1016,7 @@ def cmd_report(args):
     netf = analyze_net(snap)
     print("Auditing security...", flush=True)
     secf = cmd_security(args, quiet=True)
-    events = open(EVENTS_LOG).read().splitlines()[-30:] if os.path.exists(EVENTS_LOG) else []
+    events = read_text(EVENTS_LOG).splitlines()[-30:] if os.path.exists(EVENTS_LOG) else []
     e = html.escape
 
     def findings_html(fl):
@@ -915,6 +1111,11 @@ def main():
     p = sub.add_parser("report"); p.add_argument("--out"); p.add_argument("--no-open", action="store_true")
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_report)
     p = sub.add_parser("settings"); p.add_argument("key", nargs="?"); p.add_argument("value", nargs="?"); p.set_defaults(fn=cmd_settings)
+    p = sub.add_parser("doctor"); p.add_argument("--bundle", action="store_true", help="write a support bundle file")
+    p.set_defaults(fn=cmd_doctor)
+    p = sub.add_parser("ui"); p.add_argument("--port", type=int, default=8787); p.add_argument("--no-open", action="store_true")
+    p.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_ui)
     args = ap.parse_args()
     args.fn(args)
 

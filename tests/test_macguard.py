@@ -1,0 +1,652 @@
+"""Tests for macguard. Run: /usr/bin/python3 -m unittest discover -s tests -v
+
+Unit tests use temp dirs and mocked system commands, so they never touch your real
+caches, settings or launch agents. The `Live*` tests call real read-only macOS
+commands (df, netstat, codesign...) and are skipped off macOS.
+"""
+import argparse
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from contextlib import redirect_stdout
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import macguard as mg  # noqa: E402
+
+ON_MAC = sys.platform == "darwin"
+
+
+def quiet(fn, *a, **kw):
+    with redirect_stdout(io.StringIO()):
+        return fn(*a, **kw)
+
+
+class TempHome(unittest.TestCase):
+    """Points HOME, state dir, settings and launch-agent paths at a temp dir."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="macguard-test-"))
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+        state = os.path.join(self.home, ".macguard")
+        self.patches = [
+            mock.patch.object(mg, "HOME", self.home),
+            mock.patch.object(mg, "STATE_DIR", state),
+            mock.patch.object(mg, "BASELINE", os.path.join(state, "baseline.json")),
+            mock.patch.object(mg, "EVENTS_LOG", os.path.join(state, "events.log")),
+            mock.patch.object(mg, "SETTINGS", os.path.join(state, "settings.json")),
+            mock.patch.object(mg, "AGENT_PLIST", os.path.join(self.home, "agent.plist")),
+            mock.patch.object(mg, "notify", lambda *a: None),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def mk(self, rel, size=1024, age_days=0):
+        path = os.path.join(self.home, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"x" * size)
+        if age_days:
+            t = time.time() - age_days * 86400
+            os.utime(path, (t, t))
+        return path
+
+
+# ---------------------------------------------------------------- helpers
+
+class TestHelpers(unittest.TestCase):
+    def test_human(self):
+        self.assertEqual(mg.human(500), "500B")
+        self.assertEqual(mg.human(2048), "2K")
+        self.assertEqual(mg.human(5 * 1024 ** 3), "5.0G")
+
+    def test_split_addr(self):
+        self.assertEqual(mg.split_addr("192.168.1.5.443"), ("192.168.1.5", 443))
+        self.assertEqual(mg.split_addr("*.5000"), ("*", 5000))
+        self.assertEqual(mg.split_addr("2001:db8:1c75:6.54386"), ("2001:db8:1c75:6", 54386))
+        self.assertEqual(mg.split_addr("*.*"), ("*", None))
+
+    def test_is_private(self):
+        for h in ("127.0.0.1", "::1", "192.168.1.1", "10.0.0.4", "fe80::1876:d85d:", "fd00::1", "*"):
+            self.assertTrue(mg.is_private(h), h)
+        for h in ("8.8.8.8", "34.111.148.117", "2607:6bc0::10"):
+            self.assertFalse(mg.is_private(h), h)
+
+    def test_version_key_sorts_numerically(self):
+        names = ["IntelliJIdea2025.10", "IntelliJIdea2025.3", "IntelliJIdea2026.2"]
+        self.assertEqual(sorted(names, key=mg.version_key)[-1], "IntelliJIdea2026.2")
+        self.assertEqual(sorted(names, key=mg.version_key)[0], "IntelliJIdea2025.3")
+
+
+# ---------------------------------------------------------------- disk / cleanup
+
+class TestCleanup(TempHome):
+    def test_old_versions_keeps_newest_per_product(self):
+        for d in ("IntelliJIdea2025.3", "IntelliJIdea2026.2", "PyCharm2025.1"):
+            os.makedirs(os.path.join(self.home, "jb", d))
+        old = mg.old_versions(os.path.join(self.home, "jb", "*"), r"([A-Za-z]+)\d{4}\.\d+")
+        self.assertEqual([os.path.basename(p) for p in old], ["IntelliJIdea2025.3"])
+
+    def test_du_and_resolve_glob(self):
+        self.mk("cache/a/f1", 4096)
+        self.mk("cache/b/f2", 4096)
+        item = dict(id="t", name="t", risk="safe", paths=[os.path.join(self.home, "cache", "*")])
+        entries = mg.resolve(item)
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(all(size >= 4096 for _, size, _ in entries))
+        self.assertEqual(mg.du(os.path.join(self.home, "nope")), 0)
+
+    def test_project_artifacts_only_stale_and_guarded(self):
+        root = os.path.join(self.home, "DEV")
+        # stale node project
+        self.mk("DEV/old/package.json", 10, age_days=100)
+        self.mk("DEV/old/node_modules/x/index.js", 2 * 1024 * 1024)
+        # active cargo project
+        self.mk("DEV/fresh/Cargo.toml", 10)
+        self.mk("DEV/fresh/target/debug/bin", 1024)
+        # "build" folder without a build file must NOT count
+        self.mk("DEV/docs/build/readme.txt", 10, age_days=100)
+        # "target" without Cargo.toml/pom.xml must NOT count
+        self.mk("DEV/notrust/target/thing", 10, age_days=100)
+        with mock.patch.object(mg, "project_roots", lambda: [root]):
+            found = {os.path.relpath(a["path"], root): a for a in mg.find_project_artifacts(30)}
+        self.assertIn("old/node_modules", found)
+        self.assertTrue(found["old/node_modules"]["stale"])
+        self.assertIn("fresh/target", found)
+        self.assertFalse(found["fresh/target"]["stale"])
+        self.assertNotIn("docs/build", found)
+        self.assertNotIn("notrust/target", found)
+        with mock.patch.object(mg, "project_roots", lambda: [root]):
+            entries = mg.resolve({"special": "projects"}, 30)
+        self.assertEqual([os.path.relpath(p, root) for p, _, _ in entries], ["old/node_modules"])
+
+    def test_old_downloads(self):
+        self.mk("Downloads/old.zip", 100, age_days=120)
+        self.mk("Downloads/new.zip", 100)
+        names = [os.path.basename(p) for p, _, _ in mg.resolve({"special": "downloads"})]
+        self.assertEqual(names, ["old.zip"])
+
+    def test_clean_item_deletes_files_and_dirs(self):
+        d = os.path.dirname(self.mk("cache/dir/f", 100))
+        f = self.mk("cache/file", 100)
+        r = dict(id="t", name="t", risk="safe", entries=[(d, 100, ""), (f, 100, "")])
+        freed = quiet(mg.clean_item, r)
+        self.assertEqual(freed, 200)
+        self.assertFalse(os.path.exists(d))
+        self.assertFalse(os.path.exists(f))
+
+    def test_clean_item_refuses_paths_outside_home(self):
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        r = dict(id="t", name="t", risk="safe", entries=[(outside, 1, ""), ("/", 1, "")])
+        freed = quiet(mg.clean_item, r)
+        self.assertEqual(freed, 0)
+        self.assertTrue(os.path.exists(outside))
+
+    def _fake_scan(self):
+        safe = os.path.dirname(self.mk("cache/safe/f", 100))
+        review = os.path.dirname(self.mk("cache/review/f", 100))
+        return [dict(id="s", name="safe", risk="safe", entries=[(safe, 100, "")], size=100),
+                dict(id="r", name="review", risk="review", entries=[(review, 100, "")], size=100)], safe, review
+
+    def args(self, **kw):
+        base = dict(apply=False, yes=False, only=None, stale_days=30)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_clean_dry_run_deletes_nothing(self):
+        results, safe, review = self._fake_scan()
+        with mock.patch.object(mg, "scan_junk", lambda *a, **k: results):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_clean(self.args())
+        self.assertIn("Dry run", out.getvalue())
+        self.assertTrue(os.path.exists(safe) and os.path.exists(review))
+
+    def test_clean_apply_only_safe_by_default(self):
+        results, safe, review = self._fake_scan()
+        with mock.patch.object(mg, "scan_junk", lambda *a, **k: results):
+            quiet(mg.cmd_clean, self.args(apply=True, yes=True))
+        self.assertFalse(os.path.exists(safe))
+        self.assertTrue(os.path.exists(review))
+        self.assertIn("[clean]", mg.read_text(mg.EVENTS_LOG))
+
+    def test_clean_only_selects_review_items(self):
+        results, safe, review = self._fake_scan()
+        with mock.patch.object(mg, "scan_junk", lambda *a, **k: results):
+            quiet(mg.cmd_clean, self.args(apply=True, yes=True, only="r"))
+        self.assertTrue(os.path.exists(safe))
+        self.assertFalse(os.path.exists(review))
+
+    def test_clean_apply_aborts_without_yes(self):
+        results, safe, _ = self._fake_scan()
+        with mock.patch.object(mg, "scan_junk", lambda *a, **k: results), mock.patch("builtins.input", return_value="no"):
+            quiet(mg.cmd_clean, self.args(apply=True))
+        self.assertTrue(os.path.exists(safe))
+
+    def test_every_junk_category_is_well_formed(self):
+        ids = [j["id"] for j in mg.JUNK]
+        self.assertEqual(len(ids), len(set(ids)), "duplicate ids")
+        for j in mg.JUNK:
+            self.assertIn(j["risk"], ("safe", "review"))
+            self.assertTrue(j.get("paths") or j.get("special"), j["id"])
+
+
+# ---------------------------------------------------------------- network
+
+NETSTAT_TCP = """Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs
+tcp4       0      0  127.0.0.1.6379         *.*                    LISTEN                 0            0  131072  131072 com.docker.backe:3740   00100 00000006 000000000005b84a 00000000 00000800      1      0 000000
+tcp4       0      0  *.5000                 *.*                    LISTEN                 0            0  131072  131072    ControlCenter:673    00100 00000006 000000000000172d 00000001 00000800      1      0 000000
+tcp6       0      0  2001:db8:1c75:6.54386 2607:6bc0::10.443      ESTABLISHED        31670        34393  131072  131072           claude:50195  00102 00000008 000000000008d602 20000081 04000900      3      0 000004
+tcp4       0    148  192.168.1.10.54416     192.168.1.13.5900      ESTABLISHED    281388138       226100 1943968  131072   Screen Sharing:52243  00002 00000000 000000000008deae 20000080 04000900      4      0 000004
+"""
+ARP = """? (192.168.1.1) at 02:00:5e:00:00:01 on en0 ifscope [ethernet]
+? (192.168.1.10) at 02:00:5e:00:00:0a on en0 ifscope permanent [ethernet]
+? (192.168.1.13) at 2:0:5e:0:0:d on en0 ifscope [ethernet]
+? (192.168.1.255) at ff:ff:ff:ff:ff:ff on en0 ifscope [ethernet]
+? (192.168.1.99) at (incomplete) on en0 ifscope [ethernet]
+"""
+
+
+def fake_run(mapping):
+    def _run(cmd, timeout=60):
+        key = cmd if isinstance(cmd, str) else " ".join(cmd)
+        for k, v in mapping.items():
+            if key.startswith(k):
+                return 0, v, ""
+        return 0, "", ""
+    return _run
+
+
+def L(port, host="*", exe="/bin/x", proc="x", pid=1):
+    return dict(proto="tcp4", lhost=host, lport=port, rhost="*", rport=None, state="LISTEN", proc=proc, pid=pid, exe=exe)
+
+
+def CONN(rhost, rport, lport=50000, exe="/bin/x", proc="x", state="ESTABLISHED"):
+    return dict(proto="tcp4", lhost="192.168.1.10", lport=lport, rhost=rhost, rport=rport, state=state, proc=proc, pid=2, exe=exe)
+
+
+def SNAP(listeners=(), conns=(), arp=(), gateway="192.168.1.1", gw_mac="aa:aa:aa:aa:aa:aa", dns=("1.1.1.1",), hosts=()):
+    return dict(listeners=list(listeners), conns=list(conns), arp=list(arp), gateway=gateway, iface="en0",
+                gateway_mac=gw_mac, dns=list(dns), hosts=list(hosts), time=0)
+
+
+class TestNetworkParsing(unittest.TestCase):
+    def test_sockets_parses_netstat(self):
+        with mock.patch.object(mg, "run", fake_run({"netstat -anv -p tcp": NETSTAT_TCP})):
+            rows = mg.sockets()
+        self.assertEqual(len(rows), 4)
+        redis = rows[0]
+        self.assertEqual((redis["lhost"], redis["lport"], redis["state"], redis["pid"]), ("127.0.0.1", 6379, "LISTEN", 3740))
+        self.assertEqual(rows[1]["lhost"], "*")
+        claude = rows[2]
+        self.assertEqual((claude["rhost"], claude["rport"], claude["proc"], claude["pid"]), ("2607:6bc0::10", 443, "claude", 50195))
+        self.assertEqual(rows[3]["pid"], 52243)  # process name containing a space
+
+    def test_arp_table_normalizes_and_filters(self):
+        with mock.patch.object(mg, "run", fake_run({"arp -an": ARP})):
+            rows = mg.arp_table()
+        ips = [r["ip"] for r in rows]
+        self.assertEqual(ips, ["192.168.1.1", "192.168.1.10", "192.168.1.13"])
+        self.assertEqual(rows[2]["mac"], "02:00:5e:00:00:0d")
+        self.assertTrue(rows[1]["permanent"])
+
+    def test_gateway_and_dns(self):
+        with mock.patch.object(mg, "run", fake_run({
+                "route -n get default": "   route to: default\n    gateway: 192.168.1.1\n  interface: en0\n",
+                "scutil --dns": "  nameserver[0] : 1.1.1.1\n  nameserver[1] : 8.8.8.8\n  nameserver[0] : 1.1.1.1\n"})):
+            self.assertEqual(mg.gateway(), ("192.168.1.1", "en0"))
+            self.assertEqual(mg.dns_servers(), ["1.1.1.1", "8.8.8.8"])
+
+    def test_hosts_overrides(self):
+        content = "127.0.0.1 localhost\n255.255.255.255 broadcasthost\n::1 localhost\n# comment\n1.2.3.4 evil.example\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=content)):
+            self.assertEqual(mg.hosts_overrides(), ["1.2.3.4 evil.example"])
+
+
+class TestThreatAnalysis(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(mg, "signature", lambda path: "unsigned" if "evil" in path else "apple")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def titles(self, snap):
+        return {(s, t) for s, t, _ in mg.analyze_net(snap)}
+
+    def test_clean_snapshot_has_no_findings(self):
+        self.assertEqual(mg.analyze_net(SNAP(listeners=[L(6379, host="127.0.0.1")], conns=[CONN("8.8.8.8", 443)])), [])
+
+    def test_exposed_database_is_high(self):
+        self.assertIn(("high", "Redis exposed to the network"), self.titles(SNAP(listeners=[L(6379)])))
+
+    def test_exposed_remote_access_is_medium(self):
+        self.assertIn(("medium", "Screen Sharing (VNC) exposed to the network"), self.titles(SNAP(listeners=[L(5900)])))
+
+    def test_unsigned_listener(self):
+        t = self.titles(SNAP(listeners=[L(8000, exe="/opt/evil/bin")]))
+        self.assertIn(("high", "Unsigned program accepting network connections"), t)
+
+    def test_listener_from_temp_dir(self):
+        t = self.titles(SNAP(listeners=[L(8001, exe="/tmp/x/payload")]))
+        self.assertIn(("high", "Listener running from a temp/download folder"), t)
+
+    def test_suspicious_port(self):
+        t = self.titles(SNAP(conns=[CONN("45.1.2.3", 4444)]))
+        self.assertIn(("high", "Connection to suspicious port (metasploit default)"), t)
+
+    def test_unsigned_program_to_internet(self):
+        t = self.titles(SNAP(conns=[CONN("45.1.2.3", 443, exe="/opt/evil/bin")]))
+        self.assertIn(("medium", "Unsigned program talking to the internet"), t)
+
+    def test_port_scan(self):
+        conns = [CONN("45.1.2.3", 40000 + i, lport=p) for i, p in enumerate([22, 80, 443, 5000, 5900, 8080])]
+        listeners = [L(p) for p in (22, 80, 443, 5000, 5900, 8080)]
+        t = self.titles(SNAP(listeners=listeners, conns=conns))
+        self.assertIn(("high", "Possible port scan / flood from remote host"), t)
+
+    def test_single_inbound_internet_connection(self):
+        t = self.titles(SNAP(listeners=[L(8080)], conns=[CONN("45.1.2.3", 51000, lport=8080)]))
+        self.assertIn(("medium", "Inbound connection from the internet"), t)
+
+    def test_arp_spoofing(self):
+        arp = [{"ip": "192.168.1.1", "mac": "de:ad:be:ef:00:01"}, {"ip": "192.168.1.66", "mac": "de:ad:be:ef:00:01"}]
+        self.assertIn(("high", "Possible ARP spoofing (gateway MAC shared with another IP)"), self.titles(SNAP(arp=arp)))
+
+    def test_hosts_entries_reported(self):
+        self.assertIn(("info", "/etc/hosts has custom entries"), self.titles(SNAP(hosts=["1.2.3.4 x"])))
+
+
+# ---------------------------------------------------------------- security
+
+class TestSecurity(TempHome):
+    def run_security(self, mapping):
+        # only plists inside the temp HOME resolve to a program; system ones are ignored
+        prog = lambda p: "/nonexistent/prog" if p.startswith(self.home) else None  # noqa: E731
+        with mock.patch.object(mg, "run", fake_run(mapping)), mock.patch.object(mg, "plist_program", prog):
+            return {(s, t) for s, t, _ in mg.cmd_security(None, quiet=True)}
+
+    def test_firewall_off_and_sharing_on(self):
+        res = self.run_security({
+            "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate": "Firewall is disabled. (State = 0)",
+            "/usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode": "Firewall stealth mode is off",
+            "csrutil status": "System Integrity Protection status: enabled.",
+            "spctl --status": "assessments enabled",
+            "fdesetup status": "FileVault is On.",
+            "launchctl print-disabled system": '"com.apple.screensharing" => enabled\n"com.openssh.sshd" => enabled',
+        })
+        self.assertIn(("high", "macOS firewall is OFF"), res)
+        self.assertIn(("low", "Firewall stealth mode is off"), res)
+        self.assertIn(("medium", "Screen Sharing is enabled"), res)
+        self.assertIn(("medium", "Remote Login (SSH) is enabled"), res)
+        self.assertIn(("ok", "FileVault on"), res)
+
+    def test_all_good(self):
+        res = self.run_security({
+            "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate": "Firewall is enabled. (State = 1)",
+            "/usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode": "Firewall stealth mode is on",
+            "csrutil status": "enabled.", "spctl --status": "assessments enabled", "fdesetup status": "FileVault is On.",
+        })
+        self.assertFalse([r for r in res if r[0] in ("high", "medium")], res)
+
+    def test_orphaned_launch_item(self):
+        self.mk("Library/LaunchAgents/a.plist", 10)
+        res = self.run_security({})
+        self.assertIn(("low", "Orphaned launch item (program no longer exists)"), res)
+
+    def test_private_key_in_downloads(self):
+        self.mk("Downloads/server.key", 0)
+        with open(os.path.join(self.home, "Downloads/server.key"), "w") as fh:
+            fh.write("-----BEGIN RSA PRIVATE KEY-----\nabc\n")
+        self.mk("Downloads/notes.key", 10)  # Keynote-ish file without a key header: ignored
+        res = self.run_security({})
+        self.assertIn(("medium", "Private key / secret file in ~/Downloads"), res)
+        findings = mg.cmd_security(None, quiet=True)
+        details = " ".join(d for _, t, d in findings if "Private key" in t)
+        self.assertIn("server.key", details)
+        self.assertNotIn("notes.key", details)
+
+
+# ---------------------------------------------------------------- watch / settings
+
+class TestWatchAndSettings(TempHome):
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(mg, "signature", lambda path: "apple")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def watch(self, snap, **kw):
+        a = dict(agent=False, reset=False, once=True, interval=1)
+        a.update(kw)
+        with mock.patch.object(mg, "net_snapshot", lambda: snap):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_watch(argparse.Namespace(**a))
+        return out.getvalue()
+
+    def test_fingerprint_collapses_ephemeral_ports(self):
+        fp = mg.fingerprint(SNAP(listeners=[L(63467, exe="/usr/libexec/rapportd"), L(5000, host="127.0.0.1")]))
+        self.assertIn("/usr/libexec/rapportd|dyn|net", fp["listeners"])
+        self.assertIn("/bin/x|5000|lo", fp["listeners"])
+
+    def test_learns_baseline_then_detects_changes(self):
+        out = self.watch(SNAP(listeners=[L(5000)]))
+        self.assertIn("Baseline learned", out)
+        self.assertTrue(os.path.exists(mg.BASELINE))
+        self.assertEqual(self.watch(SNAP(listeners=[L(5000)])).count("New network listener"), 0)
+        changed = SNAP(listeners=[L(5000), L(8765, exe="/bin/server")], gw_mac="bb:bb:bb:bb:bb:bb",
+                       dns=("6.6.6.6",), hosts=("1.2.3.4 bank.example",), conns=[CONN("8.8.8.8", 443, exe="/bin/newapp")])
+        out = self.watch(changed)
+        for msg in ("New network listener", "Gateway MAC changed", "DNS servers changed", "/etc/hosts changed",
+                    "New program connecting to internet"):
+            self.assertIn(msg, out)
+        log = mg.read_text(mg.EVENTS_LOG)
+        self.assertIn("/bin/server on port 8765", log)
+        # baseline updated -> no repeat alerts
+        self.assertNotIn("New network listener", self.watch(changed))
+
+    def test_local_only_listener_not_alerted(self):
+        self.watch(SNAP())
+        self.assertNotIn("New network listener", self.watch(SNAP(listeners=[L(3000, host="127.0.0.1")])))
+
+    def test_settings_default_off(self):
+        self.assertFalse(mg.load_settings()["background_watcher"])
+
+    def test_settings_on_off_installs_and_removes_agent(self):
+        with mock.patch.object(mg, "install_agent", return_value=(True, "")) as inst, \
+                mock.patch.object(mg, "remove_agent") as rem:
+            quiet(mg.cmd_settings, argparse.Namespace(key="background_watcher", value="on"))
+            inst.assert_called_once_with(60)
+            self.assertTrue(json.loads(mg.read_text(mg.SETTINGS))["background_watcher"])
+            quiet(mg.cmd_settings, argparse.Namespace(key="background_watcher", value="off"))
+            rem.assert_called_once()
+            self.assertFalse(mg.load_settings()["background_watcher"])
+
+    def test_settings_rejects_bad_input(self):
+        with self.assertRaises(SystemExit):
+            quiet(mg.cmd_settings, argparse.Namespace(key="nope", value="1"))
+        with self.assertRaises(SystemExit):
+            quiet(mg.cmd_settings, argparse.Namespace(key="background_watcher", value="maybe"))
+
+    def test_agent_exits_when_setting_off(self):
+        with mock.patch.object(mg, "remove_agent") as rem, mock.patch.object(mg, "net_snapshot") as snap:
+            mg.cmd_watch(argparse.Namespace(agent=True, reset=False, once=True, interval=1))
+            rem.assert_called_once()
+            snap.assert_not_called()
+
+    def test_install_agent_writes_opt_in_plist(self):
+        with mock.patch.object(mg, "run", return_value=(0, "", "")):
+            ok, _ = mg.install_agent(90)
+        plist = mg.read_text(mg.AGENT_PLIST)
+        self.assertTrue(ok)
+        self.assertIn("<string>--agent</string>", plist)
+        self.assertIn("<string>90</string>", plist)
+        self.assertIn("<key>SuccessfulExit</key><false/>", plist)
+        with mock.patch.object(mg, "run", return_value=(0, "", "")):
+            mg.remove_agent()
+        self.assertFalse(os.path.exists(mg.AGENT_PLIST))
+
+
+# ---------------------------------------------------------------- web UI
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class TestWebUI(TempHome):
+    def setUp(self):
+        super().setUp()
+        self.target = os.path.dirname(self.mk("cache/junk/f", 100))
+        scan = [dict(id="junk", name="Junk", risk="safe", note="", entries=[(self.target, 100, "")], size=100)]
+        for p in (mock.patch.object(mg, "scan_junk", lambda *a, **k: [dict(r) for r in scan]),
+                  mock.patch.object(mg, "disk_info", lambda: {"total": 100, "used": 40, "free": 60}),
+                  mock.patch.object(mg, "install_agent", return_value=(True, "")),
+                  mock.patch.object(mg, "remove_agent")):
+            p.start()
+            self.addCleanup(p.stop)
+        self.port = free_port()
+        args = argparse.Namespace(port=self.port, no_open=True, stale_days=30, parent_pid=None)
+        threading.Thread(target=quiet, args=(mg.cmd_ui, args), daemon=True).start()
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", self.port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        page = self.req("/", token=None)[1]
+        self.token = re.search(r'const TOKEN = "([^"]+)"', page).group(1)
+
+    def req(self, path, body=None, token="use", host=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
+        if token:
+            r.add_header("X-Token", self.token if token == "use" else token)
+        if host:
+            r.add_header("Host", host)
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                text = resp.read().decode()
+                return resp.status, text
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def test_page_served_with_token(self):
+        code, page = self.req("/", token=None)
+        self.assertEqual(code, 200)
+        self.assertNotIn("__TOKEN__", page)
+
+    def test_api_requires_token(self):
+        self.assertEqual(self.req("/api/disk", token=None)[0], 403)
+        self.assertEqual(self.req("/api/disk", token="wrong")[0], 403)
+        self.assertEqual(self.req("/api/clean", body={"ids": ["junk"]}, token=None)[0], 403)
+        self.assertTrue(os.path.exists(self.target))
+
+    def test_rejects_foreign_host_header(self):
+        self.assertEqual(self.req("/", token=None, host="evil.example")[0], 403)
+        self.assertEqual(self.req("/api/disk", host="evil.example")[0], 403)
+
+    def test_clean_requires_scan_first(self):
+        self.assertEqual(self.req("/api/clean", body={"ids": ["junk"]})[0], 409)
+        self.assertTrue(os.path.exists(self.target))
+
+    def test_scan_then_clean(self):
+        code, body = self.req("/api/scan")
+        self.assertEqual(code, 200)
+        data = json.loads(body)
+        self.assertEqual(data["items"][0]["id"], "junk")
+        self.assertEqual(data["disk"]["free"], 60)
+        code, body = self.req("/api/clean", body={"ids": ["junk"]})
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["cleaned"], ["junk"])
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_clean_ignores_unknown_ids(self):
+        self.req("/api/scan")
+        code, body = self.req("/api/clean", body={"ids": ["../../etc"]})
+        self.assertEqual(json.loads(body)["cleaned"], [])
+        self.assertTrue(os.path.exists(self.target))
+
+    def test_settings_toggle(self):
+        with mock.patch.object(mg, "run", return_value=(1, "", "")):
+            s = json.loads(self.req("/api/settings")[1])
+            self.assertFalse(s["background_watcher"])
+            self.assertFalse(s["running"])
+        s = json.loads(self.req("/api/settings", body={"background_watcher": True})[1])
+        self.assertTrue(s["background_watcher"])
+        mg.install_agent.assert_called()
+        s = json.loads(self.req("/api/settings", body={"background_watcher": False})[1])
+        self.assertFalse(s["background_watcher"])
+        mg.remove_agent.assert_called()
+
+    def test_security_and_net_endpoints(self):
+        with mock.patch.object(mg, "cmd_security", return_value=[("high", "Firewall off", "x")]), \
+                mock.patch.object(mg, "net_snapshot", return_value=SNAP(listeners=[L(6379)])), \
+                mock.patch.object(mg, "signature", return_value="apple"):
+            sec = json.loads(self.req("/api/security")[1])
+            net = json.loads(self.req("/api/net")[1])
+        self.assertEqual(sec[0]["title"], "Firewall off")
+        self.assertTrue(net["listeners"][0]["exposed"])
+        self.assertEqual(net["findings"][0]["sev"], "high")
+
+
+# ---------------------------------------------------------------- doctor / report
+
+class TestDoctorAndReport(TempHome):
+    def test_doctor_bundle(self):
+        with self.assertRaises(SystemExit) as cm:
+            quiet(mg.cmd_doctor, argparse.Namespace(bundle=True))
+        bundles = [f for f in os.listdir(mg.STATE_DIR) if f.startswith("support-")]
+        self.assertEqual(len(bundles), 1)
+        text = mg.read_text(os.path.join(mg.STATE_DIR, bundles[0]))
+        self.assertIn("settings:", text)
+        if ON_MAC:
+            self.assertEqual(cm.exception.code, 0, text)
+
+    def test_report_writes_html(self):
+        out = os.path.join(self.tmp, "r.html")
+        with mock.patch.object(mg, "scan_junk", return_value=[]), \
+                mock.patch.object(mg, "big_dirs", return_value=[("~/x", 10)]), \
+                mock.patch.object(mg, "net_snapshot", return_value=SNAP(listeners=[L(5900)])), \
+                mock.patch.object(mg, "cmd_security", return_value=[("high", "Firewall <off>", "")]), \
+                mock.patch.object(mg, "signature", return_value="apple"):
+            quiet(mg.cmd_report, argparse.Namespace(stale_days=30, out=out, no_open=True))
+        page = mg.read_text(out)
+        self.assertIn("Firewall &lt;off&gt;", page)  # escaped
+        self.assertIn("Screen Sharing (VNC) exposed", page)
+
+
+# ---------------------------------------------------------------- live, read-only system checks
+
+@unittest.skipUnless(ON_MAC, "macOS only")
+class LiveSystem(unittest.TestCase):
+    def test_disk_info(self):
+        d = mg.disk_info()
+        self.assertGreater(d["total"], d["free"])
+
+    def test_net_snapshot(self):
+        snap = mg.net_snapshot()
+        self.assertTrue(snap["listeners"] or snap["conns"],
+                        "no sockets visible - run tests with /usr/bin/python3 (see `macguard doctor`)")
+        mg.analyze_net(snap)
+
+    def test_security_audit_runs(self):
+        findings = mg.cmd_security(None, quiet=True)
+        titles = " ".join(t for _, t, _ in findings)
+        self.assertRegex(titles, "Firewall|firewall")
+
+    def test_signature_of_system_binary(self):
+        self.assertEqual(mg.signature("/bin/ls"), "apple")
+        self.assertEqual(mg.signature("/does/not/exist"), "missing")
+
+    def test_ui_port_zero_and_parent_watchdog(self):
+        """The app starts the engine with --port 0 --parent-pid; it must report its port and exit when the parent dies."""
+        import subprocess
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
+        parent = subprocess.Popen(["sleep", "3"])
+        eng = subprocess.Popen(["/usr/bin/python3", "-u", script, "ui", "--port", "0", "--no-open", "--parent-pid", str(parent.pid)],
+                               stdout=subprocess.PIPE, text=True)
+        try:
+            line = eng.stdout.readline()
+            port = int(re.search(r"127\.0\.0\.1:(\d+)/", line).group(1))
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+            parent.wait()
+            self.assertEqual(eng.wait(timeout=10), 0)
+        finally:
+            for p in (eng, parent):
+                if p.poll() is None:
+                    p.kill()
+            eng.stdout.close()
+
+    def test_cli_help(self):
+        import subprocess
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
+        out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
+        for cmd in ("scan", "clean", "net", "security", "watch", "report", "settings", "ui", "doctor"):
+            self.assertIn(cmd, out)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,24 +1,28 @@
-# mac-cleanup
+# Mac Cleanup
 
-**Clean, monitor and secure a macOS development machine from one command.**
+**Clean, monitor and secure a macOS development machine. Native app, web UI or CLI.**
 
-Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS simulators, old IDE versions, and npm, Gradle, Cargo and pip caches, plus stale `node_modules`. They also tend to have services quietly open to the network. `mac-cleanup` (CLI name `macguard`) finds both, explains what it found, and fixes it only when you ask.
+Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS simulators, old IDE versions, and npm, Gradle, Cargo and pip caches, plus stale `node_modules`. They also tend to have services quietly open to the network. Mac Cleanup (CLI name `macguard`) finds both, explains what it found, and fixes it only when you ask.
 
-- **Disk cleanup**: sizes up junk by category. Each category is marked **safe** (caches that regenerate) or **review** (your call). It deletes nothing without `--apply` and a confirmation.
+- **Disk cleanup**: sizes up junk by category. Each category is marked **safe** (caches that regenerate) or **review** (your call). It deletes nothing without confirmation, and only inside your home folder.
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
-- **Network analysis**: every listening port with its owning binary and code signature, connections grouped by process, gateway, DNS and ARP. Flags known-bad ports, unsigned programs on the internet, binaries in temp folders, inbound scans and ARP spoofing.
-- **Watch mode (on demand)**: learns a baseline and alerts when a new program opens a port to your network, the gateway's hardware address changes, DNS or `/etc/hosts` changes, or a high-severity issue appears. Runs only when you call it, unless you turn on the background setting.
-- **HTML report**: one dashboard covering all of the above.
+- **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
+- **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
+- **Three front ends**: a native **Mac Cleanup.app**, a local **web UI** with a glass design, and the **`macguard` CLI**.
 
-Single Python file, standard library only, no root required.
+Standard-library Python plus a small Swift wrapper. No root, no telemetry, nothing leaves your Mac.
 
-## Install
+## Quick start
 
-```bash
-alias macguard="/usr/bin/python3 ~/DEV/Workspace/mac-cleanup/macguard.py"
-```
+| I want… | Do this |
+|---|---|
+| The app | `./build_app.sh --install`, then open **Mac Cleanup** from Applications (or use `dist/MacCleanup.dmg`) |
+| One-click setup and the UI | Double-click **`MacCleanup.command`** in Finder |
+| The CLI | `./setup.sh`, then open a new terminal and run `macguard --help` |
 
-## Usage
+`setup.sh` checks prerequisites (macOS, Apple's Command Line Tools for `/usr/bin/python3`, system tools), installs the `macguard` command into `~/.local/bin`, runs `macguard doctor` and the test suite. It's safe to re-run. `./setup.sh --uninstall` removes everything.
+
+## CLI
 
 | Command | What it does |
 |---|---|
@@ -28,17 +32,28 @@ alias macguard="/usr/bin/python3 ~/DEV/Workspace/mac-cleanup/macguard.py"
 | `macguard clean --only android-avd,project-artifacts --apply` | Clean specific **review** items. |
 | `macguard security` | Security posture audit. |
 | `macguard net` | Network snapshot and threat findings. |
-| `macguard watch` | Monitor in the foreground until Ctrl-C (`--once` runs a single check, `--reset` re-learns the baseline). |
-| `macguard report` | HTML dashboard, written to `~/.macguard/report.html`. |
-| `macguard settings` | Show settings. |
-| `macguard settings background_watcher on` | Opt in: run `watch` in the background at login and send macOS notifications. Off by default. |
-| `macguard settings background_watcher off` | Stop the background watcher and remove its launch agent. |
-| `macguard settings watch_interval 120` | Seconds between background checks. |
+| `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
+| `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
+| `macguard report` | Static HTML report in `~/.macguard/report.html`. |
+| `macguard settings [key value]` | `background_watcher on/off` (off by default), `watch_interval <sec>`. |
+| `macguard doctor [--bundle]` | Check prerequisites and optionally write a support file. |
 
-State lives in `~/.macguard/` (`settings.json`, `baseline.json`, `events.log`, `report.html`).
+## Development
+
+```bash
+/usr/bin/python3 -m unittest discover -s tests -v   # 58 tests
+./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
+```
+
+Unit tests run against temporary directories and mocked system commands. They never touch your real caches, settings or launch agents. The `LiveSystem` tests make read-only calls to macOS.
+
+## Docs
+
+- [Architecture](docs/ARCHITECTURE.md): components, data flow, UI security model, app process model, with a [diagram](docs/architecture.png)
+- [Support and troubleshooting](docs/SUPPORT.md)
 
 ## Notes
 
-- It always runs under Apple's `/usr/bin/python3`. On recent macOS, Homebrew or pyenv Python can't see other processes' sockets, so the script re-runs itself under the system interpreter.
-- Network detection uses heuristics over the kernel's socket table (`netstat -anv`), not packet inspection. For per-app outbound blocking, pair it with a firewall such as LuLu.
-- Project build folders (`node_modules`, `target`, `build`, `.venv` and so on) are only offered for cleanup when the project hasn't been edited for `--stale-days` (default 30). `build` and `dist` count only when they sit next to a matching build file.
+- It always runs under Apple's `/usr/bin/python3`. On recent macOS other interpreters, and the children of ad-hoc signed apps, can't see other processes' sockets. The app runs its engine as a short-lived launchd job for the same reason.
+- Network detection uses heuristics over the kernel's socket table, not packet inspection. For per-app outbound blocking, pair it with a firewall such as LuLu.
+- The app is ad-hoc signed for local use. To distribute it more widely, sign it with a Developer ID and notarize it.
