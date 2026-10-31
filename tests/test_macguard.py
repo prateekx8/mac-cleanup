@@ -383,6 +383,161 @@ class TestSecurity(TempHome):
         self.assertNotIn("notes.key", details)
 
 
+# ---------------------------------------------------------------- applications
+
+def APP(name="Thing", sig="developer:Acme (ABCDE12345)", seal_ok=True, archs=("arm64",), bundle_id="com.acme.thing",
+        path=None, updated=None, version="1.0"):
+    return dict(name=name, sig=sig, seal_ok=seal_ok, archs=list(archs), bundle_id=bundle_id, version=version,
+                path=path or f"/Applications/{name}.app", exe=f"/Applications/{name}.app/Contents/MacOS/{name}",
+                updated=updated if updated is not None else time.time())
+
+
+class TestApps(TempHome):
+    def titles(self, apps=(), casks=(), formulae=(), helpers=(), exts=(), updates=None, machine="arm64"):
+        return {(s, t) for s, t, _ in mg.analyze_apps(list(apps), list(casks), list(formulae), list(helpers), list(exts),
+                                                      updates, machine=machine)}
+
+    def test_inventory_reads_info_plist(self):
+        import plistlib
+        apps_dir = os.path.join(self.home, "Applications")
+        for name, ver in (("Alpha", "2.1"), ("Beta", "0.9")):
+            contents = os.path.join(apps_dir, f"{name}.app", "Contents")
+            os.makedirs(os.path.join(contents, "MacOS"))
+            with open(os.path.join(contents, "Info.plist"), "wb") as fh:
+                plistlib.dump({"CFBundleName": name, "CFBundleShortVersionString": ver,
+                               "CFBundleIdentifier": f"com.test.{name.lower()}", "CFBundleExecutable": name}, fh)
+        with mock.patch.object(mg, "app_dirs", lambda: [apps_dir]):
+            apps = mg.app_inventory()
+        self.assertEqual([(a["name"], a["version"], a["bundle_id"]) for a in apps],
+                         [("Alpha", "2.1", "com.test.alpha"), ("Beta", "0.9", "com.test.beta")])
+        self.assertTrue(apps[0]["exe"].endswith("Alpha.app/Contents/MacOS/Alpha"))
+
+    def test_clean_app_has_no_findings(self):
+        self.assertEqual(self.titles([APP()]), set())
+
+    def test_broken_seal_unsigned_adhoc(self):
+        t = self.titles([APP("A", seal_ok=False), APP("B", sig="unsigned", seal_ok=None), APP("C", sig="adhoc")])
+        self.assertIn(("high", "App signature broken (modified after signing)"), t)
+        self.assertIn(("medium", "Unsigned app"), t)
+        self.assertIn(("low", "Ad-hoc signed app (no developer identity)"), t)
+
+    def test_risky_and_eol_apps(self):
+        t = self.titles([APP("TeamViewer", bundle_id="com.teamviewer.TeamViewer"), APP("Adobe Flash Player")])
+        self.assertIn(("medium", "Remote-access tool - a common attack vector; remove it if you don't use it"), t)
+        self.assertIn(("high", "End-of-life software - no security updates any more"), t)
+
+    def test_intel_only_flag_respects_arm64e_and_machine(self):
+        self.assertIn(("low", "Intel-only app (likely unmaintained; needs Rosetta)"), self.titles([APP(archs=("x86_64",))]))
+        self.assertEqual(self.titles([APP(archs=("x86_64", "arm64e"))]), set())
+        self.assertEqual(self.titles([APP(archs=("x86_64",))], machine="x86_64"), set())
+
+    def test_browser_app_shims_are_ignored(self):
+        shim = APP("Chrome Remote Desktop", sig="adhoc", bundle_id="com.google.Chrome.app.abc",
+                   path=f"{self.home}/Applications/Chrome Apps.localized/Chrome Remote Desktop.app")
+        self.assertEqual(self.titles([shim]), set())
+
+    def test_stale_app(self):
+        t = self.titles([APP(updated=time.time() - 4 * 365 * 86400)])
+        self.assertIn(("info", "Not updated in 3+ years"), t)
+
+    def test_outdated_helpers_extensions_updates(self):
+        t = self.titles(casks=[("ollama-app", "0.24.0", "0.40.13")], formulae=[("openssl@3", "3.0.1", "3.4.0")],
+                        helpers=["/Library/PrivilegedHelperTools/com.old.helper"],
+                        exts=[dict(kind="network", name="VPN", team="X", version="1")],
+                        updates=["macOS Security Update 27.0.2-27.0.2"])
+        self.assertIn(("medium", "Outdated app (Homebrew cask)"), t)
+        self.assertIn(("low", "1 outdated Homebrew packages"), t)
+        self.assertIn(("medium", "Orphaned root helper (its app is gone, it still runs as root if loaded)"), t)
+        self.assertIn(("info", "Network extension can see all traffic"), t)
+        self.assertIn(("high", "macOS update available"), t)
+
+    def test_brew_outdated_parsing(self):
+        out = json.dumps({"formulae": [{"name": "git", "installed_versions": ["2.40"], "current_version": "2.47"}],
+                          "casks": [{"name": "zoom", "installed_versions": ["5.0"], "current_version": "6.2"}]})
+        with mock.patch.object(mg.shutil, "which", return_value="/opt/homebrew/bin/brew"), \
+                mock.patch.object(mg.subprocess, "run", return_value=mock.Mock(stdout=out)):
+            casks, formulae = mg.brew_outdated()
+        self.assertEqual(casks, [("zoom", "5.0", "6.2")])
+        self.assertEqual(formulae, [("git", "2.40", "2.47")])
+
+    def test_system_extensions_parsing(self):
+        out = ("3 extension(s)\n--- com.apple.system_extension.network_extension (Go to ...)\n"
+               "enabled\tactive\tteamID\tbundleID (version)\tname\t[state]\n"
+               "*\t*\tVBG97UB4TA\tcom.objective-see.lulu.extension (4.5.1/4.5.1)\tLuLu\t[activated enabled]\n"
+               "--- com.apple.system_extension.driver_extension (Go to ...)\n"
+               "*\t*\t5JZGQTGU4W\tcn.wch.CH34xVCPDriver (1.0/1)\tcn.wch.CH34xVCPDriver\t[activated enabled]\n")
+        with mock.patch.object(mg, "run", return_value=(0, out, "")):
+            exts = mg.system_extensions()
+        self.assertEqual([(e["kind"], e["name"], e["team"]) for e in exts],
+                         [("network", "LuLu", "VBG97UB4TA"), ("driver", "cn.wch.CH34xVCPDriver", "5JZGQTGU4W")])
+
+
+# ---------------------------------------------------------------- traffic
+
+def SOCK(pid, proc, rhost, rport, rx, tx, state="ESTABLISHED", lport=50000):
+    return dict(proto="tcp4", lhost="192.168.1.10", lport=lport, rhost=rhost, rport=rport, state=state, proc=proc, pid=pid,
+                rx=rx, tx=tx)
+
+
+class TestTraffic(unittest.TestCase):
+    def setUp(self):
+        for p in (mock.patch.object(mg, "signature", lambda path: "unsigned" if "evil" in path else "apple"),
+                  mock.patch.object(mg, "exe_path", lambda pid: {1: "/Applications/Up.app/Contents/MacOS/uploader",
+                                                                 2: "/Applications/Dropbox.app/Contents/MacOS/Dropbox",
+                                                                 3: "/tmp/x/evil",
+                                                                 4: "/opt/evil/scanner",
+                                                                 5: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}.get(pid, "")),
+                  mock.patch.object(mg.time, "sleep", lambda s: None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def sample(self, before, after, seconds=5):
+        with mock.patch.object(mg, "sockets", side_effect=[before, after]):
+            return mg.traffic_sample(seconds)
+
+    def test_sample_computes_rates_and_hosts(self):
+        procs = self.sample([SOCK(1, "uploader", "34.1.1.1", 443, 1000, 1000)],
+                            [SOCK(1, "uploader", "34.1.1.1", 443, 6000, 51000), SOCK(1, "uploader", "34.1.1.2", 443, 0, 5000, lport=50001)])
+        p = procs[0]
+        self.assertEqual((p["rx"], p["tx"], p["new"]), (5000, 55000, 1))
+        self.assertEqual(p["tx_rate"], 11000)
+        self.assertEqual(p["hosts"], {"34.1.1.1", "34.1.1.2"})
+        self.assertEqual(p["proc"], "uploader")
+        self.assertEqual(mg.traffic_json(procs)[0]["hosts"], 2)
+
+    def titles(self, after, seconds=5):
+        return {(s, t) for s, t, _ in mg.analyze_traffic(self.sample([], after, seconds), seconds)}
+
+    def test_heavy_upload_flagged_but_not_for_backup_apps(self):
+        big = 20 * 1024 ** 2
+        t = self.titles([SOCK(1, "uploader", "34.1.1.1", 443, 1000, big)])
+        self.assertIn(("medium", "Heavy upload (possible data exfiltration)"), t)
+        self.assertEqual(self.titles([SOCK(2, "Dropbox", "34.1.1.1", 443, 1000, big)]), set())
+
+    def test_temp_dir_program_online(self):
+        self.assertIn(("high", "Program in a temp/download folder is using the internet"),
+                      self.titles([SOCK(3, "evil", "45.1.1.1", 443, 10, 10)]))
+
+    def test_outbound_scan(self):
+        conns = [SOCK(4, "scanner", f"45.1.1.{i}", 22, 0, 60, state="SYN_SENT", lport=50000 + i) for i in range(12)]
+        t = self.titles(conns)
+        self.assertIn(("high", "Outbound scanning: port 22 on 12 hosts"), t)
+        self.assertIn(("medium", "Many connection attempts not answered (scanner or C2 retry)"), t)
+        self.assertIn(("medium", "Unsigned program is using the internet"), t)
+
+    def test_suspicious_and_uncommon_ports(self):
+        self.assertIn(("high", "Traffic to suspicious port 4444 (metasploit default)"),
+                      self.titles([SOCK(1, "uploader", "45.1.1.1", 4444, 10, 10)]))
+        self.assertIn(("low", "Traffic on uncommon ports"), self.titles([SOCK(1, "uploader", "45.1.1.1", 7777, 10, 10)]))
+
+    def test_browser_many_hosts_is_normal(self):
+        conns = [SOCK(5, "Google Chrome", f"34.1.{i // 250}.{i % 250}", 443, 100, 100, lport=40000 + i) for i in range(60)]
+        self.assertEqual(self.titles(conns), set())
+
+    def test_private_traffic_ignored(self):
+        self.assertEqual(self.titles([SOCK(1, "uploader", "192.168.1.20", 7777, 10, 10)]), set())
+
+
 # ---------------------------------------------------------------- watch / settings
 
 class TestWatchAndSettings(TempHome):
@@ -567,6 +722,13 @@ class TestWebUI(TempHome):
             sec = json.loads(self.req("/api/security")[1])
             net = json.loads(self.req("/api/net")[1])
         self.assertEqual(sec[0]["title"], "Firewall off")
+        with mock.patch.object(mg, "apps_report", return_value=([APP()], [("high", "Unsigned app", "x")])), \
+                mock.patch.object(mg, "traffic_sample", return_value=[]), \
+                mock.patch.object(mg, "analyze_traffic", return_value=[("high", "Heavy upload", "y")]):
+            apps = json.loads(self.req("/api/apps")[1])
+            traffic = json.loads(self.req("/api/traffic")[1])
+        self.assertEqual((apps["count"], apps["findings"][0]["title"]), (1, "Unsigned app"))
+        self.assertEqual((traffic["seconds"], traffic["findings"][0]["title"]), (6, "Heavy upload"))
         self.assertTrue(net["listeners"][0]["exposed"])
         self.assertEqual(net["findings"][0]["sev"], "high")
 
@@ -644,7 +806,7 @@ class LiveSystem(unittest.TestCase):
         import subprocess
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
         out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
-        for cmd in ("scan", "clean", "net", "security", "watch", "report", "settings", "ui", "doctor"):
+        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "watch", "report", "settings", "ui", "doctor"):
             self.assertIn(cmd, out)
 
 

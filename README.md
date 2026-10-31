@@ -6,6 +6,7 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 
 - **Disk cleanup**: sizes up junk by category. Each category is marked **safe** (caches that regenerate) or **review** (your call). It deletes nothing without confirmation, and only inside your home folder.
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
+- **Apps and traffic**: flags installed apps with broken or missing signatures, outdated, end-of-life or remote-access apps and orphaned root helpers, and samples live traffic per process to spot heavy uploads, scanning or odd destinations.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
 - **Three front ends**: a native **Mac Cleanup.app**, a local **web UI** with a glass design, and the **`macguard` CLI**.
@@ -32,6 +33,8 @@ Standard-library Python plus a small Swift wrapper. No root, no telemetry, nothi
 | `macguard clean --only android-avd,project-artifacts --apply` | Clean specific **review** items. |
 | `macguard security` | Security posture audit. |
 | `macguard net` | Network snapshot and threat findings. |
+| `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
+| `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
 | `macguard report` | Static HTML report in `~/.macguard/report.html`. |
@@ -41,7 +44,7 @@ Standard-library Python plus a small Swift wrapper. No root, no telemetry, nothi
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 58 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 75 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

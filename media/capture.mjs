@@ -149,7 +149,7 @@ await card("app", `${bigIcon(LONG ? 130 : 150)}
 <span class="g">❯</span> <span class="w">./build_app.sh --install</span>
 
 <span class="d"># or one-click setup + tests</span>
-<span class="g">❯</span> <span class="w">./setup.sh</span>   <span class="g">✔ 58 tests passed</span></pre></div>`);
+<span class="g">❯</span> <span class="w">./setup.sh</span>   <span class="g">✔ 75 tests passed</span></pre></div>`);
 
 await card("privacy", `<h1 style="font-size:${LONG ? 64 : 46}px;margin-bottom:30px">Private by <span class="grad">design</span></h1>
   <ul class="glass" style="width:${LONG ? "760px" : "390px"}">

@@ -10,13 +10,13 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 
 | Part | File | Responsibility |
 |---|---|---|
-| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `watch`, `report`, `settings`, `ui`, `doctor`). |
+| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `apps`, `traffic`, `watch`, `report`, `settings`, `ui`, `doctor`). |
 | Web UI | `ui.html` | A single page with vanilla JS and glassmorphism styling. It talks to the engine's JSON API. |
 | Native app | `app/main.swift` | An AppKit window with a `WKWebView`. It starts the engine and shows the UI. |
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 58 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 75 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -55,6 +55,29 @@ flowchart LR
   - many connections from one remote address (a likely scan)
   - a gateway MAC address shared with another IP (ARP spoofing)
 - **Limitation:** this inspects socket tables, not packets.
+
+### Apps
+
+- `app_inventory()` reads each bundle's `Info.plist` with `plistlib`. `app_trust()` adds the signer from `codesign -dv`, a seal check from `codesign --verify` (third-party apps only, run in parallel) and the architectures from `lipo -archs`.
+- `analyze_apps()` flags:
+  - broken seals (modified after signing)
+  - unsigned or ad-hoc apps (browser web-app shims are skipped)
+  - end-of-life and remote-access software (`RISKY_APPS`)
+  - Intel-only apps on Apple Silicon
+  - apps not updated in 3+ years
+  - outdated Homebrew casks and formulae (`brew outdated --json=v2`, no auto-update)
+  - orphaned root helpers and third-party system extensions
+- **Limitation:** CVE matching needs an online vulnerability database, which isn't included. Outdated, unsigned and end-of-life software is the offline signal for "likely vulnerable". `--online` adds pending macOS updates from `softwareupdate --list`.
+
+### Traffic
+
+- `traffic_sample()` takes two `netstat -anv` snapshots a few seconds apart and diffs each socket's `rxbytes`/`txbytes` (TCP and UDP/QUIC) to get per-process rates and public destinations.
+- `analyze_traffic()` flags:
+  - heavy uploads by programs that aren't known uploaders (possible exfiltration)
+  - outbound scanning (one port on 10+ hosts)
+  - many unanswered SYNs
+  - unsigned or temp-folder programs online
+  - suspicious or uncommon ports
 
 ### Watch
 

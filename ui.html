@@ -138,6 +138,21 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .netinfo div{padding:12px 14px;border-radius:14px;background:var(--glass);border:1px solid var(--stroke);font:12.5px/1.5 var(--mono);word-break:break-all}
 .netinfo .k{display:block;font:500 12px var(--font);color:var(--fg-3);margin-bottom:2px}
 
+/* traffic */
+.top{padding:2px 10px 6px}
+.tr{display:grid;grid-template-columns:minmax(0,1.3fr) 2fr 70px 70px;gap:12px;align-items:center;padding:8px 12px;border-radius:12px;font-size:13px}
+.tr:hover{background:var(--glass)}
+.tr .n{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tr .n small{display:block;color:var(--fg-3);font:11px var(--mono);font-weight:400}
+.tr .bars{display:flex;flex-direction:column;gap:4px}
+.tr .bars i{display:block;height:6px;border-radius:3px;min-width:3px}
+.tr .bars .d{background:linear-gradient(90deg,#3fa9ff,#2ee6c5)}.tr .bars .u{background:linear-gradient(90deg,#7c5cff,#ff4d9d)}
+.tr .v{text-align:right;font:12px var(--mono);color:var(--fg-2)}
+.tr.h{color:var(--fg-3);font-size:11.5px;font-weight:600;padding-top:2px;padding-bottom:2px}
+.tr.h:hover{background:none}
+.legend{display:flex;gap:14px;padding:0 22px 6px;color:var(--fg-3);font-size:12px}
+.legend i{display:inline-block;width:10px;height:6px;border-radius:3px;margin-right:6px;vertical-align:1px}
+
 /* watcher */
 .watch{display:flex;align-items:center;gap:18px}
 .switch{position:relative;width:52px;height:31px;flex:none}
@@ -215,6 +230,18 @@ footer code{font-family:var(--mono)}
   </section>
 
   <section class="panel glass">
+    <div class="ph"><span class="ic">🧩</span><div class="grow"><h2>Applications</h2><small>Broken or missing signatures, outdated, end-of-life and risky apps, root helpers</small></div>
+      <button class="btn ghost sm" id="appsBtn">Check</button></div>
+    <div id="apps" class="empty">Not checked yet. Takes ~20 seconds.</div>
+  </section>
+
+  <section class="panel glass">
+    <div class="ph"><span class="ic">📈</span><div class="grow"><h2>Live traffic</h2><small>Who's sending data right now: heavy uploads, scanning, odd ports</small></div>
+      <button class="btn ghost sm" id="trafficBtn">Sample 6s</button></div>
+    <div id="traffic" class="empty">Not sampled yet.</div>
+  </section>
+
+  <section class="panel glass">
     <div class="ph watch"><span class="ic">👁️</span><div class="grow"><h2>Background watcher</h2><small id="wTxt">Off unless you turn it on.</small></div>
       <label class="switch" aria-label="Background watcher"><input type="checkbox" id="wToggle"><span></span></label></div>
   </section>
@@ -257,10 +284,10 @@ function showDisk(d){
   $("ringTxt").textContent = Math.round(freePct) + "%";
 }
 
-let items = [], picked = new Set(), open = null, issues = {sec:null, net:null};
+let items = [], picked = new Set(), open = null, issues = {sec:null, net:null, apps:null, traffic:null};
 function countIssues(){
-  const n = (issues.sec??0) + (issues.net??0);
-  $("sIssues").textContent = (issues.sec===null && issues.net===null) ? "—" : n;
+  const v = Object.values(issues);
+  $("sIssues").textContent = v.every(x => x===null) ? "—" : v.reduce((a,b)=>a+(b??0),0);
 }
 function renderItems(){
   $("sSafe").textContent = human(items.filter(i=>i.risk==="safe").reduce((a,b)=>a+b.size,0));
@@ -347,8 +374,35 @@ async function checkNet(){
   } catch(e){ $("net").textContent = "Failed: " + e.message; }
   busy($("netBtn"), false, "Recheck");
 }
+async function checkApps(){
+  busy($("appsBtn"), true);
+  $("apps").className="empty"; $("apps").innerHTML='<span class="spin"></span>&nbsp; Checking signatures, architectures and updates…';
+  try { const r = await api("/api/apps"); $("apps").className="";
+        $("apps").innerHTML = `<div class="legend">${r.count} apps scanned</div>` + renderFindings(r.findings);
+        issues.apps = serious(r.findings); countIssues(); }
+  catch(e){ $("apps").textContent = "Failed: " + e.message; }
+  busy($("appsBtn"), false, "Recheck");
+}
+async function checkTraffic(){
+  busy($("trafficBtn"), true);
+  $("traffic").className="empty"; $("traffic").innerHTML='<span class="spin"></span>&nbsp; Measuring traffic for 6 seconds…';
+  try {
+    const r = await api("/api/traffic"); $("traffic").className="";
+    const max = Math.max(1, ...r.top.map(p => Math.max(p.rx_rate, p.tx_rate)));
+    const rows = r.top.map(p => `<div class="tr"><div class="n">${esc(p.proc)}<small>${p.hosts} public host${p.hosts===1?"":"s"}${p.ports.length?" · ports "+p.ports.join(", "):""}</small></div>
+      <div class="bars"><i class="d" style="width:${(p.rx_rate/max*100).toFixed(1)}%"></i><i class="u" style="width:${(p.tx_rate/max*100).toFixed(1)}%"></i></div>
+      <div class="v">${human(p.rx_rate)}/s</div><div class="v">${human(p.tx_rate)}/s</div></div>`).join("");
+    $("traffic").innerHTML = `<div class="legend"><span><i style="background:linear-gradient(90deg,#3fa9ff,#2ee6c5)"></i>Download</span>
+        <span><i style="background:linear-gradient(90deg,#7c5cff,#ff4d9d)"></i>Upload</span></div>
+      <div class="top"><div class="tr h"><div>Process</div><div></div><div class="v">Down</div><div class="v">Up</div></div>
+      ${rows || '<div class="empty">No traffic during the sample.</div>'}</div>${renderFindings(r.findings)}`;
+    issues.traffic = serious(r.findings); countIssues();
+  } catch(e){ $("traffic").textContent = "Failed: " + e.message; }
+  busy($("trafficBtn"), false, "Sample again");
+}
 $("secBtn").onclick = checkSec; $("netBtn").onclick = checkNet;
-$("checkAll").onclick = () => { checkSec(); checkNet(); };
+$("appsBtn").onclick = checkApps; $("trafficBtn").onclick = checkTraffic;
+$("checkAll").onclick = () => { checkSec(); checkNet(); checkApps(); checkTraffic(); };
 
 async function loadSettings(){
   const s = await api("/api/settings"); $("wToggle").checked = s.background_watcher;

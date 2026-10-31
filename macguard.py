@@ -6,6 +6,8 @@ Commands:
   clean                Clean junk (dry-run unless --apply)
   net                  Network snapshot: listeners, connections, ARP/DNS, threats
   security             Security posture audit (firewall, SIP, launch agents, ...)
+  apps                 Installed apps: broken/missing signatures, outdated, risky, EOL
+  traffic              Sample live traffic: heavy uploads, scanning, odd ports
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
   ui                   Small local web UI: scan, pick categories, clean, run checks
@@ -24,11 +26,13 @@ import html
 import ipaddress
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(HOME, ".macguard")
@@ -419,7 +423,11 @@ def sockets():
             state = parts[5] if proto == "tcp" else ("LISTEN" if remote == "*.*" else "UDP")
             lh, lp = split_addr(local)
             rh, rp = split_addr(remote)
-            rows.append(dict(proto=parts[0], lhost=lh, lport=lp, rhost=rh, rport=rp, state=state, proc=proc, pid=pid))
+            # byte counters follow the (state) column for tcp; udp has no state column
+            b = parts[6:8] if proto == "tcp" else parts[5:7]
+            rx, tx = (int(b[0]), int(b[1])) if len(b) == 2 and b[0].isdigit() and b[1].isdigit() else (0, 0)
+            rows.append(dict(proto=parts[0], lhost=lh, lport=lp, rhost=rh, rport=rp, state=state, proc=proc, pid=pid,
+                             rx=rx, tx=tx))
     return rows
 
 
@@ -647,6 +655,269 @@ def cmd_security(args, quiet=False):
         print(f"{C['B']}Security posture{C['x']}")
         print_findings(uniq)
     return uniq
+
+
+# ---------------------------------------------------------------- installed applications
+
+# Matched case-insensitively against app name / bundle id. Not "malware": software that
+# widens your attack surface or is end-of-life, so you should know it is there.
+RISKY_APPS = [
+    (("teamviewer", "anydesk", "logmein", "splashtop", "rustdesk", "screenconnect", "connectwise", "gotomypc", "ammyy",
+      "chrome remote desktop"), "medium", "Remote-access tool - a common attack vector; remove it if you don't use it"),
+    (("mackeeper", "cleanmymac x", "ccleaner", "advanced mac cleaner", "mac auto fixer"), "low",
+     "System 'cleaner' with privileged background helpers"),
+    (("flash player", "shockwave", "silverlight", "java 6", "quicktime player 7"), "high",
+     "End-of-life software - no security updates any more"),
+    (("utorrent", "bittorrent", "vuze"), "low", "Torrent client - often bundled with adware; exposes ports"),
+]
+
+
+def read_plist(path):
+    try:
+        with open(path, "rb") as fh:
+            return plistlib.load(fh)
+    except Exception:
+        return {}
+
+
+def app_dirs():
+    return ["/Applications", "/Applications/Utilities", f"{HOME}/Applications"]
+
+
+def app_inventory():
+    """Third-party and Apple apps in the usual folders (one level of sub-folders too)."""
+    seen, apps = set(), []
+    for d in app_dirs():
+        for path in glob.glob(f"{d}/*.app") + glob.glob(f"{d}/*/*.app"):
+            real = os.path.realpath(path)
+            if real in seen:
+                continue
+            seen.add(real)
+            info = read_plist(os.path.join(path, "Contents", "Info.plist"))
+            exe = os.path.join(path, "Contents", "MacOS", info.get("CFBundleExecutable", ""))
+            try:
+                mtime = os.stat(os.path.join(path, "Contents", "Info.plist")).st_mtime
+            except OSError:
+                mtime = 0
+            apps.append(dict(name=info.get("CFBundleDisplayName") or info.get("CFBundleName") or os.path.basename(path)[:-4],
+                             path=path, bundle_id=info.get("CFBundleIdentifier", ""),
+                             version=str(info.get("CFBundleShortVersionString") or info.get("CFBundleVersion") or "?"),
+                             exe=exe, updated=mtime))
+    return sorted(apps, key=lambda a: a["name"].lower())
+
+
+def app_trust(app):
+    """Signature identity + whether the bundle seal still verifies (tampering) + architectures."""
+    sig = signature(app["exe"]) if os.path.exists(app["exe"]) else "missing"
+    verify = None
+    if sig not in ("apple", "missing", "unsigned"):
+        rc, _, err = run(["codesign", "--verify", app["path"]], timeout=45)  # --strict also rejects harmless Finder xattrs
+        verify = rc == 0 or "timed out" in err
+    _, out, _ = run(["lipo", "-archs", app["exe"]], timeout=10)
+    return dict(app, sig=sig, seal_ok=verify, archs=out.split())
+
+
+def brew_outdated():
+    if not shutil.which("brew"):
+        return [], []
+    env = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_ANALYTICS="1")
+    try:
+        p = subprocess.run(["brew", "outdated", "--json=v2"], capture_output=True, text=True, timeout=90, env=env)
+        d = json.loads(p.stdout or "{}")
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return [], []
+    fmt = lambda x: (x["name"], ", ".join(x.get("installed_versions") or [])[:30], x.get("current_version", "?"))  # noqa: E731
+    return [fmt(c) for c in d.get("casks", [])], [fmt(f) for f in d.get("formulae", [])]
+
+
+def orphan_root_helpers():
+    """Root helpers in /Library/PrivilegedHelperTools that no LaunchDaemon references any more."""
+    referenced = set()
+    for p in glob.glob("/Library/LaunchDaemons/*.plist"):
+        d = read_plist(p)
+        prog = d.get("Program") or (d.get("ProgramArguments") or [None])[0]
+        if prog:
+            referenced.add(os.path.basename(prog))
+        referenced.add(d.get("Label", ""))
+    return [h for h in glob.glob("/Library/PrivilegedHelperTools/*") if os.path.basename(h) not in referenced]
+
+
+def system_extensions():
+    _, out, _ = run(["systemextensionsctl", "list"], timeout=15)
+    exts, kind = [], ""
+    for line in out.splitlines():
+        if line.startswith("---"):
+            kind = "network" if "network_extension" in line else ("driver" if "driver" in line else "system")
+            continue
+        m = re.search(r"\t(\w{10})\t(\S+) \(([^)]*)\)\t(.+?)\t\[(.+)\]", line)
+        if m:
+            exts.append(dict(kind=kind, team=m.group(1), bundle=m.group(2), version=m.group(3), name=m.group(4), state=m.group(5)))
+    return exts
+
+
+def analyze_apps(apps, casks, formulae, helpers, exts, macos_updates=None, machine=None):
+    f = []
+    arm = (machine or os.uname().machine) == "arm64"
+    stale = time.time() - 3 * 365 * 86400
+    for a in apps:
+        # Chrome/Edge "install as app" shortcuts are ad-hoc signed stubs generated by the browser
+        if "Chrome Apps.localized" in a["path"] or "Edge Apps.localized" in a["path"] or \
+                re.match(r"com\.(google\.Chrome|microsoft\.edgemac)\.app\.", a["bundle_id"]):
+            continue
+        label = f"{a['name']} {a['version']}"
+        key = f"{a['name']} {a['bundle_id']}".lower()
+        if a.get("seal_ok") is False:
+            f.append(("high", "App signature broken (modified after signing)", f"{label} - {a['path']}"))
+        if a["sig"] == "unsigned":
+            f.append(("medium", "Unsigned app", f"{label} - {a['path']}"))
+        elif a["sig"] == "adhoc":
+            f.append(("low", "Ad-hoc signed app (no developer identity)", f"{label} - {a['path']}"))
+        for words, sev, why in RISKY_APPS:
+            if any(w in key for w in words):
+                f.append((sev, why, label))
+        if arm and a["archs"] and not any(x.startswith("arm64") for x in a["archs"]):
+            f.append(("low", "Intel-only app (likely unmaintained; needs Rosetta)", label))
+        if a["updated"] and a["updated"] < stale and a["sig"] != "apple":
+            f.append(("info", "Not updated in 3+ years", f"{label} (bundle dated {dt.datetime.fromtimestamp(a['updated']):%Y-%m-%d})"))
+    for name, have, latest in casks:
+        f.append(("medium", "Outdated app (Homebrew cask)", f"{name} {have} -> {latest}  (brew upgrade --cask {name})"))
+    if formulae:
+        names = ", ".join(n for n, _, _ in formulae[:12]) + (" ..." if len(formulae) > 12 else "")
+        f.append(("low", f"{len(formulae)} outdated Homebrew packages", f"{names}  (brew upgrade)"))
+    for h in helpers:
+        f.append(("medium", "Orphaned root helper (its app is gone, it still runs as root if loaded)", h))
+    for e in exts:
+        if e["kind"] == "network":
+            f.append(("info", "Network extension can see all traffic", f"{e['name']} ({e['team']}) {e['version']}"))
+        elif e["kind"] == "driver":
+            f.append(("info", "Third-party driver extension", f"{e['name']} ({e['team']}) {e['version']}"))
+    if macos_updates:
+        for u in macos_updates:
+            f.append(("high" if "security" in u.lower() or "macos" in u.lower() else "medium", "macOS update available", u))
+    return f
+
+
+def macos_pending_updates():
+    """Asks Apple's update server (network, slow) - only with --online."""
+    _, out, err = run(["softwareupdate", "--list"], timeout=120)
+    return [l.split("Label:")[1].strip() for l in (out + err).splitlines() if "Label:" in l]
+
+
+def apps_report(online=False):
+    apps = app_inventory()
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        apps = list(ex.map(app_trust, apps))
+    casks, formulae = brew_outdated()
+    findings = analyze_apps(apps, casks, formulae, orphan_root_helpers(), system_extensions(),
+                            macos_pending_updates() if online else None)
+    return apps, findings
+
+
+def cmd_apps(args):
+    print(f"{C['B']}Installed applications{C['x']}  {C['d']}(checking signatures, architectures, updates...){C['x']}")
+    apps, findings = apps_report(args.online)
+    if args.list:
+        for a in apps:
+            print(f"  {a['name'][:30]:<30} {a['version'][:14]:<14} {C['d']}{a['sig'][:40]:<40} {'/'.join(a['archs'])}{C['x']}")
+        print()
+    print(f"  {len(apps)} apps scanned\n")
+    print_findings(findings)
+    if not args.online:
+        print(f"\n{C['d']}Tip: --online also asks Apple for pending macOS security updates.{C['x']}")
+
+
+# ---------------------------------------------------------------- traffic
+
+KNOWN_UPLOADERS = ("backupd", "bird", "cloudd", "Dropbox", "Google Drive", "OneDrive", "Backblaze", "bztransmit", "rsync",
+                   "ssh", "scp", "git", "git-remote-http", "docker", "com.docker", "photolibraryd", "nsurlsessiond",
+                   "Zoom", "zoom.us", "Teams", "Slack", "FaceTime", "avconferenced", "Google Chrome", "Safari", "firefox",
+                   "Arc", "Brave", "Microsoft Edge", "Chrome Helper", "WebKit", "OBS", "ffmpeg")
+BROWSERS = ("Google Chrome", "Chrome Helper", "Safari", "WebKit", "firefox", "Arc", "Brave", "Microsoft Edge", "com.apple.WebKit")
+COMMON_PORTS = {53, 80, 123, 443, 853, 993, 995, 465, 587, 5223, 5228, 3478, 3479, 19302, 8443, 4070, 2197, 22, 9418}
+SCAN_PORTS = {21, 22, 23, 25, 135, 139, 445, 1433, 3306, 3389, 5432, 5900, 6379, 8080, 9200, 27017}
+
+
+def traffic_sample(seconds=6):
+    """Two netstat snapshots `seconds` apart -> per-process bytes in/out and destinations."""
+    def snap():
+        return {(r["proto"], r["lhost"], r["lport"], r["rhost"], r["rport"], r["pid"]): r
+                for r in sockets() if r["rhost"] not in ("*",) and r["state"] != "LISTEN"}
+    a = snap()
+    time.sleep(seconds)
+    b = snap()
+    procs = {}
+    for k, r in b.items():
+        old = a.get(k)
+        drx = r["rx"] - (old["rx"] if old else 0)
+        dtx = r["tx"] - (old["tx"] if old else 0)
+        p = procs.setdefault(r["pid"], dict(pid=r["pid"], proc=r["proc"], rx=0, tx=0, hosts=set(), ports=set(), syn=0,
+                                             port_hosts={}, new=0))
+        p["rx"] += max(drx, 0)
+        p["tx"] += max(dtx, 0)
+        if not old:
+            p["new"] += 1
+        if r["state"] == "SYN_SENT":
+            p["syn"] += 1
+        if not is_private(r["rhost"]):
+            p["hosts"].add(r["rhost"])
+            if r["rport"]:
+                p["ports"].add(r["rport"])
+                p["port_hosts"].setdefault(r["rport"], set()).add(r["rhost"])
+    for p in procs.values():
+        p["exe"] = exe_path(p["pid"]) if p["pid"] else ""
+        if p["exe"]:
+            p["proc"] = os.path.basename(p["exe"])
+        p["rx_rate"], p["tx_rate"] = p["rx"] / seconds, p["tx"] / seconds
+    return sorted(procs.values(), key=lambda p: -(p["rx"] + p["tx"]))
+
+
+def analyze_traffic(procs, seconds):
+    f = []
+    for p in procs:
+        name, exe = p["proc"] or "?", p["exe"]
+        who = f"{name} (pid {p['pid']})"
+        known = any(k.lower() in (name + exe).lower() for k in KNOWN_UPLOADERS)
+        browser = any(k.lower() in (name + exe).lower() for k in BROWSERS)
+        sig = signature(exe) if exe else "unknown"
+        public = bool(p["hosts"])
+        if exe.startswith(SUSPICIOUS_EXE_DIRS) and public:
+            f.append(("high", "Program in a temp/download folder is using the internet", f"{who} {exe}"))
+        elif sig in ("unsigned", "adhoc") and public and (p["rx"] + p["tx"]) > 0:
+            f.append(("medium", f"{'Unsigned' if sig == 'unsigned' else 'Ad-hoc signed'} program is using the internet",
+                      f"{who} {exe} - {human(p['tx'])} up / {human(p['rx'])} down"))
+        if p["tx_rate"] > 1.5 * 1024 ** 2 and p["tx"] > 3 * p["rx"] and not known:
+            f.append(("high" if sig in ("unsigned", "adhoc", "unknown") else "medium", "Heavy upload (possible data exfiltration)",
+                      f"{who} sent {human(p['tx'])} in {seconds}s ({human(p['tx_rate'])}/s) to {', '.join(sorted(p['hosts'])[:3])}"))
+        for port, hosts in p["port_hosts"].items():
+            if port in SCAN_PORTS and len(hosts) >= 10:
+                f.append(("high", f"Outbound scanning: port {port} on {len(hosts)} hosts", f"{who}"))
+        if len(p["hosts"]) >= 40 and not browser:
+            f.append(("medium", "Talking to an unusual number of hosts", f"{who} - {len(p['hosts'])} public hosts in {seconds}s"))
+        if p["syn"] >= 10:
+            f.append(("medium", "Many connection attempts not answered (scanner or C2 retry)", f"{who} - {p['syn']} pending"))
+        odd = sorted(x for x in p["ports"] if x not in COMMON_PORTS and x < 49152)
+        if odd and public and not browser:
+            bad = [x for x in odd if x in SUSPICIOUS_PORTS]
+            if bad:
+                f.append(("high", f"Traffic to suspicious port {bad[0]} ({SUSPICIOUS_PORTS[bad[0]]})", who))
+            else:
+                f.append(("low", "Traffic on uncommon ports", f"{who} -> ports {', '.join(map(str, odd[:6]))}"))
+    return f
+
+
+def traffic_json(procs):
+    return [dict(proc=p["proc"], pid=p["pid"], exe=p["exe"], rx_rate=p["rx_rate"], tx_rate=p["tx_rate"],
+                 hosts=len(p["hosts"]), ports=sorted(p["ports"])[:8]) for p in procs if p["rx"] + p["tx"] > 0][:12]
+
+
+def cmd_traffic(args):
+    print(f"{C['B']}Sampling network traffic for {args.seconds}s...{C['x']}", flush=True)
+    procs = traffic_sample(args.seconds)
+    print(f"\n  {'process':<26} {'down/s':>9} {'up/s':>9}  hosts")
+    for p in [p for p in procs if p["rx"] + p["tx"] > 0][:15]:
+        print(f"  {p['proc'][:26]:<26} {human(p['rx_rate']):>9} {human(p['tx_rate']):>9}  {len(p['hosts'])}")
+    print(f"\n{C['B']}Findings{C['x']}")
+    print_findings(analyze_traffic(procs, args.seconds))
 
 
 # ---------------------------------------------------------------- watch mode
@@ -944,6 +1215,12 @@ def cmd_ui(args):
                                           "exposed": not (s["lhost"].startswith("127.") or s["lhost"] == "::1")})
                 return self.send(200, {"gateway": snap["gateway"], "gateway_mac": snap["gateway_mac"], "dns": snap["dns"],
                                        "listeners": listeners, "findings": findings_json(analyze_net(snap))})
+            if self.path == "/api/apps":
+                apps, findings = apps_report(online=False)
+                return self.send(200, {"count": len(apps), "findings": findings_json(findings)})
+            if self.path == "/api/traffic":
+                procs = traffic_sample(6)
+                return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
             if self.path == "/api/settings":
                 s = load_settings()
                 s["running"] = run(["launchctl", "print", f"gui/{os.getuid()}/{AGENT_LABEL}"])[0] == 0
@@ -951,10 +1228,12 @@ def cmd_ui(args):
             self.send(404, {"error": "not found"})
 
         def do_POST(self):
+            # read the body first so a rejected request still gets a clean response, not a reset
+            raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 1 << 20))
             if not self.allowed():
                 return self.send(403, {"error": "forbidden"})
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                body = json.loads(raw or b"{}")
             except ValueError:
                 return self.send(400, {"error": "bad json"})
             if self.path == "/api/clean":
@@ -1105,6 +1384,9 @@ def main():
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_clean)
     sub.add_parser("net").set_defaults(fn=cmd_net)
     sub.add_parser("security").set_defaults(fn=cmd_security)
+    p = sub.add_parser("apps"); p.add_argument("--online", action="store_true", help="also check Apple for macOS updates")
+    p.add_argument("--list", action="store_true", help="print every app"); p.set_defaults(fn=cmd_apps)
+    p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=30); p.add_argument("--once", action="store_true")
     p.add_argument("--reset", action="store_true", help="re-learn the baseline")
     p.add_argument("--agent", action="store_true", help=argparse.SUPPRESS); p.set_defaults(fn=cmd_watch)
