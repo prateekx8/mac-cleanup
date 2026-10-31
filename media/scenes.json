@@ -1,0 +1,30 @@
+{
+  "long": [
+    {"shot": "title",    "say": "Meet Mac Cleanup. A free, local tool that keeps a developer's Mac light, and safe."},
+    {"shot": "problem",  "say": "If you build software on a Mac, junk piles up quietly. Xcode DerivedData, old simulators, stale node modules, and caches from every package manager."},
+    {"shot": "hero",     "say": "Mac Cleanup puts it all in one place. Everything runs on your machine. Nothing is uploaded, and nothing is deleted without your say."},
+    {"shot": "scanning", "say": "Press Scan. It checks caches, simulators, old IDE versions, and your project folders."},
+    {"shot": "results",  "say": "Results come back as cards. Green items are safe caches that rebuild themselves, so they're pre-selected. Amber items need your judgement."},
+    {"shot": "paths",    "say": "Open any card to see exactly which folders it found, and how big each one is."},
+    {"shot": "review",   "say": "Want an amber item gone too? Just tap it. The dock at the bottom keeps a running total."},
+    {"shot": "cleaning", "say": "When you're happy, hit Clean selected, and confirm."},
+    {"shot": "cleaned",  "say": "Twenty five gigabytes back, in seconds. The free space ring updates right away."},
+    {"shot": "security", "say": "Next, security. One click audits your firewall, disk encryption, sharing services, startup items, and even private keys left lying in Downloads."},
+    {"shot": "network",  "say": "The network check lists every service open to your network, with the program behind it, and flags risky ones like an exposed Redis, or Screen Sharing."},
+    {"shot": "watcher",  "say": "Want ongoing protection? Turn on the background watcher. It alerts you when something new opens a port, or your router or DNS changes. It's off by default."},
+    {"shot": "light",    "say": "It follows your system theme, and looks just as good in light mode."},
+    {"shot": "cli",      "say": "Prefer the terminal? Everything is also a command, with dry runs by default."},
+    {"shot": "app",      "say": "Install it as a native Mac app, double click the one click setup, or use the command line. It's a single Python file with no dependencies, and fifty eight automated tests."},
+    {"shot": "privacy",  "say": "No root access. No telemetry. Deletes happen only inside your home folder, and only after you confirm."},
+    {"shot": "outro",    "say": "Mac Cleanup. A lighter machine, and a safer one."}
+  ],
+  "short": [
+    {"shot": "hook",     "say": "Your Mac is hiding over twenty gigabytes of developer junk."},
+    {"shot": "scanning", "say": "This free tool finds it in one tap."},
+    {"shot": "results",  "say": "Safe caches are pre-selected. Anything risky waits for you."},
+    {"shot": "cleaned",  "say": "Clean, and twenty five gigabytes are back."},
+    {"shot": "security", "say": "It audits your security too,"},
+    {"shot": "network",  "say": "and shows what's exposed on your network."},
+    {"shot": "outro",    "say": "Mac Cleanup. Local, private, free."}
+  ]
+}
