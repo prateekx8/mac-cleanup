@@ -13,7 +13,18 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 
 Standard-library Python plus a small Swift wrapper. No root, no telemetry, nothing leaves your Mac.
 
+![Mac Cleanup: scan results with safe items pre-selected](docs/screenshot.png)
+
 ## Quick start
+
+```bash
+git clone https://github.com/prateekx8/mac-cleanup.git
+cd mac-cleanup
+./setup.sh                      # checks prerequisites, installs `macguard`, runs the tests
+./build_app.sh --install        # optional: native Mac Cleanup.app in /Applications
+```
+
+Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select --install`) for `/usr/bin/python3` and `swiftc`.
 
 | I want… | Do this |
 |---|---|
@@ -60,3 +71,7 @@ Unit tests run against temporary directories and mocked system commands. They ne
 - It always runs under Apple's `/usr/bin/python3`. On recent macOS other interpreters, and the children of ad-hoc signed apps, can't see other processes' sockets. The app runs its engine as a short-lived launchd job for the same reason.
 - Network detection uses heuristics over the kernel's socket table, not packet inspection. For per-app outbound blocking, pair it with a firewall such as LuLu.
 - The app is ad-hoc signed for local use. To distribute it more widely, sign it with a Developer ID and notarize it.
+
+## License
+
+[MIT](LICENSE). The narration in the demo videos uses Kokoro-82M (Apache-2.0). The videos show demo data only.
