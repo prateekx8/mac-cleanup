@@ -10,13 +10,13 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 
 | Part | File | Responsibility |
 |---|---|---|
-| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `apps`, `traffic`, `uninstall`, `watch`, `report`, `settings`, `ui`, `doctor`). |
+| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `apps`, `traffic`, `uninstall`, `kill`, `watch`, `report`, `settings`, `ui`, `doctor`). |
 | Web UI | `ui.html` | A single page with vanilla JS and glassmorphism styling. It talks to the engine's JSON API. |
 | Native app | `app/main.swift` | An AppKit window with a `WKWebView`. It starts the engine and shows the UI. |
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 108 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 115 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -82,6 +82,12 @@ flowchart LR
 - `app_leftovers()` matches the app's data in `~/Library` by **exact** bundle ID, or by exact app name for names of 4+ characters that aren't generic. It covers Application Support, Caches, Preferences and ByHost, Containers, Group Containers, Application Scripts, Saved Application State, HTTPStorages, Cookies, WebKit, Logs and LaunchAgents, plus system `/Library/LaunchDaemons`, `/Library/LaunchAgents` and `/Library/PrivilegedHelperTools` entries named after the bundle ID.
 - `do_uninstall()` refuses Apple, system and running apps. It moves each item to `~/.Trash` with `os.rename`, so it's recoverable, and never overwrites a name already there. For root-owned items it falls back to Finder, which asks for your password. The server re-plans from the app's path on every request, so the page never chooses which files go.
 - `orphan_leftovers()` (the `app-leftovers` review item) lists reverse-DNS-named folders and plists whose ID no installed app, Apple app, launch item or running process owns. A shared vendor prefix is flagged "check first". Cleaning these also goes to the Trash.
+
+### Quit app and everything under it
+
+- `app_process_tree()` reads `ps -axo pid,ppid,uid,comm` once. It takes every process whose executable lives inside the app bundle (main app, helpers, XPC services, login items) or in `/Library/PrivilegedHelperTools/<bundle id>*`, adds all their descendants, and removes macguard itself and its ancestors, so it never kills the app or terminal it runs in.
+- `kill_app()` first unloads the app's loaded launch agents (`launchctl bootout gui/<uid>/<label>`) so it can't respawn, which is what kept relaunching CCleaner. It sends TERM to the tree, waits up to 5 s, then sends KILL to survivors. Root-owned processes are reported for `sudo kill`. Core macOS processes (Finder, Dock, WindowServer, loginwindow…) are refused.
+- A real end-to-end test compiles a tiny app binary that forks a child, then checks both are gone.
 
 ### Traffic
 

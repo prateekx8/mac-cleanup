@@ -49,6 +49,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard net` | Network snapshot and threat findings. |
 | `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
 | `macguard uninstall <app> [--apply] [--leftovers-only]` | Dry-run by default: lists the app and every leftover. `--apply` moves them to the Trash; `--leftovers-only` resets the app and keeps it. Also in the UI under Applications → Manage apps. |
+| `macguard kill <app> [--keep-agents]` | Quit an app **and everything under it**: helpers, XPC services, child processes and root helpers. It unloads the app's launch agents first so it can't relaunch, then sends TERM, then KILL after 5 s. Root processes get a ready `sudo kill` line. In the UI, running apps show a badge and a **Quit** button. `uninstall --quit` stops the app before removing it. |
 | `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
@@ -59,7 +60,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 108 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 115 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

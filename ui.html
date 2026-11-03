@@ -175,6 +175,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .app .n{flex:1;min-width:0}
 .app .n small{display:block;color:var(--fg-3);font:11.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .app .lock{font-size:12px;color:var(--fg-3)}
+.chip.running{color:var(--ok);background:color-mix(in srgb,var(--ok) 16%,transparent);white-space:nowrap}
 
 /* watcher */
 .watch{display:flex;align-items:center;gap:18px}
@@ -460,10 +461,13 @@ function renderInstalled(){
   $("appCount").textContent = `${list.length} of ${installed.length} apps`;
   $("appList").innerHTML = list.map((a,i) => `<div class="app"><div class="n">${esc(a.name)} <span style="color:var(--fg-3)">${esc(a.version)}</span>
       <small>${esc(a.bundle_id)} · ${esc(a.path)}</small></div>
+      ${a.processes ? `<span class="chip running" title="${a.processes} process(es)">● running</span>` : ""}
+      ${a.processes && !a.kill_protected ? `<button class="btn ghost sm" data-kill="${esc(a.path)}">Quit</button>` : ""}
       ${a.protected ? `<span class="lock">🔒 ${esc(a.protected)}</span>` :
         `<button class="btn ghost sm" data-reset="${esc(a.path)}">Reset</button><button class="btn danger sm" data-un="${esc(a.path)}">Uninstall</button>`}</div>`).join("")
     || '<div class="empty">No apps match.</div>';
   $("appList").querySelectorAll("[data-un],[data-reset]").forEach(b => b.onclick = () => uninstall(b.dataset.un || b.dataset.reset, !!b.dataset.reset, b));
+  $("appList").querySelectorAll("[data-kill]").forEach(b => b.onclick = () => quitApp(b.dataset.kill, b));
 }
 async function manageApps(){
   busy($("manageBtn"), true);
@@ -471,18 +475,39 @@ async function manageApps(){
   catch(e){ toast("Failed: " + e.message); }
   busy($("manageBtn"), false, "Manage apps");
 }
+async function quitApp(path, btn){
+  busy(btn, true);
+  try {
+    const plan = await api("/api/kill/plan", {path});
+    if (plan.blocked){ toast(`${plan.name}: ${plan.blocked}`); return; }
+    if (!plan.processes.length && !plan.agents.length){ toast(`${plan.name} isn't running`); return; }
+    if (!confirm(`Quit ${plan.name} and everything under it?\nUnsaved work in it is lost.\n\n` +
+                 plan.processes.map(p => `• ${p.pid}  ${p.exe}${p.root ? "  (root - needs sudo)" : ""}`).join("\n") +
+                 (plan.agents.length ? `\n\nAlso unloads launch agents so it can't relaunch:\n` + plan.agents.map(l => `• ${l}`).join("\n") : ""))) return;
+    const r = await api("/api/kill", {path});
+    toast(`${r.name}: stopped ${r.stopped} process(es)` + (r.needs_admin.length ? ` · ${r.needs_admin.length} need sudo` : "") +
+          (r.survivors.length ? ` · ${r.survivors.length} still running` : ""));
+    const a = installed.find(x => x.path === path); if (a) a.processes = r.survivors.length + r.needs_admin.length;
+    renderInstalled();
+  } catch(e){ toast("Failed: " + e.message); }
+  finally { busy(btn, false, "Quit"); }
+}
 async function uninstall(path, leftoversOnly, btn){
   busy(btn, true);
   try {
     const plan = await api("/api/uninstall/plan", {path, leftovers_only: leftoversOnly});
     if (plan.blocked){ toast(`${plan.name}: ${plan.blocked}`); return; }
-    if (plan.running){ toast(`Quit ${plan.name} first`); return; }
+    let quit = false;
+    if (plan.running){
+      if (!confirm(`${plan.name} is running. Quit it and everything under it first? Unsaved work in it is lost.`)) return;
+      quit = true;
+    }
     const sys = plan.items.some(i => i.path.startsWith("/Library/"));
     const what = leftoversOnly ? `Reset ${plan.name} (remove its data, keep the app)` : `Uninstall ${plan.name}`;
     if (!confirm(`${what}?\n\nMoves ${plan.items.length} item(s), ${human(plan.size)}, to the Trash (recoverable until you empty it):\n\n` +
                  plan.items.map(i => `• ${human(i.size)}  ${i.path}`).join("\n") +
                  (sys ? "\n\nSystem-wide items: macOS will ask for your password." : ""))) return;
-    const r = await api("/api/uninstall", {path, leftovers_only: leftoversOnly});
+    const r = await api("/api/uninstall", {path, leftovers_only: leftoversOnly, quit});
     toast(`${r.name}: ${r.moved} item(s), ${human(r.freed)} moved to Trash` + (r.failed.length ? ` · ${r.failed.length} failed` : ""));
     if (!leftoversOnly) { installed = installed.filter(a => a.path !== path); renderInstalled(); }
   } catch(e){ toast("Failed: " + e.message); }

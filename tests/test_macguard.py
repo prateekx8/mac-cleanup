@@ -690,6 +690,101 @@ class TestUninstall(TempHome):
         self.assertEqual(os.listdir(os.path.join(self.home, ".Trash")), ["io.gone.app"])
 
 
+# ---------------------------------------------------------------- quit app + process tree
+
+class TestKill(TempHome):
+    APP = dict(name="Widgetly", bundle_id="io.acme.widgetly", path="/Applications/Widgetly.app", version="1", exe="", updated=0)
+
+    def table(self):
+        me, parent = os.getpid(), os.getppid()
+        return [dict(pid=1, ppid=0, uid=0, exe="/sbin/launchd"),
+                dict(pid=parent, ppid=1, uid=501, exe="/Applications/Widgetly.app/Contents/MacOS/Widgetly"),  # launched us
+                dict(pid=me, ppid=parent, uid=501, exe="/usr/bin/python3"),
+                dict(pid=100, ppid=1, uid=501, exe="/Applications/Widgetly.app/Contents/MacOS/Widgetly"),
+                dict(pid=101, ppid=100, uid=501, exe="/Applications/Widgetly.app/Contents/Frameworks/Widgetly Helper.app/Contents/MacOS/Widgetly Helper"),
+                dict(pid=102, ppid=101, uid=501, exe="/usr/bin/python3"),               # child spawned by the helper
+                dict(pid=200, ppid=1, uid=0, exe="/Library/PrivilegedHelperTools/io.acme.widgetly.daemon"),
+                dict(pid=300, ppid=1, uid=501, exe="/Applications/Widgetly Pro.app/Contents/MacOS/Widgetly Pro"),  # other app
+                dict(pid=301, ppid=1, uid=501, exe="/Applications/Safari.app/Contents/MacOS/Safari")]
+
+    def test_process_table_parses_paths_with_spaces(self):
+        out = "    1     0     0 /sbin/launchd\n  612   600   501 /Applications/Docker.app/Contents/MacOS/Docker Desktop.app/Contents/MacOS/Docker Desktop\n"
+        with mock.patch.object(mg, "run", return_value=(0, out, "")):
+            rows = mg.process_table()
+        self.assertEqual(rows[1], dict(pid=612, ppid=600, uid=501,
+                                       exe="/Applications/Docker.app/Contents/MacOS/Docker Desktop.app/Contents/MacOS/Docker Desktop"))
+
+    def test_tree_includes_helpers_children_and_root_helper_but_not_others_or_ourselves(self):
+        pids = [p["pid"] for p in mg.app_process_tree(self.APP, self.table())]
+        self.assertEqual(pids, [100, 101, 102, 200])
+
+    def test_launch_labels(self):
+        out = "PID\tStatus\tLabel\n-\t0\tio.acme.widgetly.update\n812\t0\tio.acme.widgetlypro\n-\t0\tcom.apple.x\n"
+        with mock.patch.object(mg, "run", return_value=(0, out, "")):
+            self.assertEqual(mg.app_launch_labels(self.APP), ["io.acme.widgetly.update"])
+
+    def test_kill_unloads_agents_then_term_then_kill(self):
+        state = {"alive": {100, 101, 102}}
+        sent, calls = [], []
+
+        def fake_kill(pid, sig):
+            if pid == 200:
+                raise PermissionError(1, "not permitted")
+            sent.append((pid, sig))
+            if sig == 9 or pid != 101:  # the helper ignores TERM, everything dies on KILL
+                state["alive"].discard(pid)
+
+        tree = lambda app, table=None: [p for p in self.table() if p["pid"] in state["alive"] | {200}]  # noqa: E731
+        with mock.patch.object(mg, "app_process_tree", tree), mock.patch.object(mg.os, "kill", fake_kill), \
+                mock.patch.object(mg, "app_launch_labels", return_value=["io.acme.widgetly.update"]), \
+                mock.patch.object(mg, "run", side_effect=lambda cmd, timeout=60: calls.append(cmd) or (0, "", "")):
+            r = mg.kill_app(self.APP, grace=0.3)
+        self.assertEqual(calls[0], ["launchctl", "bootout", f"gui/{os.getuid()}/io.acme.widgetly.update"])
+        self.assertIn((101, 9), sent)  # escalated after the grace period
+        self.assertNotIn((100, 9), sent)  # exited on TERM, no KILL needed
+        self.assertEqual(sorted(p["pid"] for p in r["stopped"]), [100, 101, 102])
+        self.assertEqual([p["pid"] for p in r["needs_admin"]], [200])
+        self.assertEqual(r["survivors"], [])
+        self.assertIn("[kill]", mg.read_text(mg.EVENTS_LOG))
+
+    def test_protected_processes(self):
+        with self.assertRaises(ValueError):
+            mg.kill_app(dict(self.APP, bundle_id="com.apple.finder", path="/System/Library/CoreServices/Finder.app"))
+
+    def test_kill_real_process_tree(self):
+        """End to end: a fake .app whose main process spawns a child; both must be gone afterwards."""
+        import subprocess
+        import shutil
+        cc = shutil.which("cc")
+        if not cc:
+            self.skipTest("needs a C compiler (Xcode Command Line Tools)")
+        bundle = os.path.join(self.tmp, "Sleepy.app")
+        exe = os.path.join(bundle, "Contents", "MacOS", "Sleepy")
+        os.makedirs(os.path.dirname(exe))
+        src = os.path.join(self.tmp, "sleepy.c")
+        with open(src, "w") as fh:  # main process inside the bundle forks a child outside it, then waits
+            fh.write('#include <unistd.h>\n#include <sys/wait.h>\n'
+                     'int main(void){ if (fork()==0) { execl("/bin/sleep","sleep","300",(char*)0); _exit(1);} '
+                     'pause(); return 0; }\n')
+        subprocess.run([cc, "-o", exe, src], check=True, capture_output=True)
+        proc = subprocess.Popen([exe])
+        app = dict(name="Sleepy", bundle_id="io.test.sleepy", path=bundle, version="1", exe=exe, updated=0)
+        try:
+            for _ in range(40):
+                if mg.app_process_tree(app):
+                    break
+                time.sleep(0.05)
+            before = mg.app_process_tree(app)
+            self.assertTrue(before, "fake app not visible in the process table")
+            with mock.patch.object(mg, "app_launch_labels", return_value=[]):
+                r = mg.kill_app(app, grace=2)
+            self.assertEqual(r["survivors"], [])
+            self.assertEqual(mg.app_process_tree(app), [])
+        finally:
+            proc.kill()
+            proc.wait()
+
+
 # ---------------------------------------------------------------- traffic
 
 def SOCK(pid, proc, rhost, rport, rx, tx, state="ESTABLISHED", lport=50000):
@@ -1108,6 +1203,21 @@ class TestWebUI(TempHome):
         self.assertFalse(os.path.exists(app_path))
         self.assertTrue(os.path.exists("/etc/hosts"))
 
+    def test_kill_endpoints(self):
+        app = dict(name="Widgetly", bundle_id="io.acme.widgetly", path="/Applications/Widgetly.app", version="1", exe="", updated=0)
+        procs = [dict(pid=100, ppid=1, uid=os.getuid(), exe="/Applications/Widgetly.app/Contents/MacOS/Widgetly")]
+        with mock.patch.object(mg, "app_inventory", return_value=[app]), \
+                mock.patch.object(mg, "app_process_tree", return_value=procs), \
+                mock.patch.object(mg, "app_launch_labels", return_value=["io.acme.widgetly.update"]), \
+                mock.patch.object(mg, "kill_app", return_value=dict(stopped=procs, unloaded=["io.acme.widgetly.update"],
+                                                                     needs_admin=[], survivors=[])) as k:
+            plan = json.loads(self.req("/api/kill/plan", body={"path": app["path"]})[1])
+            self.assertEqual((plan["processes"][0]["exe"], plan["agents"]), ("<app>/Contents/MacOS/Widgetly", ["io.acme.widgetly.update"]))
+            k.assert_not_called()  # plan never kills
+            r = json.loads(self.req("/api/kill", body={"path": app["path"]})[1])
+            self.assertEqual((r["stopped"], r["survivors"]), (1, []))
+            self.assertEqual(self.req("/api/kill", body={"path": "/Applications/Other.app"})[0], 404)
+
     def test_security_and_net_endpoints(self):
         with mock.patch.object(mg, "cmd_security", return_value=[("high", "Firewall off", "x")]), \
                 mock.patch.object(mg, "net_snapshot", return_value=SNAP(listeners=[L(6379)])), \
@@ -1199,7 +1309,7 @@ class LiveSystem(unittest.TestCase):
         import subprocess
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
         out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
-        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "watch", "report", "settings", "ui", "doctor"):
+        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "watch", "report", "settings", "ui", "doctor"):
             self.assertIn(cmd, out)
 
 

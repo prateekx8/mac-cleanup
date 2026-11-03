@@ -9,6 +9,7 @@ Commands:
   apps                 Installed apps: broken/missing signatures, outdated, risky, EOL
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
+  kill APP             Quit an app and every process under it (helpers, children, launch agents)
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
   ui                   Small local web UI: scan, pick categories, clean, run checks
@@ -1153,9 +1154,139 @@ def protected_app(app):
     return None
 
 
+# processes that keep macOS itself working - never killed
+PROTECTED_PROCESS_IDS = {"com.apple.finder", "com.apple.dock", "com.apple.loginwindow", "com.apple.WindowServer",
+                         "com.apple.systemuiserver", "com.apple.controlcenter", "com.apple.notificationcenterui",
+                         "com.apple.Spotlight", "com.apple.coreservices.uiagent"}
+
+
+def process_table():
+    """[{pid, ppid, uid, exe}] for every process (ps shows full executable paths on macOS)."""
+    _, out, _ = run(["ps", "-axo", "pid=,ppid=,uid=,comm="], timeout=15)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append(dict(pid=int(parts[0]), ppid=int(parts[1]), uid=int(parts[2]) if parts[2].isdigit() else -1,
+                             exe=parts[3].strip()))
+    return rows
+
+
+def app_process_tree(app, table=None):
+    """Every process belonging to an app: anything run from inside its bundle (main app, helpers, XPC services,
+    login items), its root helpers in /Library/PrivilegedHelperTools, and all of their descendants."""
+    table = table if table is not None else process_table()
+    bundle = app["path"].rstrip("/") + "/"
+    helpers = f"/Library/PrivilegedHelperTools/{app.get('bundle_id') or '//none//'}"
+    roots = {p["pid"] for p in table if p["exe"].startswith(bundle) or (app.get("bundle_id") and p["exe"].startswith(helpers))}
+    children = {}
+    for p in table:
+        children.setdefault(p["ppid"], []).append(p["pid"])
+    tree, todo = set(), list(roots)
+    while todo:
+        pid = todo.pop()
+        if pid not in tree:
+            tree.add(pid)
+            todo += children.get(pid, [])
+    me = {os.getpid()}  # never kill ourselves or whatever launched us (e.g. the Mac Cleanup app, a terminal)
+    by_pid = {p["pid"]: p for p in table}
+    pid = os.getpid()
+    while pid in by_pid and pid > 1:
+        pid = by_pid[pid]["ppid"]
+        me.add(pid)
+    return [by_pid[p] for p in sorted(tree - me) if p in by_pid]
+
+
 def app_running(app):
-    rc, out, _ = run(["pgrep", "-f", os.path.join(app["path"], "Contents", "MacOS") + "/"], timeout=10)
-    return rc == 0 and bool(out.strip())
+    return bool(app_process_tree(app))
+
+
+def app_launch_labels(app):
+    """Loaded launch-agent labels in the user's session that belong to the app (they would respawn it)."""
+    bid = app.get("bundle_id", "")
+    if not bid:
+        return []
+    _, out, _ = run(["launchctl", "list"], timeout=15)
+    labels = []
+    for line in out.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) == 3 and (parts[2] == bid or parts[2].startswith(bid + ".")):
+            labels.append(parts[2])
+    return labels
+
+
+def kill_protected(app):
+    if app.get("bundle_id") in PROTECTED_PROCESS_IDS or app["path"].startswith("/System/Library/CoreServices/"):
+        return "macOS needs this to run"
+    return None
+
+
+def kill_app(app, grace=5.0, keep_agents=False):
+    """Stop an app and everything under it: unload its launch agents (no respawn), TERM the whole tree,
+    wait `grace` seconds, then KILL what's left. Returns dict(stopped, unloaded, needs_admin, survivors)."""
+    if kill_protected(app):
+        raise ValueError(f"refusing: {kill_protected(app)}")
+    unloaded = []
+    if not keep_agents:
+        for label in app_launch_labels(app):
+            if run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=30)[0] == 0:
+                unloaded.append(label)
+    procs = app_process_tree(app)
+    needs_admin = []
+    for p in procs:
+        try:
+            os.kill(p["pid"], 15)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            needs_admin.append(p)
+    deadline = time.time() + grace
+    alive = lambda: {q["pid"] for q in app_process_tree(app)} - {q["pid"] for q in needs_admin}  # noqa: E731
+    while alive() and time.time() < deadline:
+        time.sleep(0.25)
+    for pid in alive():
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+    time.sleep(0.3)
+    survivors = [q for q in app_process_tree(app) if q["pid"] not in {n["pid"] for n in needs_admin}]
+    stopped = [p for p in procs if p not in needs_admin and p["pid"] not in {s["pid"] for s in survivors}]
+    log_event("kill", f"{app['name']}: stopped {len(stopped)} process(es), unloaded {len(unloaded)} agent(s), "
+                      f"{len(needs_admin)} need admin")
+    return dict(stopped=stopped, unloaded=unloaded, needs_admin=needs_admin, survivors=survivors)
+
+
+def cmd_kill(args):
+    matches = find_app(args.app)
+    if len(matches) != 1:
+        print("No single app matches - be more specific:" if matches else f"No installed app matches '{args.app}'.")
+        for a in matches:
+            print(f"  {a['name']}  ({a['bundle_id']})")
+        sys.exit(1)
+    app = matches[0]
+    procs, labels = app_process_tree(app), app_launch_labels(app)
+    print(f"{C['B']}{app['name']}{C['x']}  {C['d']}{app['bundle_id']}{C['x']}")
+    if not procs and not labels:
+        print("  not running")
+        return
+    for p in procs:
+        who = "" if p["uid"] == os.getuid() else f"  {C['y']}(root - needs sudo){C['x']}"
+        print(f"  {p['pid']:>7}  {p['exe'].replace(app['path'], '<app>')}{who}")
+    for label in labels:
+        print(f"  {'agent':>7}  {label}  {C['d']}(would relaunch it){C['x']}")
+    if kill_protected(app):
+        sys.exit(f"{C['r']}Refusing: {kill_protected(app)}.{C['x']}")
+    if not args.yes and input(f"\nQuit {app['name']} and {len(procs)} process(es)? Unsaved work is lost. Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    r = kill_app(app, keep_agents=args.keep_agents)
+    print(f"{C['g']}Stopped {len(r['stopped'])} process(es){C['x']}" + (f", unloaded {len(r['unloaded'])} agent(s)" if r["unloaded"] else ""))
+    if r["needs_admin"]:
+        pids = " ".join(str(p["pid"]) for p in r["needs_admin"])
+        print(f"{C['y']}{len(r['needs_admin'])} root process(es) left:{C['x']} sudo kill {pids}")
+    if r["survivors"]:
+        print(f"{C['r']}Still running:{C['x']} " + ", ".join(str(p["pid"]) for p in r["survivors"]))
 
 
 def app_leftovers(app):
@@ -1240,8 +1371,12 @@ def cmd_uninstall(args):
         print(f"  {C['d']}/Library items are system-wide: Finder will ask for your password. Restart afterwards to stop their daemons.{C['x']}")
     if plan["blocked"]:
         sys.exit(f"{C['r']}Refusing: {plan['blocked']}.{C['x']}")
+    if plan["running"] and args.apply and getattr(args, "quit", False):
+        r = kill_app(a)
+        print(f"  stopped {len(r['stopped'])} process(es) first")
+        plan["running"] = app_running(a)
     if plan["running"]:
-        sys.exit(f"{C['y']}{a['name']} is running - quit it first.{C['x']}")
+        sys.exit(f"{C['y']}{a['name']} is running - quit it first (or add --quit).{C['x']}")
     if not args.apply:
         print(f"\n{C['y']}Dry run.{C['x']} Re-run with --apply to move these to the Trash (recoverable until you empty it).")
         return
@@ -1696,8 +1831,10 @@ def cmd_ui(args):
                 apps, findings = apps_report(online=False)
                 return self.send(200, {"count": len(apps), "findings": findings_json(findings)})
             if self.path == "/api/installed":
+                table = process_table()
                 return self.send(200, [dict(name=a["name"], version=a["version"], bundle_id=a["bundle_id"], path=a["path"],
-                                            protected=protected_app(a)) for a in app_inventory()])
+                                            protected=protected_app(a), kill_protected=kill_protected(a),
+                                            processes=len(app_process_tree(a, table))) for a in app_inventory()])
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -1726,6 +1863,23 @@ def cmd_ui(args):
                     state["scan"] = None
                 log_event("clean", f"[ui] freed ~{human(freed)} ({', '.join(r['id'] for r in plan)})")
                 return self.send(200, {"freed": freed, "cleaned": [r["id"] for r in plan]})
+            if self.path in ("/api/kill/plan", "/api/kill"):
+                app = next((a for a in app_inventory() if a["path"] == body.get("path")), None)
+                if not app:
+                    return self.send(404, {"error": "app not found"})
+                procs = app_process_tree(app)
+                view = dict(name=app["name"], blocked=kill_protected(app), agents=app_launch_labels(app),
+                            processes=[dict(pid=p["pid"], exe=p["exe"].replace(app["path"], "<app>"),
+                                            root=p["uid"] != os.getuid()) for p in procs])
+                if self.path == "/api/kill/plan":
+                    return self.send(200, view)
+                try:
+                    r = kill_app(app)
+                except ValueError as e:
+                    return self.send(409, {"error": str(e)})
+                return self.send(200, dict(view, stopped=len(r["stopped"]), unloaded=r["unloaded"],
+                                           needs_admin=[p["pid"] for p in r["needs_admin"]],
+                                           survivors=[p["pid"] for p in r["survivors"]]))
             if self.path in ("/api/uninstall/plan", "/api/uninstall"):
                 # re-plan from the app's path every time: the page never chooses which files go
                 app = next((a for a in app_inventory() if a["path"] == body.get("path")), None)
@@ -1736,6 +1890,9 @@ def cmd_ui(args):
                             items=[{"path": p.replace(HOME, "~"), "size": n} for p, n in plan["items"]])
                 if self.path == "/api/uninstall/plan":
                     return self.send(200, view)
+                if plan["running"] and body.get("quit"):
+                    kill_app(app)
+                    plan["running"] = app_running(app)
                 try:
                     moved, failed = do_uninstall(plan)
                 except ValueError as e:
@@ -1887,7 +2044,12 @@ def main():
     p.add_argument("app", help="app name or bundle id"); p.add_argument("--apply", action="store_true")
     p.add_argument("--yes", action="store_true"); p.add_argument("--leftovers-only", action="store_true",
                                                                  help="keep the app, clear its data (reset)")
+    p.add_argument("--quit", action="store_true", help="stop the app and everything under it first")
     p.set_defaults(fn=cmd_uninstall)
+    p = sub.add_parser("kill", help="quit an app and every process under it")
+    p.add_argument("app", help="app name or bundle id"); p.add_argument("--yes", action="store_true")
+    p.add_argument("--keep-agents", action="store_true", help="don't unload its launch agents (it may relaunch)")
+    p.set_defaults(fn=cmd_kill)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=30); p.add_argument("--once", action="store_true")
     p.add_argument("--reset", action="store_true", help="re-learn the baseline")
