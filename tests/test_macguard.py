@@ -48,6 +48,8 @@ class TempHome(unittest.TestCase):
             mock.patch.object(mg, "SETTINGS", os.path.join(state, "settings.json")),
             mock.patch.object(mg, "AGENT_PLIST", os.path.join(self.home, "agent.plist")),
             mock.patch.object(mg, "notify", lambda *a: None),
+            mock.patch.object(mg, "TRASH_BIN", None),  # never touch the real Trash from tests
+            mock.patch.object(mg, "finder_trash", lambda paths: None),
         ]
         for p in self.patches:
             p.start()
@@ -547,6 +549,7 @@ class TestUninstall(TempHome):
     def test_leftovers_match_exact_id_and_name_only(self):
         for rel in ("Library/Application Support/io.acme.widgetly/db", "Library/Application Support/Widgetly/x",
                     "Library/Caches/io.acme.widgetly/c", "Library/Preferences/io.acme.widgetly.plist",
+                    "Library/Preferences/io.acme.widgetly.update.plist",
                     "Library/Containers/io.acme.widgetly/Data/x", "Library/Saved Application State/io.acme.widgetly.savedState/s",
                     "Library/Group Containers/ABCDE12345.io.acme.widgetly/g", "Library/LaunchAgents/io.acme.widgetly.helper.plist",
                     # must NOT match:
@@ -557,6 +560,7 @@ class TestUninstall(TempHome):
         self.assertEqual(got, sorted([
             "Library/Application Support/io.acme.widgetly", "Library/Application Support/Widgetly",
             "Library/Caches/io.acme.widgetly", "Library/Preferences/io.acme.widgetly.plist",
+            "Library/Preferences/io.acme.widgetly.update.plist",
             "Library/Containers/io.acme.widgetly", "Library/Saved Application State/io.acme.widgetly.savedState",
             "Library/Group Containers/ABCDE12345.io.acme.widgetly", "Library/LaunchAgents/io.acme.widgetly.helper.plist"]))
 
@@ -587,6 +591,60 @@ class TestUninstall(TempHome):
         self.assertFalse(os.path.exists(self.app["path"]))
         self.assertEqual(sorted(os.listdir(os.path.join(self.home, ".Trash"))), ["Widgetly.app", "io.acme.widgetly"])
         self.assertIn("[uninstall]", mg.read_text(mg.EVENTS_LOG))
+
+    def test_root_owned_items_share_one_finder_request(self):
+        sys_items = [os.path.dirname(self.mk(f"Library/LaunchAgents/io.acme.widgetly.{i}.plist/x", 10)) for i in range(3)]
+        plan = dict(app=self.app, items=[(p, 10) for p in sys_items], size=30, blocked=None, running=False)
+        batches = []
+
+        def finder(paths):  # simulate the user typing their password: Finder trashes them all
+            batches.append(list(paths))
+            for p in paths:
+                shutil.rmtree(p)
+        with mock.patch.object(mg.os, "rename", side_effect=PermissionError(1, "Operation not permitted")), \
+                mock.patch.object(mg, "finder_trash", finder), mock.patch.object(mg, "run", return_value=(0, "", "")):
+            moved, failed = quiet(mg.do_uninstall, plan)
+        self.assertEqual(len(batches), 1)  # one password prompt, not three
+        self.assertEqual(len(batches[0]), 3)
+        self.assertEqual((len(moved), failed), (3, []))
+
+    def test_never_reports_moved_when_still_there(self):
+        """Regression: Finder said OK but nothing moved - success must be verified on disk."""
+        d = os.path.dirname(self.mk("Library/Caches/io.acme.widgetly/c", 10))
+        plan = dict(app=self.app, items=[(d, 10)], size=10, blocked=None, running=False)
+        with mock.patch.object(mg.os, "rename", side_effect=PermissionError(1, "denied")), \
+                mock.patch.object(mg, "run", return_value=(0, "", "")):
+            moved, failed = quiet(mg.do_uninstall, plan)
+        self.assertEqual(moved, [])
+        self.assertEqual(failed[0][0], d)
+        self.assertTrue(os.path.exists(d))
+
+    def test_same_basename_items_do_not_collide(self):
+        """Regression: three folders named io.acme.widgetly moved in the same second."""
+        dirs = [os.path.dirname(self.mk(f"Library/{f}/io.acme.widgetly/x", 10))
+                for f in ("Application Support", "Caches", "HTTPStorages")]
+        result = mg.trash_paths(dirs)
+        self.assertEqual(set(result.values()), {""})
+        self.assertEqual(len(os.listdir(os.path.join(self.home, ".Trash"))), 3)
+
+    def test_apps_in_root_applications_folder_are_allowed(self):
+        """Regression: /Applications/X.app was rejected as an 'unsafe path'."""
+        app = dict(self.app, path="/Applications/Widgetly.app")
+        plan = dict(app=app, items=[("/Applications/Widgetly.app", 10), ("/etc", 1)], size=11, blocked=None, running=False)
+        with mock.patch.object(mg, "trash_paths", return_value={"/Applications/Widgetly.app": ""}) as tp, \
+                mock.patch.object(mg.os.path, "lexists", return_value=False), mock.patch.object(mg, "run", return_value=(0, "", "")):
+            moved, failed = quiet(mg.do_uninstall, plan)
+        tp.assert_called_once_with(["/Applications/Widgetly.app"])
+        self.assertEqual(moved, [("/Applications/Widgetly.app", 10)])
+        self.assertEqual(failed, [("/etc", "unsafe path")])
+
+    def test_launch_agents_are_unloaded_before_trashing(self):
+        agent = self.mk("Library/LaunchAgents/io.acme.widgetly.plist", 10)
+        calls = []
+        with mock.patch.object(mg, "run", side_effect=lambda cmd, timeout=60: calls.append(cmd) or (0, "", "")):
+            quiet(mg.do_uninstall, dict(app=self.app, items=[(agent, 10)], size=10, blocked=None, running=False))
+        self.assertEqual(calls[0][:2], ["launchctl", "bootout"])
+        self.assertEqual(calls[0][-1], agent)
 
     def test_reset_keeps_the_app(self):
         self.mk("Library/Caches/io.acme.widgetly/c", 10)

@@ -557,14 +557,12 @@ def clean_item(r):
     if sp and sp.startswith("docker-"):
         return docker_clean(sp, r["entries"])
     if sp == "orphans":  # app data is recoverable from the Trash, unlike caches
-        freed = 0
-        for p, size, _ in r["entries"]:
-            if p.startswith(HOME + "/Library/") and os.path.lexists(p):
-                ok, err = trash(p)
-                freed += size if ok else 0
-                if not ok:
-                    print(f"   {C['r']}failed{C['x']} {p}: {err}")
-        return freed
+        entries = [(p, size) for p, size, _ in r["entries"] if p.startswith(HOME + "/Library/")]
+        result = trash_paths([p for p, _ in entries])
+        for p, err in result.items():
+            if err:
+                print(f"   {C['r']}failed{C['x']} {p}: {err}")
+        return sum(size for p, size in entries if p in result and not result[p])
     if r.get("cmd") and shutil.which(r["cmd"].split()[0]):
         run(r["cmd"], timeout=900)
     freed = 0
@@ -1078,7 +1076,7 @@ def cmd_apps(args):
 LEFTOVER_PLACES = [
     ("Application Support", "{id}"), ("Application Support", "{name}"),
     ("Caches", "{id}"), ("Caches", "{name}"),
-    ("Preferences", "{id}.plist"), ("Preferences/ByHost", "{id}.*.plist"),
+    ("Preferences", "{id}.plist"), ("Preferences", "{id}.*.plist"), ("Preferences/ByHost", "{id}.*.plist"),
     ("Containers", "{id}"), ("Application Scripts", "{id}"),
     ("Saved Application State", "{id}.savedState"),
     ("HTTPStorages", "{id}"), ("HTTPStorages", "{id}.binarycookies"), ("Cookies", "{id}.binarycookies"),
@@ -1091,21 +1089,58 @@ GENERIC_NAMES = {"app", "data", "cache", "caches", "logs", "helper", "update", "
                  "apple", "mozilla", "chrome", "electron", "node", "python", "java", "default"}
 
 
-def trash(path):
-    """Move to the user's Trash (recoverable). Falls back to Finder, which asks for a password when needed."""
+TRASH_BIN = "/usr/bin/trash"  # macOS 15+: FileManager.trashItem, works without Full Disk Access
+
+
+def finder_trash(paths):
+    """Trash root-owned items through Finder in ONE request, so macOS asks for the password once."""
+    files = ", ".join(f'(POSIX file "{p}" as alias)' for p in paths)
+    run(["osascript", "-e", f'tell application "Finder" to delete {{{files}}}'], timeout=300)
+
+
+def _rename_to_trash(path):
     os.makedirs(os.path.join(HOME, ".Trash"), exist_ok=True)
-    dest = os.path.join(HOME, ".Trash", os.path.basename(path.rstrip("/")))
-    if os.path.lexists(dest):
-        stem, ext = os.path.splitext(dest)
-        dest = f"{stem} {dt.datetime.now():%H.%M.%S}{ext}"
+    base = os.path.basename(path.rstrip("/"))
+    stem, ext = os.path.splitext(base)
+    dest, n = os.path.join(HOME, ".Trash", base), 1
+    while os.path.lexists(dest):
+        n += 1
+        dest = os.path.join(HOME, ".Trash", f"{stem} {n}{ext}")
     try:
         os.rename(path, dest)
-        return True, ""
-    except PermissionError as e:  # root-owned (App Store apps, /Library items): Finder asks for a password
-        rc, _, err = run(["osascript", "-e", f'tell application "Finder" to delete (POSIX file "{path}" as alias)'], timeout=120)
-        return rc == 0, (err.strip() or e.strerror)
-    except OSError as e:
-        return False, e.strerror
+    except OSError:
+        pass  # verified below
+
+
+def trash_paths(paths):
+    """Move paths to the Trash (recoverable). Returns {path: ''} on success or {path: reason}.
+    Success is only ever reported for paths that are actually gone afterwards."""
+    paths = [p for p in paths if os.path.lexists(p)]
+    if not paths:
+        return {}
+    if TRASH_BIN and os.path.exists(TRASH_BIN):
+        run([TRASH_BIN, *paths], timeout=600)
+    else:
+        for p in paths:
+            _rename_to_trash(p)
+    left = [p for p in paths if os.path.lexists(p)]
+    if left:  # root-owned or protected: one Finder request, one password prompt
+        finder_trash(left)
+    return {p: ("still there - macOS refused (password cancelled, or this app may not control Finder; "
+                "drag it to the Trash in Finder)" if os.path.lexists(p) else "")
+            for p in paths}
+
+
+def trash(path):
+    err = trash_paths([path]).get(path, "")
+    return not err, err
+
+
+def unload_launch_items(paths):
+    """Stop an app's launch agents before trashing them, so the app can't relaunch mid-uninstall."""
+    for p in paths:
+        if "/LaunchAgents/" in p and p.endswith(".plist"):
+            run(["launchctl", "bootout", f"gui/{os.getuid()}", p], timeout=30)
 
 
 def protected_app(app):
@@ -1169,15 +1204,19 @@ def do_uninstall(plan):
         raise ValueError(f"refusing: {plan['blocked']}")
     if plan["running"]:
         raise ValueError(f"quit {plan['app']['name']} first")
-    moved, failed = [], []
+    ok_paths, failed = [], []
     for path, size in plan["items"]:
         system = path.startswith(("/Library/LaunchDaemons/", "/Library/LaunchAgents/", "/Library/PrivilegedHelperTools/",
                                   "/Library/Application Support/"))
-        if not (system or path.startswith(("/Applications/", HOME + "/"))) or path.count("/") < 3:
-            failed.append((path, "unsafe path"))
-            continue
-        ok, err = trash(path)
-        (moved if ok else failed).append((path, size) if ok else (path, err))
+        app_bundle = re.fullmatch(r"/Applications/[^/]+\.app", path) is not None
+        home_data = path.startswith(HOME + "/") and path.count("/") >= 4
+        (ok_paths if system or app_bundle or home_data else failed).append(path if (system or app_bundle or home_data)
+                                                                           else (path, "unsafe path"))
+    unload_launch_items(ok_paths)
+    result = trash_paths(ok_paths)
+    sizes = dict(plan["items"])
+    moved = [(p, sizes[p]) for p in ok_paths if result.get(p, "") == "" and not os.path.lexists(p)]
+    failed += [(p, result[p]) for p in ok_paths if result.get(p)]
     log_event("uninstall", f"{plan['app']['name']}: moved {len(moved)} item(s) to Trash, {len(failed)} failed")
     return moved, failed
 
