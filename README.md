@@ -43,6 +43,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard clean` | Dry run of the **safe** cleanup. |
 | `macguard clean --apply` | Delete safe items after you type `yes`. |
 | `macguard clean --only android-avd,project-artifacts --apply` | Clean specific **review** items. |
+| `macguard clean --builds --apply` | Optional: also remove build output in **active** projects (`target`, `build`, `dist`, `.next`, `__pycache__`, `cmake-build-*`…). Dependencies such as `node_modules` and `.venv` are never touched, and neither is anything committed to git. |
 | `macguard security` | Security posture audit. |
 | `macguard net` | Network snapshot and threat findings. |
 | `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
@@ -56,7 +57,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 88 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 92 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

@@ -114,12 +114,18 @@ JUNK = [
          note="re-downloaded when a model is next used"),
     dict(id="android-avd", name="Android emulator images (AVDs)", risk="review", paths=[f"{H}/.android/avd/*"]),
     dict(id="android-ndk-old", name="Old Android NDK versions", risk="review", special="ndk"),
-    dict(id="project-artifacts", name="Stale project build dirs (node_modules/target/build)", risk="review", special="projects"),
+    dict(id="project-artifacts", name="Stale project folders (node_modules/target/build, untouched 30+ days)", risk="review",
+         special="projects"),
+    dict(id="build-outputs", name="Build output in active projects (target, build, dist, .next, caches)", risk="review",
+         special="builds", note="optional - rebuilt on the next build; stop dev servers first"),
     dict(id="trash", name="Trash", risk="review", paths=[f"{H}/.Trash/*"]),
     dict(id="downloads-old", name="Downloads older than 90 days", risk="review", special="downloads"),
 ]
 
-ARTIFACT_DIRS = {"node_modules", "target", ".next", ".nuxt", ".turbo", ".parcel-cache", "DerivedData", ".venv", "venv", "__pycache__", ".pytest_cache"}
+DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}  # slow to reinstall: only ever offered when the project is stale
+BUILD_DIRS = {"target", ".next", ".nuxt", ".turbo", ".parcel-cache", ".svelte-kit", ".angular", "DerivedData", "__pycache__",
+              ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle"}
+ARTIFACT_DIRS = DEPENDENCY_DIRS | BUILD_DIRS
 # "build"/"dist" only count when next to a known build file, to avoid deleting real folders named build
 GUARDED_ARTIFACTS = {"build": ("build.gradle", "build.gradle.kts", "package.json", "CMakeLists.txt", "setup.py", "pyproject.toml"),
                      "dist": ("package.json", "setup.py", "pyproject.toml")}
@@ -145,7 +151,50 @@ def newest_mtime(project, skip):
     return newest
 
 
+def is_artifact(d, files):
+    """Is folder `d` (inside a dir containing `files`) a build/dependency output?"""
+    if d == "target":
+        return "Cargo.toml" in files or "pom.xml" in files
+    if d.startswith("cmake-build-"):
+        return "CMakeLists.txt" in files
+    return d in ARTIFACT_DIRS or (d in GUARDED_ARTIFACTS and any(f in files for f in GUARDED_ARTIFACTS[d]))
+
+
+_tracked_cache = {}
+
+
+def git_tracked_dirs(path):
+    """(repo top, set of folders holding git-tracked files) for the repo containing `path`; (None, set()) outside git."""
+    rc, top, _ = run(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=10)
+    top = top.strip() if rc == 0 else None
+    if not top:
+        return None, set()
+    if top not in _tracked_cache:
+        _, out, _ = run(["git", "-C", top, "ls-files", "-z"], timeout=60)
+        dirs = set()
+        for f in out.split("\0"):
+            parts = f.split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                dirs.add("/".join(parts[:i]))
+        _tracked_cache[top] = dirs
+    return top, _tracked_cache[top]
+
+
+def is_git_tracked(full):
+    """True when any file under `full` is committed - then it's source, not build output (e.g. a committed dist/)."""
+    top, dirs = git_tracked_dirs(os.path.dirname(full))
+    return bool(top) and os.path.relpath(os.path.realpath(full), os.path.realpath(top)) in dirs
+
+
+_artifact_cache = {}
+
+
 def find_project_artifacts(stale_days=30):
+    """Build and dependency folders in project roots; cached for a minute so one scan walks the disk once."""
+    hit = _artifact_cache.get(stale_days)
+    if hit and time.time() - hit[0] < 60:
+        return [dict(a) for a in hit[1]]
+    _tracked_cache.clear()
     found = []
     cutoff = time.time() - stale_days * 86400
     for base in project_roots():
@@ -156,19 +205,21 @@ def find_project_artifacts(stale_days=30):
             keep = []
             for d in dirs:
                 full = os.path.join(root, d)
-                is_art = d in ARTIFACT_DIRS or (d in GUARDED_ARTIFACTS and any(f in files for f in GUARDED_ARTIFACTS[d]))
-                if d == "target" and "Cargo.toml" not in files and "pom.xml" not in files:
-                    is_art = False
-                if is_art and not os.path.islink(full):
+                if is_artifact(d, files) and not os.path.islink(full):
+                    if is_git_tracked(full):
+                        continue  # committed output (e.g. a published dist/) is source - never offered
                     last = newest_mtime(root, d)
                     found.append({"path": full, "project": root, "stale": last < cutoff,
+                                  "kind": "deps" if d in DEPENDENCY_DIRS else "build",
                                   "last_touched": dt.datetime.fromtimestamp(last).strftime("%Y-%m-%d") if last else "?"})
                 elif not d.startswith(".") or d in (".github",):
                     keep.append(d)
             dirs[:] = keep
     for f in found:
         f["size"] = du(f["path"])
-    return sorted(found, key=lambda x: -x["size"])
+    found.sort(key=lambda x: -x["size"])
+    _artifact_cache[stale_days] = (time.time(), found)
+    return [dict(a) for a in found]
 
 
 def simctl_unavailable():
@@ -296,6 +347,9 @@ def resolve(item, stale_days=30):
     elif sp == "projects":
         return [(a["path"], a["size"], f"last edited {a['last_touched']}")
                 for a in find_project_artifacts(stale_days) if a["stale"] and a["size"] > 1 << 20]
+    elif sp == "builds":  # active projects only (stale ones are in "projects"), and never dependencies
+        return [(a["path"], a["size"], f"project edited {a['last_touched']}")
+                for a in find_project_artifacts(stale_days) if not a["stale"] and a["kind"] == "build" and a["size"] > 1 << 20]
     elif sp == "downloads":
         cutoff = time.time() - 90 * 86400
         out = []
@@ -460,6 +514,8 @@ def space_report(stale_days=30):
 def cmd_clean(args):
     results = scan_junk(args.stale_days)
     wanted = set(args.only.split(",")) if args.only else None
+    if getattr(args, "builds", False):
+        wanted = (wanted or set()) | {"build-outputs"}
     plan = [r for r in results if r["size"] > 0 and ((wanted and r["id"] in wanted) or (not wanted and r["risk"] == "safe"))]
     if not plan:
         print("Nothing to clean." + ("" if wanted else " (review-level items need --only <id>)"))
@@ -1566,6 +1622,7 @@ def main():
     p = sub.add_parser("scan"); p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_scan)
     p = sub.add_parser("clean"); p.add_argument("--apply", action="store_true"); p.add_argument("--yes", action="store_true")
     p.add_argument("--only", help="comma-separated category ids (needed for review items)")
+    p.add_argument("--builds", action="store_true", help="also remove build output in active projects (target, build, dist...)")
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_clean)
     sub.add_parser("net").set_defaults(fn=cmd_net)
     sub.add_parser("security").set_defaults(fn=cmd_security)

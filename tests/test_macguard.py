@@ -51,6 +51,8 @@ class TempHome(unittest.TestCase):
         ]
         for p in self.patches:
             p.start()
+        mg._artifact_cache.clear()
+        mg._tracked_cache.clear()
 
     def tearDown(self):
         for p in self.patches:
@@ -135,6 +137,61 @@ class TestCleanup(TempHome):
         with mock.patch.object(mg, "project_roots", lambda: [root]):
             entries = mg.resolve({"special": "projects"}, 30)
         self.assertEqual([os.path.relpath(p, root) for p, _, _ in entries], ["old/node_modules"])
+
+    def git(self, cwd, *args):
+        import subprocess
+        subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True,
+                       env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                                GIT_COMMITTER_EMAIL="t@t"))
+
+    def test_build_outputs_active_only_and_never_dependencies(self):
+        root = os.path.join(self.home, "DEV")
+        self.mk("DEV/rust/Cargo.toml", 10)
+        self.mk("DEV/rust/target/release/app", 2 * 1024 * 1024)
+        self.mk("DEV/web/package.json", 10)
+        self.mk("DEV/web/.next/cache/x", 2 * 1024 * 1024)
+        self.mk("DEV/web/node_modules/react/index.js", 2 * 1024 * 1024)  # dependency: not a build output
+        self.mk("DEV/cpp/CMakeLists.txt", 10)
+        self.mk("DEV/cpp/cmake-build-debug/obj.o", 2 * 1024 * 1024)
+        self.mk("DEV/old/package.json", 10, age_days=100)
+        self.mk("DEV/old/dist/bundle.js", 2 * 1024 * 1024, age_days=100)
+        with mock.patch.object(mg, "project_roots", lambda: [root]):
+            builds = sorted(os.path.relpath(p, root) for p, _, _ in mg.resolve({"special": "builds"}))
+            stale = sorted(os.path.relpath(p, root) for p, _, _ in mg.resolve({"special": "projects"}))
+        self.assertEqual(builds, ["cpp/cmake-build-debug", "rust/target", "web/.next"])
+        self.assertEqual(stale, ["old/dist"])  # stale project: in the stale check, not duplicated in builds
+
+    def test_git_tracked_output_is_never_offered(self):
+        root = os.path.join(self.home, "DEV")
+        repo = os.path.join(root, "lib")
+        self.mk("DEV/lib/package.json", 10)
+        self.mk("DEV/lib/dist/published.js", 2 * 1024 * 1024)      # committed: source
+        self.mk("DEV/lib/build/out.js", 2 * 1024 * 1024)           # not committed: build output
+        self.git(repo, "init", "-q")
+        self.git(repo, "add", "package.json", "dist/published.js")
+        self.git(repo, "commit", "-qm", "init")
+        with mock.patch.object(mg, "project_roots", lambda: [root]):
+            builds = [os.path.relpath(p, root) for p, _, _ in mg.resolve({"special": "builds"})]
+        self.assertEqual(builds, ["lib/build"])
+
+    def test_is_artifact_rules(self):
+        self.assertTrue(mg.is_artifact("target", ["Cargo.toml"]))
+        self.assertFalse(mg.is_artifact("target", ["notes.txt"]))
+        self.assertTrue(mg.is_artifact("cmake-build-release", ["CMakeLists.txt"]))
+        self.assertFalse(mg.is_artifact("build", ["README.md"]))
+        self.assertTrue(mg.is_artifact("build", ["build.gradle"]))
+        self.assertTrue(mg.is_artifact("__pycache__", []))
+        self.assertIn("node_modules", mg.DEPENDENCY_DIRS)
+        self.assertNotIn("node_modules", mg.BUILD_DIRS)
+
+    def test_builds_flag_selects_build_outputs(self):
+        target = os.path.dirname(self.mk("DEV/rust/target/x", 100))
+        results = [dict(id="build-outputs", name="b", risk="review", entries=[(target, 100, "")], size=100),
+                   dict(id="s", name="safe", risk="safe", entries=[], size=0)]
+        with mock.patch.object(mg, "scan_junk", lambda *a, **k: results):
+            quiet(mg.cmd_clean, argparse.Namespace(apply=True, yes=True, only=None, builds=True, stale_days=30))
+        self.assertFalse(os.path.exists(target))
+        self.assertTrue(os.path.exists(os.path.dirname(target)))  # project itself kept
 
     def test_old_downloads(self):
         self.mk("Downloads/old.zip", 100, age_days=120)

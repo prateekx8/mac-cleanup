@@ -16,7 +16,7 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 88 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 92 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -42,7 +42,8 @@ flowchart LR
 
 - `JUNK` is a declarative list. Each entry has an `id`, a `risk` (`safe` or `review`), and either glob `paths` or a `special` resolver (`simctl`, `docker`, `jetbrains`, `ndk`, `projects`, `downloads`).
 - **Safe** items are caches that rebuild themselves. **Review** items need your decision.
-- Project build folders only count when the project hasn't been edited for `--stale-days`. `build` and `dist` count only next to a matching build file, and `target` only next to `Cargo.toml` or `pom.xml`.
+- Project folders come in two kinds. **Dependencies** (`node_modules`, `.venv`, `venv`) are only offered once the project has gone stale. **Build output** (`target`, `build`, `dist`, `.next`, `__pycache__`, `.gradle`, lint and type caches, `cmake-build-*`) is also offered for active projects, through the optional `build-outputs` review check (`clean --builds`). Anything holding git-tracked files is skipped (`git ls-files`, cached once per repo), so a committed `dist/` is safe.
+- Stale project folders only count when the project hasn't been edited for `--stale-days`. `build` and `dist` count only next to a matching build file, and `target` only next to `Cargo.toml` or `pom.xml`.
 - `clean_item` refuses any path outside `$HOME` or shallower than four levels. Where a tool has its own cleanup command (`xcrun simctl delete unavailable`, `docker system prune`, `npm cache clean`, `brew cleanup`), that command is used.
 
 ### Docker and space insights
