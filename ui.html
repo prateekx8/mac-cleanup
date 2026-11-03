@@ -138,6 +138,20 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .netinfo div{padding:12px 14px;border-radius:14px;background:var(--glass);border:1px solid var(--stroke);font:12.5px/1.5 var(--mono);word-break:break-all}
 .netinfo .k{display:block;font:500 12px var(--font);color:var(--fg-3);margin-bottom:2px}
 
+/* space insights */
+.alert{margin:0 0 14px;padding:14px 18px;display:flex;gap:12px;align-items:center;font-weight:600}
+.alert.critical{border-color:color-mix(in srgb,var(--hi) 60%,transparent);background:color-mix(in srgb,var(--hi) 14%,var(--glass))}
+.alert.low{border-color:color-mix(in srgb,var(--med) 60%,transparent);background:color-mix(in srgb,var(--med) 14%,var(--glass))}
+.alert small{display:block;font-weight:400;color:var(--fg-2)}
+.insight{padding:4px 10px 10px}
+.insight h3{font-size:13px;font-weight:700;color:var(--fg-2);padding:10px 12px 4px;text-transform:uppercase;letter-spacing:.05em}
+.irow{display:grid;grid-template-columns:80px 1fr;gap:12px;padding:8px 12px;border-radius:12px;font-size:13.5px}
+.irow:hover{background:var(--glass)}
+.irow b{font-variant-numeric:tabular-nums;text-align:right}
+.irow b.up{color:var(--med)}
+.irow small{display:block;color:var(--fg-3);font:12px var(--mono);word-break:break-all}
+.irow small.how{font:12.5px var(--font);word-break:normal;overflow-wrap:anywhere}
+
 /* traffic */
 .top{padding:2px 10px 6px}
 .tr{display:grid;grid-template-columns:minmax(0,1.3fr) 2fr 70px 70px;gap:12px;align-items:center;padding:8px 12px;border-radius:12px;font-size:13px}
@@ -203,6 +217,7 @@ footer code{font-family:var(--mono)}
     </div>
   </header>
 
+  <div id="diskAlert" class="alert glass" hidden></div>
   <div class="stats">
     <div class="stat disk glass"><div class="ring" id="ring"><span id="ringTxt">—</span></div>
       <div><div class="k">Free space</div><b id="sFree">—</b><div class="k" id="diskTxt">of —</div></div></div>
@@ -215,6 +230,7 @@ footer code{font-family:var(--mono)}
   <section class="panel glass">
     <div class="ph"><span class="ic">🧹</span><div class="grow"><h2>Cleanup</h2><small>Safe items are pre-selected. Review items are your call.</small></div></div>
     <div id="items" class="empty">Press Scan to find what can be cleaned.</div>
+    <div id="insights"></div>
   </section>
 
   <section class="panel glass">
@@ -276,7 +292,29 @@ $("themeBtn").onclick = () => {
   r.dataset.theme = light ? "dark" : "light"; try{ localStorage.setItem("theme", r.dataset.theme) }catch(e){}
 };
 
+function showAlert(d){
+  const el=$("diskAlert"); if(!d || !d.low){ el.hidden=true; return; }
+  el.hidden=false; el.className="alert glass "+(d.critical?"critical":"low");
+  el.innerHTML=`<span style="font-size:22px">${d.critical?"⛔":"⚠️"}</span><div>${d.critical?"Disk almost full":"Disk space low"}: ${human(d.free)} free
+    <small>Builds, updates and apps can start failing. Scan and clean below; big items managed by apps are listed with how to remove them.</small></div>`;
+}
+function renderInsights(r){
+  let h="";
+  if (r.since != null){
+    const when=new Date(r.since*1000).toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+    h += `<div class="insight"><h3>Grew since ${esc(when)}</h3>` + (r.grew.length ? r.grew.map(g=>`<div class="irow"><b class="up">+${human(g.now-g.before)}</b>
+      <div>${esc(g.path)}<small>${human(g.before)} → ${human(g.now)}</small></div></div>`).join("") : `<div class="irow"><b>—</b><div>Nothing grew by more than 512M</div></div>`) + `</div>`;
+  } else {
+    h += `<div class="insight"><h3>Growth tracking</h3><div class="irow"><b>✓</b><div>Folder sizes saved<small>The next scan shows what grew since now</small></div></div></div>`;
+  }
+  if (r.managed && r.managed.length){
+    h += `<div class="insight"><h3>Managed by apps · remove from the app itself</h3>` + r.managed.map(m=>`<div class="irow"><b>${m.size?human(m.size):"—"}</b>
+      <div>${esc(m.name)}<small class="how">${esc(m.how)}</small></div></div>`).join("") + `</div>`;
+  }
+  $("insights").innerHTML = h;
+}
 function showDisk(d){
+  showAlert(d);
   const freePct = d.free/d.total*100;
   $("sFree").textContent = human(d.free);
   $("diskTxt").textContent = `of ${human(d.total)}`;
@@ -327,8 +365,8 @@ $("clearSel").onclick = () => { picked.clear(); renderItems(); };
 
 async function scan(){
   [$("scanBtn"),$("scanTop")].forEach(b=>busy(b,true));
-  $("items").className="empty"; $("items").innerHTML='<span class="spin"></span>&nbsp; Scanning caches, simulators and projects…';
-  try { const r = await api("/api/scan"); showDisk(r.disk); items = r.items;
+  $("items").className="empty"; $("items").innerHTML='<span class="spin"></span>&nbsp; Scanning caches, Docker, simulators, projects and folder growth (about a minute)…';
+  try { const r = await api("/api/scan"); showDisk(r.disk); items = r.items; renderInsights(r);
         picked = new Set(items.filter(i=>i.risk==="safe").map(i=>i.id)); open = null; renderItems();
         $("when").textContent = "Last scan " + new Date().toLocaleTimeString(); }
   catch(e){ $("items").textContent = "Scan failed: " + e.message; }

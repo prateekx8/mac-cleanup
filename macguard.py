@@ -96,13 +96,22 @@ JUNK = [
     dict(id="maven", name="Maven repository", risk="review", paths=[f"{H}/.m2/repository"]),
     dict(id="cargo", name="Cargo registry cache", risk="safe", paths=[f"{H}/.cargo/registry/cache", f"{H}/.cargo/registry/src"]),
     dict(id="brew", name="Homebrew cache & old versions", risk="safe", paths=[f"{H}/Library/Caches/Homebrew"], cmd="brew cleanup -s --prune=all"),
-    dict(id="docker", name="Docker unused images/build cache", risk="safe", special="docker"),
+    dict(id="docker-build-cache", name="Docker build cache", risk="safe", special="docker-build-cache",
+         note="next build is slower once"),
+    dict(id="docker-dangling", name="Docker dangling images (untagged)", risk="safe", special="docker-dangling"),
+    dict(id="docker-stopped", name="Docker stopped containers", risk="review", special="docker-stopped",
+         note="compose recreates one-shot jobs; check none hold data you need"),
+    dict(id="docker-unused-images", name="Docker images no container uses", risk="review", special="docker-unused-images"),
+    dict(id="docker-unused-volumes", name="Docker volumes no container uses", risk="review", special="docker-unused-volumes",
+         note="volumes hold data - deleting is permanent"),
     dict(id="user-logs", name="User logs", risk="safe", paths=[f"{H}/Library/Logs/*"]),
     dict(id="selenium-prisma", name="Selenium / Prisma / Puppeteer caches", risk="safe",
          paths=[f"{H}/.cache/selenium", f"{H}/.cache/prisma", f"{H}/.cache/puppeteer", f"{H}/.cache/ms-playwright"]),
     dict(id="jetbrains-old", name="Old JetBrains IDE versions", risk="safe", special="jetbrains"),
     dict(id="docker-install-tmp", name="Stuck Docker installer download", risk="review",
          paths=[f"{H}/Library/Application Support/com.docker.install/in_progress"], note="quit Docker Desktop first"),
+    dict(id="hf-models", name="Hugging Face model downloads", risk="review", paths=[f"{H}/.cache/huggingface/hub/models--*"],
+         note="re-downloaded when a model is next used"),
     dict(id="android-avd", name="Android emulator images (AVDs)", risk="review", paths=[f"{H}/.android/avd/*"]),
     dict(id="android-ndk-old", name="Old Android NDK versions", risk="review", special="ndk"),
     dict(id="project-artifacts", name="Stale project build dirs (node_modules/target/build)", risk="review", special="projects"),
@@ -174,17 +183,83 @@ def simctl_unavailable():
     return items
 
 
-def docker_reclaimable():
-    rc, out, _ = run(["docker", "system", "df", "--format", "{{json .}}"], timeout=20)
-    if rc:
+def docker_size(text):
+    """'1.01GB' / '552MB' / '4.1kB (virtual 3.59GB)' -> bytes (docker reports decimal units)."""
+    m = re.match(r"\s*([\d.]+)\s*([kKMGT]?B)", text or "")
+    if not m:
         return 0
-    total = 0
-    for line in out.splitlines():
-        m = re.match(r"([\d.]+)\s*([kKMGT]?B)", json.loads(line).get("Reclaimable", "0B"))
-        if m:
-            mult = {"B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}.get(m.group(2), 1)
-            total += float(m.group(1)) * mult
-    return int(total)
+    return int(float(m.group(1)) * {"B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}[m.group(2)])
+
+
+def docker_lines(*args, timeout=30):
+    """JSON lines from a docker CLI call, [] when docker is missing or its engine isn't running."""
+    if not shutil.which("docker"):
+        return []
+    rc, out, _ = run(["docker", *args, "--format", "{{json .}}"], timeout=timeout)
+    rows = []
+    for line in out.splitlines() if rc == 0 else []:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows
+
+
+def docker_entries(kind):
+    """(display 'name (id)', bytes, label) per removable docker object of one kind."""
+    if kind == "docker-build-cache":
+        for row in docker_lines("system", "df"):
+            if row.get("Type") == "Build Cache":
+                n = docker_size(row.get("Reclaimable"))
+                return [("build cache", n, f"{row.get('TotalCount', '?')} entries")] if n else []
+        return []
+    if kind == "docker-stopped":
+        return [(f"{c['Names']} ({c['ID'][:12]})", docker_size(c.get("Size")), f"{c['Image']} - {c['Status']}")
+                for c in docker_lines("ps", "-a", "--filter", "status=exited", "--filter", "status=created", "--size")]
+    if kind == "docker-unused-volumes":
+        used = {m for c in docker_lines("ps", "-a") for m in (c.get("Mounts") or "").split(",") if m}
+        sizes = {}
+        for row in docker_lines("system", "df", "-v", timeout=60):
+            for v in row.get("Volumes") or []:
+                sizes[v.get("Name")] = docker_size(v.get("Size"))
+        return [(f"{v['Name']} (volume)", sizes.get(v["Name"], 0), v.get("Driver", ""))
+                for v in docker_lines("volume", "ls", "--filter", "dangling=true") if v["Name"][:20] not in {u[:20] for u in used}]
+    images = docker_lines("images", "--no-trunc")
+    in_use = {c.get("Image") for c in docker_lines("ps", "-a")} | {c.get("ImageID", "")[:19] for c in docker_lines("ps", "-a")}
+    out = []
+    for im in images:
+        iid = im["ID"].replace("sha256:", "")[:12]
+        name = f"{im['Repository']}:{im['Tag']}"
+        dangling = im["Repository"] == "<none>"
+        if kind == "docker-dangling" and dangling:
+            out.append((f"<none> ({iid})", docker_size(im.get("Size")), im.get("CreatedSince", "")))
+        elif kind == "docker-unused-images" and not dangling and name not in in_use and im["Repository"] not in in_use \
+                and not any(iid in (x or "") for x in in_use):
+            out.append((f"{name} ({iid})", docker_size(im.get("Size")), f"created {im.get('CreatedSince', '?')}"))
+    return out
+
+
+def docker_clean(kind, entries):
+    """Remove exactly the listed docker objects; returns bytes freed (as reported at scan time)."""
+    ids = [m.group(1) for d, _, _ in entries for m in [re.search(r"\(([0-9a-f]{12})\)$", d)] if m]
+    freed = 0
+    if kind == "docker-build-cache":
+        rc, _, _ = run(["docker", "builder", "prune", "-a", "-f"], timeout=900)
+        return sum(e[1] for e in entries) if rc == 0 else 0
+    if kind == "docker-unused-volumes":
+        for d, size, _ in entries:
+            name = d.rsplit(" (volume)", 1)[0]
+            if run(["docker", "volume", "rm", name], timeout=120)[0] == 0:
+                freed += size
+        return freed
+    cmd = ["docker", "rm"] if kind == "docker-stopped" else ["docker", "rmi"]
+    for (d, size, _), iid in zip([e for e in entries if re.search(r"\(([0-9a-f]{12})\)$", e[0])], ids):
+        rc, _, err = run(cmd + [iid], timeout=300)  # never --force: in-use objects stay
+        if rc == 0:
+            freed += size
+        else:
+            print(f"   {C['y']}kept{C['x']} {d}: {err.strip()[:120]}")
+    return freed
 
 
 def version_key(name):
@@ -210,9 +285,8 @@ def resolve(item, stale_days=30):
     sp = item.get("special")
     if sp == "simctl":
         paths = simctl_unavailable()
-    elif sp == "docker":
-        n = docker_reclaimable()
-        return [("docker system prune", n, "docker images/containers/build cache")] if n else []
+    elif sp and sp.startswith("docker-"):
+        return docker_entries(sp)
     elif sp == "jetbrains":
         paths = old_versions(f"{HOME}/Library/Application Support/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
             old_versions(f"{HOME}/Library/Caches/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
@@ -238,45 +312,149 @@ def resolve(item, stale_days=30):
 
 
 def cmd_scan(args):
-    print(f"{C['B']}Disk{C['x']}")
-    _, out, _ = run(["df", "-k", "/System/Volumes/Data"])
-    f = out.splitlines()[-1].split()
-    total, used, avail = int(f[1]) * 1024, int(f[2]) * 1024, int(f[3]) * 1024
-    print(f"  Data volume: {human(used)} used / {human(total)}  ({human(avail)} free)\n")
-    results = scan_junk(args.stale_days, verbose=True)
-    safe = sum(r["size"] for r in results if r["risk"] == "safe")
-    review = sum(r["size"] for r in results if r["risk"] == "review")
+    print("Scanning (disk, caches, Docker, folder growth)...", flush=True)
+    rep = space_report(args.stale_days)
+    d = rep["disk"]
+    col = C["r"] if d["critical"] else (C["y"] if d["low"] else "")
+    print(f"\n{C['B']}Disk{C['x']}  {human(d['used'])} used / {human(d['total'])}  {col}({human(d['free'])} free){C['x']}")
+    if d["low"]:
+        print(f"  {col}{'CRITICAL' if d['critical'] else 'LOW'}: builds, updates and apps can start failing. Clean below.{C['x']}")
+    print()
+    for r in rep["results"]:
+        print_junk(r)
+    safe = sum(r["size"] for r in rep["results"] if r["risk"] == "safe")
+    review = sum(r["size"] for r in rep["results"] if r["risk"] == "review")
     print(f"\n{C['g']}Safe to clean: {human(safe)}{C['x']}   {C['y']}Needs review: {human(review)}{C['x']}")
-    print(f"\nTop space users not touched by cleanup (for your judgement):")
-    for p in big_dirs():
-        print(f"  {human(p[1]):>7}  {p[0]}")
+    if rep["since"] is not None:
+        print(f"\n{C['B']}Grew since {dt.datetime.fromtimestamp(rep['since']):%b %d %H:%M}{C['x']}")
+        for p, before, now in rep["grew"][:10]:
+            print(f"  {C['y']}+{human(now - before):>7}{C['x']}  {p}  {C['d']}({human(before)} -> {human(now)}){C['x']}")
+        if not rep["grew"]:
+            print(f"  {C['d']}nothing grew by more than 512M{C['x']}")
+    else:
+        print(f"\n{C['d']}Folder sizes saved; the next scan (an hour or more from now) shows what grew.{C['x']}")
+    if rep["managed"]:
+        print(f"\n{C['B']}Managed by apps (remove from the app itself){C['x']}")
+        for m in rep["managed"]:
+            print(f"  {human(m['size']):>7}  {m['name']}  {C['d']}- {m['how']}{C['x']}")
+    print(f"\n{C['B']}Largest folders{C['x']}")
+    for p, n in rep["big"]:
+        print(f"  {human(n):>7}  {p}")
     print(f"\nNext: {C['B']}macguard clean{C['x']} (dry-run)  ->  {C['B']}macguard clean --apply{C['x']}")
+
+
+def print_junk(r):
+    if r["size"] <= 0:
+        return
+    col = C["g"] if r["risk"] == "safe" else C["y"]
+    print(f"  {human(r['size']):>7}  {col}{r['risk']:<6}{C['x']} {r['id']:<22} {r['name']}"
+          + (f" {C['d']}({r['note']}){C['x']}" if r.get("note") else ""))
+    if r["risk"] == "review" or (r.get("special") or "").startswith(("docker-", "jetbrains", "ndk")):
+        for p, size, label in sorted(r["entries"], key=lambda e: -e[1])[:8]:
+            print(f"           {C['d']}{human(size):>7}  {p.replace(HOME, '~')}  {label}{C['x']}")
 
 
 def scan_junk(stale_days=30, verbose=False):
     results = []
     for item in JUNK:
         entries = resolve(item, stale_days)
-        size = sum(e[1] for e in entries)
-        results.append({**item, "entries": entries, "size": size})
-        if verbose and size > 0:
-            col = C["g"] if item["risk"] == "safe" else C["y"]
-            print(f"  {human(size):>7}  {col}{item['risk']:<6}{C['x']} {item['id']:<20} {item['name']}"
-                  + (f" {C['d']}({item['note']}){C['x']}" if item.get("note") else ""))
-            if item["risk"] == "review" or item.get("special") in ("jetbrains", "ndk"):
-                for p, s, label in sorted(entries, key=lambda e: -e[1])[:8]:
-                    print(f"           {C['d']}{human(s):>7}  {p.replace(HOME, '~')}  {label}{C['x']}")
+        r = {**item, "entries": entries, "size": sum(e[1] for e in entries)}
+        results.append(r)
+        if verbose:
+            print_junk(r)
     return results
 
 
-def big_dirs():
-    cands = [f"{HOME}/Library/Application Support/*", f"{HOME}/Library/Containers/*", f"{HOME}/Library/Group Containers/*", f"{HOME}/.[!.]*"]
-    sizes = []
-    for pat in cands:
+LOW_DISK_BYTES = 10 * 1024 ** 3
+
+
+def disk_health(d=None):
+    """Free-space status: low under 10 GB or 10%, critical under 5 GB or 5%."""
+    d = dict(d or disk_info())
+    d["low"] = d["free"] < LOW_DISK_BYTES or d["free"] < d["total"] * 0.10
+    d["critical"] = d["free"] < LOW_DISK_BYTES / 2 or d["free"] < d["total"] * 0.05
+    return d
+
+
+def measure_dirs():
+    """Sizes of the folders that usually hide big growth: app data, containers, dot-dirs, projects."""
+    pats = [f"{HOME}/Library/Application Support/*", f"{HOME}/Library/Containers/*", f"{HOME}/Library/Group Containers/*",
+            f"{HOME}/.[!.]*", f"{HOME}/Downloads", f"{HOME}/Movies", f"{HOME}/Documents", f"{HOME}/Desktop"]
+    pats += [f"{r}/*" for r in project_roots()] + [f"{r}/*/*" for r in project_roots()]
+    sizes = {}
+    for pat in pats:
         for p in glob.glob(pat):
-            if os.path.isdir(p) and not os.path.islink(p):
-                sizes.append((p.replace(HOME, "~"), du(p)))
-    return sorted(sizes, key=lambda x: -x[1])[:10]
+            if os.path.isdir(p) and not os.path.islink(p) and p.replace(HOME, "~") not in sizes:
+                n = du(p)
+                if n >= 50 * 1024 ** 2:
+                    sizes[p.replace(HOME, "~")] = n
+    return sizes
+
+
+def big_dirs(sizes=None, n=10):
+    sizes = sizes if sizes is not None else measure_dirs()
+    # parents and children both appear for project roots; keep the list readable
+    return sorted(sizes.items(), key=lambda x: -x[1])[:n]
+
+
+def sizes_file():
+    return os.path.join(STATE_DIR, "sizes.json")
+
+
+def record_sizes(sizes, keep=30):
+    ensure_state()
+    try:
+        hist = json.loads(read_text(sizes_file()))
+    except (OSError, ValueError):
+        hist = []
+    hist.append({"t": time.time(), "sizes": sizes})
+    write_json(sizes_file(), hist[-keep:])
+    return hist[:-1]
+
+
+def growth(sizes, history, min_delta=512 * 1024 ** 2, min_age=3600):
+    """Folders that grew by min_delta+ since the newest snapshot at least min_age old."""
+    older = [h for h in history if time.time() - h["t"] >= min_age]
+    if not older:
+        return None, []
+    base = older[-1]
+    rows = [(p, base["sizes"].get(p, 0), now) for p, now in sizes.items() if now - base["sizes"].get(p, 0) >= min_delta]
+    # drop a parent when one of its children explains the growth (DEV vs DEV/project)
+    rows = [r for r in rows if not any(o[0].startswith(r[0] + "/") for o in rows)]
+    return base["t"], sorted(rows, key=lambda r: -(r[2] - r[1]))
+
+
+def managed_storage():
+    """Big data that its own app must remove - reported, never deleted by macguard."""
+    items = [
+        ("Claude Cowork workspace image", f"{HOME}/Library/Application Support/Claude/vm_bundles",
+         "Claude app > Settings > Storage > Remove (downloads again when Cowork is next used)"),
+        ("Docker Desktop virtual disk", f"{HOME}/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+         "Clean the Docker items above; space returns to macOS gradually. Cap it in Docker Desktop > Settings > Resources"),
+        ("Ollama models", f"{HOME}/.ollama/models", "ollama list, then ollama rm <model>"),
+        ("iPhone / iPad backups", f"{HOME}/Library/Application Support/MobileSync/Backup", "Finder > your device > Manage Backups"),
+        ("Xcode archives", f"{HOME}/Library/Developer/Xcode/Archives", "Xcode > Window > Organizer > Archives"),
+        ("Simulator runtimes", "/Library/Developer/CoreSimulator/Volumes", "xcrun simctl runtime list, then xcrun simctl runtime delete <id>"),
+    ]
+    out = []
+    for name, path, how in items:
+        n = du(path) if os.path.exists(path) else 0
+        if n >= 100 * 1024 ** 2:
+            out.append(dict(name=name, path=path.replace(HOME, "~"), size=n, how=how))
+    _, snaps, _ = run(["tmutil", "listlocalsnapshots", "/"], timeout=20)
+    count = sum(1 for l in snaps.splitlines() if "com.apple" in l)
+    if count:
+        out.append(dict(name=f"{count} Time Machine local snapshot{'s' if count > 1 else ''}", path="/", size=0,
+                        how="macOS frees these when space runs low; tmutil thinlocalsnapshots / forces it"))
+    return sorted(out, key=lambda x: -x["size"])
+
+
+def space_report(stale_days=30):
+    """Everything a cleanup decision needs, in one pass."""
+    results = scan_junk(stale_days)
+    sizes = measure_dirs()
+    since, grew = growth(sizes, record_sizes(sizes))
+    return dict(disk=disk_health(), results=results, big=big_dirs(sizes), since=since, grew=grew, managed=managed_storage())
 
 
 def cmd_clean(args):
@@ -315,10 +493,8 @@ def clean_item(r):
     if sp == "simctl":
         run(["xcrun", "simctl", "delete", "unavailable"], timeout=600)
         return r["size"]
-    if sp == "docker":
-        run(["docker", "system", "prune", "-f"], timeout=600)
-        run(["docker", "builder", "prune", "-f"], timeout=600)
-        return r["size"]
+    if sp and sp.startswith("docker-"):
+        return docker_clean(sp, r["entries"])
     if r.get("cmd") and shutil.which(r["cmd"].split()[0]):
         run(r["cmd"], timeout=900)
     freed = 0
@@ -991,6 +1167,12 @@ def cmd_watch(args):
             if fp["hosts"] != base["hosts"]:
                 events.append(("high", "/etc/hosts changed", "; ".join(fp["hosts"][:3])))
                 base["hosts"] = fp["hosts"]
+            d = disk_health()
+            disk_changed = bool(base.get("low_disk")) != d["low"]
+            if d["low"] and disk_changed:
+                events.append(("high" if d["critical"] else "medium", "Low disk space",
+                               f"{human(d['free'])} free of {human(d['total'])} - run macguard scan"))
+            base["low_disk"] = d["low"]
             for sev, title, detail in analyze_net(snap):
                 if sev == "high" and (title, detail) not in reported:
                     reported.add((title, detail))
@@ -1000,7 +1182,7 @@ def cmd_watch(args):
                 print(f"{dt.datetime.now():%H:%M:%S} {sev.upper():<6} {title}: {detail}", flush=True)
                 if sev in ("high", "medium"):
                     notify(title, detail)
-            if events:
+            if events or disk_changed:  # also remember recovery, so the alert re-arms
                 write_json(BASELINE, base)
             if args.once:
                 return
@@ -1198,11 +1380,14 @@ def cmd_ui(args):
             if not self.allowed():
                 return self.send(403, {"error": "forbidden"})
             if self.path == "/api/disk":
-                return self.send(200, disk_info())
+                return self.send(200, disk_health())
             if self.path == "/api/scan":
                 with lock:
-                    state["scan"] = scan_junk(args.stale_days)
-                return self.send(200, {"disk": disk_info(), "items": junk_json(state["scan"])})
+                    rep = space_report(args.stale_days)
+                    state["scan"] = rep["results"]
+                return self.send(200, {"disk": rep["disk"], "items": junk_json(rep["results"]), "since": rep["since"],
+                                       "grew": [{"path": p, "before": b, "now": n} for p, b, n in rep["grew"][:10]],
+                                       "managed": rep["managed"]})
             if self.path == "/api/security":
                 return self.send(200, findings_json(cmd_security(args, quiet=True)))
             if self.path == "/api/net":

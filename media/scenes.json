@@ -16,7 +16,7 @@
     {"shot": "watcher",  "say": "Want ongoing protection? Turn on the background watcher. It alerts you when something new opens a port, or your router or DNS changes. It's off by default."},
     {"shot": "light",    "say": "It follows your system theme, and looks just as good in light mode."},
     {"shot": "cli",      "say": "Prefer the terminal? Everything is also a command, with dry runs by default."},
-    {"shot": "app",      "say": "Install it as a native Mac app, double click the one click setup, or use the command line. It's a single Python file with no dependencies, and seventy five automated tests."},
+    {"shot": "app",      "say": "Install it as a native Mac app, double click the one click setup, or use the command line. It's a single Python file with no dependencies, and eighty eight automated tests."},
     {"shot": "privacy",  "say": "No root access. No telemetry. Deletes happen only inside your home folder, and only after you confirm."},
     {"shot": "outro",    "say": "Mac Cleanup. A lighter machine, and a safer one."}
   ],

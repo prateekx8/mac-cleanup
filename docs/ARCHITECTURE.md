@@ -16,7 +16,7 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 75 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 88 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -44,6 +44,13 @@ flowchart LR
 - **Safe** items are caches that rebuild themselves. **Review** items need your decision.
 - Project build folders only count when the project hasn't been edited for `--stale-days`. `build` and `dist` count only next to a matching build file, and `target` only next to `Cargo.toml` or `pom.xml`.
 - `clean_item` refuses any path outside `$HOME` or shallower than four levels. Where a tool has its own cleanup command (`xcrun simctl delete unavailable`, `docker system prune`, `npm cache clean`, `brew cleanup`), that command is used.
+
+### Docker and space insights
+
+- Docker is split by risk. Build cache and dangling images are **safe**. Stopped containers, images no container uses, and dangling volumes are **review**, listed as `name (id)`. Cleanup removes exactly those IDs (`docker rm`, `docker rmi` and `docker volume rm` never use `--force`), so in-use objects stay. When Docker's engine isn't running, nothing is listed.
+- `disk_health()`: **low** means under 10 GB or 10% free, **critical** under 5 GB or 5%. Scan and the UI show a banner, and the watcher alerts once per drop, then re-arms after recovery.
+- `measure_dirs()` sizes app-data, container, dot-folder and project directories. `record_sizes()` keeps the last 30 snapshots in `~/.macguard/sizes.json`. `growth()` compares against the newest snapshot that's at least an hour old and drops a parent when a child explains the growth.
+- `managed_storage()` reports large data that its owning app must remove: the Claude Cowork image, Docker's virtual disk, simulator runtimes, Ollama models, iPhone backups, Xcode archives and Time Machine local snapshots. Each comes with how to remove it. macguard never deletes these.
 
 ### Network
 

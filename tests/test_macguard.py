@@ -538,14 +538,166 @@ class TestTraffic(unittest.TestCase):
         self.assertEqual(self.titles([SOCK(1, "uploader", "192.168.1.20", 7777, 10, 10)]), set())
 
 
+# ---------------------------------------------------------------- docker / space insights
+
+DOCKER = {
+    "system df": [{"Type": "Images", "Reclaimable": "1GB"}, {"Type": "Build Cache", "Reclaimable": "8.231GB", "TotalCount": "136"}],
+    "ps -a --filter status=exited --filter status=created --size": [
+        {"ID": "62ddaa677671aa", "Names": "shop-local-migrate-1", "Image": "shop-api:local", "Status": "Exited (0) 9 hours ago",
+         "Size": "201kB (virtual 3.6GB)"}],
+    "ps -a": [{"ID": "1", "Image": "shop-api:local", "ImageID": "sha256:aaaaaaaaaaaa", "Mounts": "dbdata"},
+              {"ID": "2", "Image": "postgres:15-alpine", "ImageID": "sha256:bbbbbbbbbbbb", "Mounts": ""}],
+    "images --no-trunc": [
+        {"ID": "sha256:aaaaaaaaaaaa1", "Repository": "shop-api", "Tag": "local", "Size": "4.84GB", "CreatedSince": "9 hours ago"},
+        {"ID": "sha256:bbbbbbbbbbbb2", "Repository": "postgres", "Tag": "15-alpine", "Size": "408MB", "CreatedSince": "10 days ago"},
+        {"ID": "sha256:cccccccccccc3", "Repository": "browserbox", "Tag": "latest-browser", "Size": "4.3GB", "CreatedSince": "3 days ago"},
+        {"ID": "sha256:dddddddddddd4", "Repository": "<none>", "Tag": "<none>", "Size": "552MB", "CreatedSince": "6 hours ago"}],
+    "volume ls --filter dangling=true": [{"Name": "f6829d57d1b7229a555fbbe71e4e4c8d984e99ad6fd5063ed9daf107859b84c9", "Driver": "local"}],
+    "system df -v": [{"Volumes": [{"Name": "f6829d57d1b7229a555fbbe71e4e4c8d984e99ad6fd5063ed9daf107859b84c9", "Size": "73.5MB"}]}],
+}
+
+
+def docker_run(calls):
+    def _run(cmd, timeout=60):
+        calls.append(cmd)
+        if cmd[:1] == ["docker"] and cmd[-2:] == ["--format", "{{json .}}"]:
+            rows = DOCKER.get(" ".join(cmd[1:-2]), [])
+            return 0, "\n".join(json.dumps(r) for r in rows), ""
+        return 0, "", ""
+    return _run
+
+
+class TestDocker(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        for p in (mock.patch.object(mg, "run", docker_run(self.calls)),
+                  mock.patch.object(mg.shutil, "which", return_value="/usr/local/bin/docker")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_docker_size(self):
+        self.assertEqual(mg.docker_size("1.01GB"), 1010000000)
+        self.assertEqual(mg.docker_size("201kB (virtual 3.6GB)"), 201000)
+        self.assertEqual(mg.docker_size(""), 0)
+
+    def test_categories(self):
+        e = {k: mg.docker_entries(k) for k in ("docker-build-cache", "docker-dangling", "docker-stopped",
+                                               "docker-unused-images", "docker-unused-volumes")}
+        self.assertEqual(e["docker-build-cache"], [("build cache", 8231000000, "136 entries")])
+        self.assertEqual([x[0] for x in e["docker-dangling"]], ["<none> (dddddddddddd)"])
+        self.assertEqual([x[0] for x in e["docker-stopped"]], ["shop-local-migrate-1 (62ddaa677671)"])
+        # in-use images (by name or id) are never offered; only browserbox is unused
+        self.assertEqual([x[0] for x in e["docker-unused-images"]], ["browserbox:latest-browser (cccccccccccc)"])
+        self.assertEqual(e["docker-unused-volumes"][0][1], 73500000)
+
+    def test_categories_have_correct_risk(self):
+        risk = {j["id"]: j["risk"] for j in mg.JUNK}
+        self.assertEqual(risk["docker-build-cache"], "safe")
+        self.assertEqual(risk["docker-dangling"], "safe")
+        for k in ("docker-stopped", "docker-unused-images", "docker-unused-volumes"):
+            self.assertEqual(risk[k], "review", k)
+
+    def test_clean_removes_exactly_listed_ids_without_force(self):
+        entries = mg.docker_entries("docker-unused-images")
+        quiet(mg.docker_clean, "docker-unused-images", entries)
+        rm = [c for c in self.calls if c[:2] == ["docker", "rmi"]]
+        self.assertEqual(rm, [["docker", "rmi", "cccccccccccc"]])
+        self.assertFalse(any("-f" in c or "--force" in c for c in rm))
+
+    def test_clean_volume_uses_full_name(self):
+        entries = mg.docker_entries("docker-unused-volumes")
+        freed = quiet(mg.docker_clean, "docker-unused-volumes", entries)
+        self.assertIn(["docker", "volume", "rm", DOCKER["volume ls --filter dangling=true"][0]["Name"]], self.calls)
+        self.assertEqual(freed, 73500000)
+
+    def test_clean_stopped_and_build_cache(self):
+        quiet(mg.docker_clean, "docker-stopped", mg.docker_entries("docker-stopped"))
+        quiet(mg.docker_clean, "docker-build-cache", mg.docker_entries("docker-build-cache"))
+        self.assertIn(["docker", "rm", "62ddaa677671"], self.calls)
+        self.assertIn(["docker", "builder", "prune", "-a", "-f"], self.calls)
+
+    def test_no_docker_engine_means_nothing_listed(self):
+        with mock.patch.object(mg, "run", return_value=(1, "", "Cannot connect to the Docker daemon")):
+            self.assertEqual(mg.docker_entries("docker-unused-images"), [])
+
+
+GB = 1024 ** 3
+
+
+class TestSpaceInsights(TempHome):
+    def test_disk_health_thresholds(self):
+        h = lambda free, total=228 * GB: mg.disk_health({"total": total, "used": total - free, "free": free})  # noqa: E731
+        self.assertFalse(h(65 * GB)["low"])
+        self.assertTrue(h(9 * GB, total=100 * GB)["low"])
+        self.assertFalse(h(9 * GB, total=100 * GB)["critical"])
+        self.assertTrue(h(3.9 * GB)["critical"])
+        self.assertTrue(h(40 * GB, total=1000 * GB)["low"])  # under 10% even with plenty of GB
+
+    def test_growth_compares_with_snapshot_an_hour_old(self):
+        with mock.patch.object(mg.time, "time", return_value=1000.0):
+            self.assertEqual(mg.record_sizes({"~/Library/Containers/com.docker.docker": GB // 5, "~/DEV": 8 * GB}), [])
+        now = {"~/Library/Containers/com.docker.docker": 40 * GB, "~/DEV": 17 * GB, "~/DEV/creator-studio": 6 * GB}
+        with mock.patch.object(mg.time, "time", return_value=1000.0 + 600):  # 10 minutes later: too soon
+            self.assertEqual(mg.growth(now, mg.record_sizes(now)), (None, []))
+        with mock.patch.object(mg.time, "time", return_value=1000.0 + 7200):
+            since, rows = mg.growth(now, mg.record_sizes(now))
+        self.assertEqual(since, 1000.0 + 600)  # newest snapshot that's at least an hour old
+        self.assertEqual(rows, [])  # nothing changed since that one
+        hist = [{"t": 0, "sizes": {"~/Library/Containers/com.docker.docker": GB // 5, "~/DEV": 8 * GB}}]
+        with mock.patch.object(mg.time, "time", return_value=7200.0):
+            since, rows = mg.growth(now, hist)
+        self.assertEqual(rows[0][0], "~/Library/Containers/com.docker.docker")
+        # ~/DEV is dropped because its child ~/DEV/creator-studio explains the growth
+        self.assertEqual([r[0] for r in rows], ["~/Library/Containers/com.docker.docker", "~/DEV/creator-studio"])
+
+    def test_history_is_capped(self):
+        for i in range(35):
+            mg.record_sizes({"~/x": i})
+        self.assertEqual(len(json.loads(mg.read_text(mg.sizes_file()))), 30)
+
+    def test_managed_storage_reports_and_never_offers_deletion(self):
+        os.makedirs(os.path.join(self.home, "Library/Application Support/Claude/vm_bundles"))
+        sizes = {os.path.join(self.home, "Library/Application Support/Claude/vm_bundles"): 11 * GB}
+        with mock.patch.object(mg, "du", lambda p: sizes.get(p, 0)), \
+                mock.patch.object(mg, "run", return_value=(0, "com.apple.TimeMachine.2026-11-03-010101.local\n", "")):
+            m = mg.managed_storage()
+        self.assertEqual(m[0]["name"], "Claude Cowork workspace image")
+        self.assertIn("Settings > Storage", m[0]["how"])
+        self.assertTrue(any("Time Machine" in x["name"] for x in m))
+        self.assertNotIn("managed", {j["id"] for j in mg.JUNK})  # not a cleanable category
+
+    def test_scan_cli_shows_low_disk_growth_and_managed(self):
+        rep = dict(disk=mg.disk_health({"total": 228 * GB, "used": 224 * GB, "free": 4 * GB}), results=[], big=[("~/DEV", GB)],
+                   since=0.0, grew=[("~/Library/Containers/com.docker.docker", GB // 5, 40 * GB)],
+                   managed=[dict(name="Claude Cowork workspace image", path="~/x", size=11 * GB, how="Claude app > Settings > Storage")])
+        out = io.StringIO()
+        with mock.patch.object(mg, "space_report", return_value=rep), redirect_stdout(out):
+            mg.cmd_scan(argparse.Namespace(stale_days=30))
+        text = out.getvalue()
+        for want in ("CRITICAL", "Grew since", "com.docker.docker", "Managed by apps", "Claude Cowork workspace image"):
+            self.assertIn(want, text)
+
+
 # ---------------------------------------------------------------- watch / settings
 
 class TestWatchAndSettings(TempHome):
     def setUp(self):
         super().setUp()
-        p = mock.patch.object(mg, "signature", lambda path: "apple")
-        p.start()
-        self.addCleanup(p.stop)
+        self.disk = {"total": 1000 * GB, "used": 500 * GB, "free": 500 * GB}
+        for p in (mock.patch.object(mg, "signature", lambda path: "apple"),
+                  mock.patch.object(mg, "disk_info", lambda: dict(self.disk))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_low_disk_alert_once_then_rearms(self):
+        self.watch(SNAP())
+        self.disk.update(free=3 * GB)
+        self.assertIn("Low disk space", self.watch(SNAP()))
+        self.assertNotIn("Low disk space", self.watch(SNAP()))  # no repeat while still low
+        self.disk.update(free=400 * GB)
+        self.watch(SNAP())
+        self.disk.update(free=3 * GB)
+        self.assertIn("Low disk space", self.watch(SNAP()))
 
     def watch(self, snap, **kw):
         a = dict(agent=False, reset=False, once=True, interval=1)
@@ -636,6 +788,9 @@ class TestWebUI(TempHome):
         scan = [dict(id="junk", name="Junk", risk="safe", note="", entries=[(self.target, 100, "")], size=100)]
         for p in (mock.patch.object(mg, "scan_junk", lambda *a, **k: [dict(r) for r in scan]),
                   mock.patch.object(mg, "disk_info", lambda: {"total": 100, "used": 40, "free": 60}),
+                  mock.patch.object(mg, "measure_dirs", lambda: {"~/DEV/big": 5 * GB}),
+                  mock.patch.object(mg, "managed_storage", lambda: [dict(name="Claude Cowork workspace image", path="~/x",
+                                                                        size=11 * GB, how="Claude app > Settings > Storage")]),
                   mock.patch.object(mg, "install_agent", return_value=(True, "")),
                   mock.patch.object(mg, "remove_agent")):
             p.start()
@@ -692,6 +847,9 @@ class TestWebUI(TempHome):
         data = json.loads(body)
         self.assertEqual(data["items"][0]["id"], "junk")
         self.assertEqual(data["disk"]["free"], 60)
+        self.assertTrue(data["disk"]["critical"])  # 60 of 100 bytes free is still < 5 GB
+        self.assertEqual(data["managed"][0]["name"], "Claude Cowork workspace image")
+        self.assertIsNone(data["since"])  # first scan only records sizes
         code, body = self.req("/api/clean", body={"ids": ["junk"]})
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(body)["cleaned"], ["junk"])

@@ -4,7 +4,8 @@
 
 Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS simulators, old IDE versions, and npm, Gradle, Cargo and pip caches, plus stale `node_modules`. They also tend to have services quietly open to the network. Mac Cleanup (CLI name `macguard`) finds both, explains what it found, and fixes it only when you ask.
 
-- **Disk cleanup**: sizes up junk by category. Each category is marked **safe** (caches that regenerate) or **review** (your call). It deletes nothing without confirmation, and only inside your home folder.
+- **Disk cleanup**: sizes up junk by category (Docker split into build cache, dangling images, stopped containers, unused images and volumes). Each category is marked **safe** (caches that regenerate) or **review** (your call). It deletes nothing without confirmation, and only inside your home folder.
+- **Space insights**: a low-disk warning (also in the watcher), what grew since the last scan, and big data that only its own app should remove (Claude Cowork image, Docker's virtual disk, simulator runtimes, Ollama models, iPhone backups), with how to remove each.
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
 - **Apps and traffic**: flags installed apps with broken or missing signatures, outdated, end-of-life or remote-access apps and orphaned root helpers, and samples live traffic per process to spot heavy uploads, scanning or odd destinations.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
@@ -38,7 +39,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 
 | Command | What it does |
 |---|---|
-| `macguard scan` | Disk junk analysis. Read-only. |
+| `macguard scan` | Disk junk analysis, low-disk warning, what grew since the last scan, app-managed storage. Read-only. |
 | `macguard clean` | Dry run of the **safe** cleanup. |
 | `macguard clean --apply` | Delete safe items after you type `yes`. |
 | `macguard clean --only android-avd,project-artifacts --apply` | Clean specific **review** items. |
@@ -55,7 +56,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 75 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 88 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
