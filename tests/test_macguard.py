@@ -529,6 +529,109 @@ class TestApps(TempHome):
                          [("network", "LuLu", "VBG97UB4TA"), ("driver", "cn.wch.CH34xVCPDriver", "5JZGQTGU4W")])
 
 
+# ---------------------------------------------------------------- uninstall / leftovers
+
+class TestUninstall(TempHome):
+    def setUp(self):
+        super().setUp()
+        self.app = self.make_app("Widgetly", "io.acme.widgetly")
+        p = mock.patch.object(mg, "app_running", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def make_app(self, name, bid):
+        path = os.path.join(self.home, "Applications", f"{name}.app")
+        self.mk(f"Applications/{name}.app/Contents/MacOS/{name}", 1000)
+        return dict(name=name, bundle_id=bid, path=path, version="1.0", exe="", updated=0)
+
+    def test_leftovers_match_exact_id_and_name_only(self):
+        for rel in ("Library/Application Support/io.acme.widgetly/db", "Library/Application Support/Widgetly/x",
+                    "Library/Caches/io.acme.widgetly/c", "Library/Preferences/io.acme.widgetly.plist",
+                    "Library/Containers/io.acme.widgetly/Data/x", "Library/Saved Application State/io.acme.widgetly.savedState/s",
+                    "Library/Group Containers/ABCDE12345.io.acme.widgetly/g", "Library/LaunchAgents/io.acme.widgetly.helper.plist",
+                    # must NOT match:
+                    "Library/Application Support/io.acme.widgetlyPro/x", "Library/Caches/io.acme.other/c",
+                    "Library/Application Support/Widget/x"):
+            self.mk(rel, 10)
+        got = sorted(os.path.relpath(p, self.home) for p, _ in mg.app_leftovers(self.app))
+        self.assertEqual(got, sorted([
+            "Library/Application Support/io.acme.widgetly", "Library/Application Support/Widgetly",
+            "Library/Caches/io.acme.widgetly", "Library/Preferences/io.acme.widgetly.plist",
+            "Library/Containers/io.acme.widgetly", "Library/Saved Application State/io.acme.widgetly.savedState",
+            "Library/Group Containers/ABCDE12345.io.acme.widgetly", "Library/LaunchAgents/io.acme.widgetly.helper.plist"]))
+
+    def test_generic_names_are_not_used_for_matching(self):
+        app = self.make_app("Data", "io.acme.data")
+        self.mk("Library/Application Support/Data/important", 10)
+        self.assertEqual(mg.app_leftovers(app), [])
+
+    def test_protected_apps(self):
+        self.assertEqual(mg.protected_app(dict(self.app, bundle_id="com.apple.Safari")), "Apple/system app")
+        self.assertEqual(mg.protected_app(dict(self.app, path="/opt/tools/Thing.app")), "not in an Applications folder")
+        self.assertIsNone(mg.protected_app(self.app))
+
+    def test_trash_is_recoverable_and_never_overwrites(self):
+        a = self.mk("Library/Caches/x/one", 10)
+        b = self.mk("other/x/one", 10)
+        self.assertTrue(mg.trash(os.path.dirname(a))[0])
+        self.assertTrue(mg.trash(os.path.dirname(b))[0])  # same basename: gets a time suffix
+        trashed = os.listdir(os.path.join(self.home, ".Trash"))
+        self.assertEqual(len(trashed), 2)
+        self.assertIn("x", trashed)
+
+    def test_uninstall_moves_app_and_data_to_trash(self):
+        self.mk("Library/Application Support/io.acme.widgetly/db", 10)
+        plan = mg.uninstall_plan(self.app)
+        moved, failed = quiet(mg.do_uninstall, plan)
+        self.assertEqual((len(moved), failed), (2, []))
+        self.assertFalse(os.path.exists(self.app["path"]))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.home, ".Trash"))), ["Widgetly.app", "io.acme.widgetly"])
+        self.assertIn("[uninstall]", mg.read_text(mg.EVENTS_LOG))
+
+    def test_reset_keeps_the_app(self):
+        self.mk("Library/Caches/io.acme.widgetly/c", 10)
+        quiet(mg.do_uninstall, mg.uninstall_plan(self.app, leftovers_only=True))
+        self.assertTrue(os.path.exists(self.app["path"]))
+        self.assertFalse(os.path.exists(os.path.join(self.home, "Library/Caches/io.acme.widgetly")))
+
+    def test_refuses_protected_and_running(self):
+        with self.assertRaises(ValueError):
+            mg.do_uninstall(mg.uninstall_plan(dict(self.app, bundle_id="com.apple.Notes")))
+        with mock.patch.object(mg, "app_running", return_value=True), self.assertRaises(ValueError):
+            mg.do_uninstall(mg.uninstall_plan(self.app))
+        self.assertTrue(os.path.exists(self.app["path"]))
+
+    def test_cli_dry_run_and_ambiguity(self):
+        other = self.make_app("Widgetly Pro", "io.acme.widgetlypro")
+        with mock.patch.object(mg, "app_inventory", return_value=[self.app, other]):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_uninstall(argparse.Namespace(app="widgetly", apply=False, yes=False, leftovers_only=False))
+            self.assertIn("Dry run", out.getvalue())
+            self.assertTrue(os.path.exists(self.app["path"]))
+            with self.assertRaises(SystemExit):
+                quiet(mg.cmd_uninstall, argparse.Namespace(app="widg", apply=False, yes=False, leftovers_only=False))
+
+    def test_orphan_leftovers(self):
+        self.mk("Library/Application Support/io.gone.app/big", 2 * 1024 * 1024)          # orphan
+        self.mk("Library/Caches/io.acme.widgetly.helper/x", 2 * 1024 * 1024)              # helper of installed app
+        self.mk("Library/Caches/com.apple.Safari/x", 2 * 1024 * 1024)                     # Apple
+        self.mk("Library/Application Support/Plain Folder/x", 2 * 1024 * 1024)            # not attributable
+        self.mk("Library/Preferences/io.acme.other.plist", 2 * 1024 * 1024)               # orphan, vendor installed
+        with mock.patch.object(mg, "app_inventory", return_value=[self.app]), \
+                mock.patch.object(mg, "running_commands", return_value="/usr/sbin/cfprefsd\n"):
+            got = {os.path.relpath(p, self.home): label for p, _, label in mg.orphan_leftovers()}
+        self.assertEqual(set(got), {"Library/Application Support/io.gone.app", "Library/Preferences/io.acme.other.plist"})
+        self.assertIn("same vendor still installed", got["Library/Preferences/io.acme.other.plist"])
+        self.assertEqual({j["id"]: j["risk"] for j in mg.JUNK}["app-leftovers"], "review")
+
+    def test_cleaning_orphans_uses_trash(self):
+        p = os.path.dirname(self.mk("Library/Application Support/io.gone.app/big", 100))
+        freed = quiet(mg.clean_item, dict(id="app-leftovers", name="x", special="orphans", entries=[(p, 100, "")]))
+        self.assertEqual(freed, 100)
+        self.assertEqual(os.listdir(os.path.join(self.home, ".Trash")), ["io.gone.app"])
+
+
 # ---------------------------------------------------------------- traffic
 
 def SOCK(pid, proc, rhost, rport, rx, tx, state="ESTABLISHED", lport=50000):
@@ -930,6 +1033,23 @@ class TestWebUI(TempHome):
         self.assertFalse(s["background_watcher"])
         mg.remove_agent.assert_called()
 
+    def test_uninstall_endpoints_replan_server_side(self):
+        app_path = os.path.join(self.home, "Applications", "Widgetly.app")
+        self.mk("Applications/Widgetly.app/Contents/MacOS/Widgetly", 10)
+        self.mk("Library/Caches/io.acme.widgetly/c", 10)
+        app = dict(name="Widgetly", bundle_id="io.acme.widgetly", path=app_path, version="1", exe="", updated=0)
+        with mock.patch.object(mg, "app_inventory", return_value=[app]), mock.patch.object(mg, "app_running", return_value=False):
+            listed = json.loads(self.req("/api/installed")[1])
+            self.assertEqual((listed[0]["name"], listed[0]["protected"]), ("Widgetly", None))
+            plan = json.loads(self.req("/api/uninstall/plan", body={"path": app_path})[1])
+            self.assertEqual(len(plan["items"]), 2)
+            self.assertTrue(os.path.exists(app_path))  # plan never deletes
+            self.assertEqual(self.req("/api/uninstall", body={"path": "/etc"})[0], 404)  # unknown path refused
+            r = json.loads(self.req("/api/uninstall", body={"path": app_path, "items": ["/etc/hosts"]})[1])
+        self.assertEqual(r["moved"], 2)
+        self.assertFalse(os.path.exists(app_path))
+        self.assertTrue(os.path.exists("/etc/hosts"))
+
     def test_security_and_net_endpoints(self):
         with mock.patch.object(mg, "cmd_security", return_value=[("high", "Firewall off", "x")]), \
                 mock.patch.object(mg, "net_snapshot", return_value=SNAP(listeners=[L(6379)])), \
@@ -1021,7 +1141,7 @@ class LiveSystem(unittest.TestCase):
         import subprocess
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
         out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
-        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "watch", "report", "settings", "ui", "doctor"):
+        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "watch", "report", "settings", "ui", "doctor"):
             self.assertIn(cmd, out)
 
 

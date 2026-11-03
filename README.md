@@ -8,6 +8,7 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Space insights**: a low-disk warning (also in the watcher), what grew since the last scan, and big data that only its own app should remove (Claude Cowork image, Docker's virtual disk, simulator runtimes, Ollama models, iPhone backups), with how to remove each.
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
 - **Apps and traffic**: flags installed apps with broken or missing signatures, outdated, end-of-life or remote-access apps and orphaned root helpers, and samples live traffic per process to spot heavy uploads, scanning or odd destinations.
+- **Full uninstall and app reset**: removes an app plus its scattered data (Application Support, Caches, Preferences, Containers, saved state, cookies, launch agents and system launch daemons) by exact bundle ID or name, and finds leftovers from apps you've already deleted. Everything goes to the **Trash**, so it's recoverable. Apple apps and running apps are refused.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
 - **Three front ends**: a native **Mac Cleanup.app**, a local **web UI** with a glass design, and the **`macguard` CLI**.
@@ -47,6 +48,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard security` | Security posture audit. |
 | `macguard net` | Network snapshot and threat findings. |
 | `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
+| `macguard uninstall <app> [--apply] [--leftovers-only]` | Dry-run by default: lists the app and every leftover. `--apply` moves them to the Trash; `--leftovers-only` resets the app and keeps it. Also in the UI under Applications → Manage apps. |
 | `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
@@ -57,7 +59,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 92 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 103 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

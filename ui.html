@@ -167,6 +167,15 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .legend{display:flex;gap:14px;padding:0 22px 6px;color:var(--fg-3);font-size:12px}
 .legend i{display:inline-block;width:10px;height:6px;border-radius:3px;margin-right:6px;vertical-align:1px}
 
+/* installed apps */
+.search{flex:1;max-width:320px;height:34px;padding:0 14px;border-radius:999px;border:1px solid var(--stroke);background:var(--glass-2);color:var(--fg);font:inherit}
+.legend:has(.search){align-items:center}
+.app{display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:14px}
+.app:hover{background:var(--glass)}
+.app .n{flex:1;min-width:0}
+.app .n small{display:block;color:var(--fg-3);font:11.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.app .lock{font-size:12px;color:var(--fg-3)}
+
 /* watcher */
 .watch{display:flex;align-items:center;gap:18px}
 .switch{position:relative;width:52px;height:31px;flex:none}
@@ -247,8 +256,14 @@ footer code{font-family:var(--mono)}
 
   <section class="panel glass">
     <div class="ph"><span class="ic">🧩</span><div class="grow"><h2>Applications</h2><small>Broken or missing signatures, outdated, end-of-life and risky apps, root helpers</small></div>
+      <button class="btn ghost sm" id="manageBtn">Manage apps</button>
       <button class="btn ghost sm" id="appsBtn">Check</button></div>
     <div id="apps" class="empty">Not checked yet. Takes ~20 seconds.</div>
+    <div id="installed" hidden>
+      <div class="legend" style="padding-top:8px"><input id="appSearch" class="search" placeholder="Search apps…" aria-label="Search apps">
+        <span id="appCount"></span></div>
+      <div id="appList" class="list"></div>
+    </div>
   </section>
 
   <section class="panel glass">
@@ -438,6 +453,43 @@ async function checkTraffic(){
   } catch(e){ $("traffic").textContent = "Failed: " + e.message; }
   busy($("trafficBtn"), false, "Sample again");
 }
+let installed = [];
+function renderInstalled(){
+  const q = $("appSearch").value.trim().toLowerCase();
+  const list = installed.filter(a => !q || a.name.toLowerCase().includes(q) || a.bundle_id.toLowerCase().includes(q));
+  $("appCount").textContent = `${list.length} of ${installed.length} apps`;
+  $("appList").innerHTML = list.map((a,i) => `<div class="app"><div class="n">${esc(a.name)} <span style="color:var(--fg-3)">${esc(a.version)}</span>
+      <small>${esc(a.bundle_id)} · ${esc(a.path)}</small></div>
+      ${a.protected ? `<span class="lock">🔒 ${esc(a.protected)}</span>` :
+        `<button class="btn ghost sm" data-reset="${esc(a.path)}">Reset</button><button class="btn danger sm" data-un="${esc(a.path)}">Uninstall</button>`}</div>`).join("")
+    || '<div class="empty">No apps match.</div>';
+  $("appList").querySelectorAll("[data-un],[data-reset]").forEach(b => b.onclick = () => uninstall(b.dataset.un || b.dataset.reset, !!b.dataset.reset, b));
+}
+async function manageApps(){
+  busy($("manageBtn"), true);
+  try { installed = await api("/api/installed"); $("installed").hidden = false; renderInstalled(); }
+  catch(e){ toast("Failed: " + e.message); }
+  busy($("manageBtn"), false, "Manage apps");
+}
+async function uninstall(path, leftoversOnly, btn){
+  busy(btn, true);
+  try {
+    const plan = await api("/api/uninstall/plan", {path, leftovers_only: leftoversOnly});
+    if (plan.blocked){ toast(`${plan.name}: ${plan.blocked}`); return; }
+    if (plan.running){ toast(`Quit ${plan.name} first`); return; }
+    const sys = plan.items.some(i => i.path.startsWith("/Library/"));
+    const what = leftoversOnly ? `Reset ${plan.name} (remove its data, keep the app)` : `Uninstall ${plan.name}`;
+    if (!confirm(`${what}?\n\nMoves ${plan.items.length} item(s), ${human(plan.size)}, to the Trash (recoverable until you empty it):\n\n` +
+                 plan.items.map(i => `• ${human(i.size)}  ${i.path}`).join("\n") +
+                 (sys ? "\n\nSystem-wide items: macOS will ask for your password." : ""))) return;
+    const r = await api("/api/uninstall", {path, leftovers_only: leftoversOnly});
+    toast(`${r.name}: ${r.moved} item(s), ${human(r.freed)} moved to Trash` + (r.failed.length ? ` · ${r.failed.length} failed` : ""));
+    if (!leftoversOnly) { installed = installed.filter(a => a.path !== path); renderInstalled(); }
+  } catch(e){ toast("Failed: " + e.message); }
+  finally { busy(btn, false, leftoversOnly ? "Reset" : "Uninstall"); }
+}
+$("manageBtn").onclick = manageApps; $("appSearch").oninput = renderInstalled;
+
 $("secBtn").onclick = checkSec; $("netBtn").onclick = checkNet;
 $("appsBtn").onclick = checkApps; $("trafficBtn").onclick = checkTraffic;
 $("checkAll").onclick = () => { checkSec(); checkNet(); checkApps(); checkTraffic(); };

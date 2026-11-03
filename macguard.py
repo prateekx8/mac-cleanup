@@ -8,6 +8,7 @@ Commands:
   security             Security posture audit (firewall, SIP, launch agents, ...)
   apps                 Installed apps: broken/missing signatures, outdated, risky, EOL
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
+  uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
   ui                   Small local web UI: scan, pick categories, clean, run checks
@@ -120,6 +121,8 @@ JUNK = [
          special="builds", note="optional - rebuilt on the next build; stop dev servers first"),
     dict(id="trash", name="Trash", risk="review", paths=[f"{H}/.Trash/*"]),
     dict(id="downloads-old", name="Downloads older than 90 days", risk="review", special="downloads"),
+    dict(id="app-leftovers", name="Leftovers from uninstalled apps", risk="review", special="orphans",
+         note="moved to the Trash, not deleted"),
 ]
 
 DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}  # slow to reinstall: only ever offered when the project is stale
@@ -347,6 +350,8 @@ def resolve(item, stale_days=30):
     elif sp == "projects":
         return [(a["path"], a["size"], f"last edited {a['last_touched']}")
                 for a in find_project_artifacts(stale_days) if a["stale"] and a["size"] > 1 << 20]
+    elif sp == "orphans":
+        return orphan_leftovers()
     elif sp == "builds":  # active projects only (stale ones are in "projects"), and never dependencies
         return [(a["path"], a["size"], f"project edited {a['last_touched']}")
                 for a in find_project_artifacts(stale_days) if not a["stale"] and a["kind"] == "build" and a["size"] > 1 << 20]
@@ -551,6 +556,15 @@ def clean_item(r):
         return r["size"]
     if sp and sp.startswith("docker-"):
         return docker_clean(sp, r["entries"])
+    if sp == "orphans":  # app data is recoverable from the Trash, unlike caches
+        freed = 0
+        for p, size, _ in r["entries"]:
+            if p.startswith(HOME + "/Library/") and os.path.lexists(p):
+                ok, err = trash(p)
+                freed += size if ok else 0
+                if not ok:
+                    print(f"   {C['r']}failed{C['x']} {p}: {err}")
+        return freed
     if r.get("cmd") and shutil.which(r["cmd"].split()[0]):
         run(r["cmd"], timeout=900)
     freed = 0
@@ -1058,6 +1072,189 @@ def cmd_apps(args):
         print(f"\n{C['d']}Tip: --online also asks Apple for pending macOS security updates.{C['x']}")
 
 
+# ---------------------------------------------------------------- uninstall / app leftovers
+
+# ~/Library folders where apps keep per-app data, and how entries there are named
+LEFTOVER_PLACES = [
+    ("Application Support", "{id}"), ("Application Support", "{name}"),
+    ("Caches", "{id}"), ("Caches", "{name}"),
+    ("Preferences", "{id}.plist"), ("Preferences/ByHost", "{id}.*.plist"),
+    ("Containers", "{id}"), ("Application Scripts", "{id}"),
+    ("Saved Application State", "{id}.savedState"),
+    ("HTTPStorages", "{id}"), ("HTTPStorages", "{id}.binarycookies"), ("Cookies", "{id}.binarycookies"),
+    ("WebKit", "{id}"), ("Logs", "{id}"), ("Logs", "{name}"),
+    ("LaunchAgents", "{id}*.plist"),
+]
+LEFTOVER_ROOTS = ["Application Support", "Caches", "Containers", "Preferences", "Saved Application State", "HTTPStorages",
+                  "WebKit", "Logs", "Application Scripts", "Cookies"]
+GENERIC_NAMES = {"app", "data", "cache", "caches", "logs", "helper", "update", "updater", "google", "microsoft", "adobe",
+                 "apple", "mozilla", "chrome", "electron", "node", "python", "java", "default"}
+
+
+def trash(path):
+    """Move to the user's Trash (recoverable). Falls back to Finder, which asks for a password when needed."""
+    os.makedirs(os.path.join(HOME, ".Trash"), exist_ok=True)
+    dest = os.path.join(HOME, ".Trash", os.path.basename(path.rstrip("/")))
+    if os.path.lexists(dest):
+        stem, ext = os.path.splitext(dest)
+        dest = f"{stem} {dt.datetime.now():%H.%M.%S}{ext}"
+    try:
+        os.rename(path, dest)
+        return True, ""
+    except PermissionError as e:  # root-owned (App Store apps, /Library items): Finder asks for a password
+        rc, _, err = run(["osascript", "-e", f'tell application "Finder" to delete (POSIX file "{path}" as alias)'], timeout=120)
+        return rc == 0, (err.strip() or e.strerror)
+    except OSError as e:
+        return False, e.strerror
+
+
+def protected_app(app):
+    """Apps macguard refuses to uninstall."""
+    bid = app.get("bundle_id", "")
+    if not bid or bid.startswith("com.apple.") or app["path"].startswith(("/System/", "/Applications/Utilities/")):
+        return "Apple/system app"
+    if not app["path"].startswith(("/Applications/", f"{HOME}/Applications/")):
+        return "not in an Applications folder"
+    return None
+
+
+def app_running(app):
+    rc, out, _ = run(["pgrep", "-f", os.path.join(app["path"], "Contents", "MacOS") + "/"], timeout=10)
+    return rc == 0 and bool(out.strip())
+
+
+def app_leftovers(app):
+    """(path, bytes) of this app's data in ~/Library, matched by exact bundle id or exact app name."""
+    bid, name = app.get("bundle_id", ""), app.get("name", "")
+    use_name = len(name) >= 4 and name.lower() not in GENERIC_NAMES
+    lib = os.path.join(HOME, "Library")
+    found = {}
+    for folder, pat in LEFTOVER_PLACES:
+        if "{name}" in pat and not use_name:
+            continue
+        if "{id}" in pat and not bid:
+            continue
+        for p in glob.glob(os.path.join(lib, folder, pat.format(id=glob.escape(bid), name=glob.escape(name)))):
+            found[p] = du(p)
+    if bid:  # system-wide pieces (launch daemons, root helpers): Finder asks for a password to trash these
+        for folder in ("/Library/LaunchDaemons", "/Library/LaunchAgents", "/Library/PrivilegedHelperTools"):
+            for p in glob.glob(os.path.join(folder, glob.escape(bid) + "*")):
+                found[p] = du(p)
+        if use_name:
+            for p in glob.glob(os.path.join("/Library/Application Support", glob.escape(name))):
+                found[p] = du(p)
+    if bid:  # group containers are named <TEAMID>.<group id>; match the app's id inside
+        for p in glob.glob(os.path.join(lib, "Group Containers", "*")):
+            if os.path.basename(p).endswith("." + bid) or os.path.basename(p) == f"group.{bid}":
+                found[p] = du(p)
+    return sorted(found.items(), key=lambda x: -x[1])
+
+
+def find_app(query):
+    q = query.lower().removesuffix(".app")
+    apps = app_inventory()
+    exact = [a for a in apps if a["name"].lower() == q or a["bundle_id"].lower() == q or os.path.basename(a["path"]).lower() == q + ".app"]
+    return exact or [a for a in apps if q in a["name"].lower()]
+
+
+def uninstall_plan(app, leftovers_only=False):
+    items = ([] if leftovers_only else [(app["path"], du(app["path"]))]) + app_leftovers(app)
+    return dict(app=app, items=items, size=sum(n for _, n in items), blocked=protected_app(app),
+                running=app_running(app))
+
+
+def do_uninstall(plan):
+    """Move every planned item to the Trash; returns (moved, failed)."""
+    if plan["blocked"]:
+        raise ValueError(f"refusing: {plan['blocked']}")
+    if plan["running"]:
+        raise ValueError(f"quit {plan['app']['name']} first")
+    moved, failed = [], []
+    for path, size in plan["items"]:
+        system = path.startswith(("/Library/LaunchDaemons/", "/Library/LaunchAgents/", "/Library/PrivilegedHelperTools/",
+                                  "/Library/Application Support/"))
+        if not (system or path.startswith(("/Applications/", HOME + "/"))) or path.count("/") < 3:
+            failed.append((path, "unsafe path"))
+            continue
+        ok, err = trash(path)
+        (moved if ok else failed).append((path, size) if ok else (path, err))
+    log_event("uninstall", f"{plan['app']['name']}: moved {len(moved)} item(s) to Trash, {len(failed)} failed")
+    return moved, failed
+
+
+def cmd_uninstall(args):
+    matches = find_app(args.app)
+    if not matches:
+        sys.exit(f"No installed app matches '{args.app}'.")
+    if len(matches) > 1:
+        print("Several apps match - be more specific:")
+        for a in matches:
+            print(f"  {a['name']}  ({a['bundle_id']})  {a['path']}")
+        sys.exit(1)
+    plan = uninstall_plan(matches[0], args.leftovers_only)
+    a = plan["app"]
+    print(f"{C['B']}{a['name']} {a['version']}{C['x']}  {C['d']}{a['bundle_id']}{C['x']}")
+    for path, size in plan["items"]:
+        print(f"  {human(size):>7}  {path.replace(HOME, '~')}")
+    print(f"  {C['B']}{human(plan['size']):>7}  total -> Trash{C['x']}")
+    if any(p.startswith("/Library/") for p, _ in plan["items"]):
+        print(f"  {C['d']}/Library items are system-wide: Finder will ask for your password. Restart afterwards to stop their daemons.{C['x']}")
+    if plan["blocked"]:
+        sys.exit(f"{C['r']}Refusing: {plan['blocked']}.{C['x']}")
+    if plan["running"]:
+        sys.exit(f"{C['y']}{a['name']} is running - quit it first.{C['x']}")
+    if not args.apply:
+        print(f"\n{C['y']}Dry run.{C['x']} Re-run with --apply to move these to the Trash (recoverable until you empty it).")
+        return
+    if not args.yes and input(f"\nMove {len(plan['items'])} item(s) ({human(plan['size'])}) to the Trash? Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    moved, failed = do_uninstall(plan)
+    for path, err in failed:
+        print(f"  {C['r']}failed{C['x']} {path.replace(HOME, '~')}: {err}")
+    print(f"{C['g']}Moved {len(moved)} item(s), {human(sum(n for _, n in moved))}, to the Trash.{C['x']}")
+
+
+def running_commands():
+    _, out, _ = run(["ps", "-axo", "comm="], timeout=10)
+    return out.lower()
+
+
+def orphan_leftovers(min_bytes=1024 ** 2):
+    """Data in ~/Library named after a bundle id that no installed app (or running process / launch item) has."""
+    ids = {a["bundle_id"].lower() for a in app_inventory() if a["bundle_id"]}
+    for d in ("/System/Applications", "/System/Applications/Utilities", "/System/Library/CoreServices"):
+        for p in glob.glob(f"{d}/*.app"):
+            bid = read_plist(os.path.join(p, "Contents", "Info.plist")).get("CFBundleIdentifier")
+            if bid:
+                ids.add(bid.lower())
+    running = running_commands()
+    for pl in glob.glob(f"{HOME}/Library/LaunchAgents/*.plist") + glob.glob("/Library/Launch*/*.plist"):
+        ids.add(os.path.basename(pl)[:-6].lower())
+
+    def owned(bid):
+        b = bid.lower()
+        # an installed app owns its own id and its helpers' ids (com.vendor.app.helper); vendor-wide prefixes too
+        return any(b == i or b.startswith(i + ".") or i.startswith(b + ".") for i in ids) or b in running
+
+    out = []
+    lib = os.path.join(HOME, "Library")
+    for folder in LEFTOVER_ROOTS:
+        for p in glob.glob(os.path.join(lib, folder, "*")):
+            base = os.path.basename(p)
+            bid = re.sub(r"(\.binarycookies|\.savedState|\.plist)$", "", base)
+            if bid.count(".") < 2 or not re.fullmatch(r"[A-Za-z0-9-]+(\.[A-Za-z0-9_-]+){2,}", bid):
+                continue  # only reverse-DNS names can be attributed to an app
+            if bid.lower().startswith(("com.apple.", "group.com.apple.", "systemgroup.")) or owned(bid):
+                continue
+            n = du(p)
+            if n >= min_bytes:
+                vendor = ".".join(bid.lower().split(".")[:2])
+                hint = " (same vendor still installed - check first)" if any(i.startswith(vendor + ".") for i in ids) else ""
+                out.append((p, n, f"{folder} - no installed app '{bid}'{hint}"))
+    return sorted(out, key=lambda x: -x[1])
+
+
 # ---------------------------------------------------------------- traffic
 
 KNOWN_UPLOADERS = ("backupd", "bird", "cloudd", "Dropbox", "Google Drive", "OneDrive", "Backblaze", "bztransmit", "rsync",
@@ -1459,6 +1656,9 @@ def cmd_ui(args):
             if self.path == "/api/apps":
                 apps, findings = apps_report(online=False)
                 return self.send(200, {"count": len(apps), "findings": findings_json(findings)})
+            if self.path == "/api/installed":
+                return self.send(200, [dict(name=a["name"], version=a["version"], bundle_id=a["bundle_id"], path=a["path"],
+                                            protected=protected_app(a)) for a in app_inventory()])
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -1487,6 +1687,22 @@ def cmd_ui(args):
                     state["scan"] = None
                 log_event("clean", f"[ui] freed ~{human(freed)} ({', '.join(r['id'] for r in plan)})")
                 return self.send(200, {"freed": freed, "cleaned": [r["id"] for r in plan]})
+            if self.path in ("/api/uninstall/plan", "/api/uninstall"):
+                # re-plan from the app's path every time: the page never chooses which files go
+                app = next((a for a in app_inventory() if a["path"] == body.get("path")), None)
+                if not app:
+                    return self.send(404, {"error": "app not found"})
+                plan = uninstall_plan(app, bool(body.get("leftovers_only")))
+                view = dict(name=app["name"], blocked=plan["blocked"], running=plan["running"], size=plan["size"],
+                            items=[{"path": p.replace(HOME, "~"), "size": n} for p, n in plan["items"]])
+                if self.path == "/api/uninstall/plan":
+                    return self.send(200, view)
+                try:
+                    moved, failed = do_uninstall(plan)
+                except ValueError as e:
+                    return self.send(409, {"error": str(e)})
+                return self.send(200, dict(view, moved=len(moved), freed=sum(n for _, n in moved),
+                                           failed=[{"path": p.replace(HOME, "~"), "error": e} for p, e in failed]))
             if self.path == "/api/settings":
                 s = load_settings()
                 if "background_watcher" in body:
@@ -1628,6 +1844,11 @@ def main():
     sub.add_parser("security").set_defaults(fn=cmd_security)
     p = sub.add_parser("apps"); p.add_argument("--online", action="store_true", help="also check Apple for macOS updates")
     p.add_argument("--list", action="store_true", help="print every app"); p.set_defaults(fn=cmd_apps)
+    p = sub.add_parser("uninstall", help="remove an app and its ~/Library data (to the Trash)")
+    p.add_argument("app", help="app name or bundle id"); p.add_argument("--apply", action="store_true")
+    p.add_argument("--yes", action="store_true"); p.add_argument("--leftovers-only", action="store_true",
+                                                                 help="keep the app, clear its data (reset)")
+    p.set_defaults(fn=cmd_uninstall)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=30); p.add_argument("--once", action="store_true")
     p.add_argument("--reset", action="store_true", help="re-learn the baseline")
