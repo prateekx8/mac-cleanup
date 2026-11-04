@@ -80,7 +80,7 @@ claude mcp add mac-cleanup -- /usr/bin/python3 /path/to/mac-cleanup/macguard.py 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 91 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 92 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
