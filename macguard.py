@@ -414,12 +414,18 @@ def print_junk(r):
             print(f"           {C['d']}{human(size):>7}  {p.replace(HOME, '~')}  {label}{C['x']}")
 
 
+def overlaps(a, b):
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+
+
 def scan_junk(stale_days=30, verbose=False):
-    results = []
-    for item in JUNK:
-        entries = resolve(item, stale_days)
-        r = {**item, "entries": entries, "size": sum(e[1] for e in entries)}
-        results.append(r)
+    results = [{**item, "entries": resolve(item, stale_days)} for item in JUNK]
+    # an app leftover that's already a more specific item (e.g. the stuck Docker installer) is listed once
+    claimed = [p for r in results if r["id"] != "app-leftovers" for p, _, _ in r["entries"] if p.startswith("/")]
+    for r in results:
+        if r["id"] == "app-leftovers":
+            r["entries"] = [e for e in r["entries"] if not any(overlaps(e[0], c) for c in claimed)]
+        r["size"] = sum(e[1] for e in r["entries"])
         if verbose:
             print_junk(r)
     return results

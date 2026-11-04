@@ -683,6 +683,18 @@ class TestUninstall(TempHome):
         self.assertIn("same vendor still installed", got["Library/Preferences/io.acme.other.plist"])
         self.assertEqual({j["id"]: j["risk"] for j in mg.JUNK}["app-leftovers"], "review")
 
+    def test_leftover_already_listed_elsewhere_is_counted_once(self):
+        """Regression: com.docker.install showed as both 'stuck Docker installer' and an app leftover."""
+        inst = os.path.join(self.home, "Library/Application Support/com.docker.install")
+        junk = [dict(id="docker-install-tmp", name="d", risk="review", paths=[]),
+                dict(id="app-leftovers", name="l", risk="review", special="orphans")]
+        fake = {"docker-install-tmp": [(inst + "/in_progress", 2 * GB, "")],
+                "app-leftovers": [(inst, 2 * GB, ""), (os.path.join(self.home, "Library/Caches/io.gone.app"), 5, "")]}
+        with mock.patch.object(mg, "JUNK", junk), mock.patch.object(mg, "resolve", lambda item, sd=30: fake[item["id"]]):
+            res = {r["id"]: r for r in mg.scan_junk()}
+        self.assertEqual([os.path.basename(p) for p, _, _ in res["app-leftovers"]["entries"]], ["io.gone.app"])
+        self.assertEqual(res["app-leftovers"]["size"], 5)
+
     def test_cleaning_orphans_uses_trash(self):
         p = os.path.dirname(self.mk("Library/Application Support/io.gone.app/big", 100))
         freed = quiet(mg.clean_item, dict(id="app-leftovers", name="x", special="orphans", entries=[(p, 100, "")]))
