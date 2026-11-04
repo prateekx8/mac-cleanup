@@ -6,6 +6,8 @@ Commands:
   clean                Clean junk (dry-run unless --apply)
   net                  Network snapshot: listeners, connections, ARP/DNS, threats
   security             Security posture audit (firewall, SIP, launch agents, ...)
+  deepscan             Everything at once: health score, prioritised findings with fixes, new since last time
+                       (--clean also cleans the safe items, --traffic adds a live traffic sample)
   apps                 Installed apps: broken/missing signatures, outdated, risky, EOL
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
@@ -490,6 +492,18 @@ def growth(sizes, history, min_delta=512 * 1024 ** 2, min_age=3600):
     return base["t"], sorted(rows, key=lambda r: -(r[2] - r[1]))
 
 
+def simulator_runtimes():
+    """Installed simulator runtimes as macOS counts them (`simctl runtime list`), not the raw Volumes folder."""
+    if not shutil.which("xcrun"):
+        return dict(size=0, runtimes=[])
+    _, out, _ = run(["xcrun", "simctl", "runtime", "list"], timeout=60)
+    runtimes = [dict(name=m.group(1).strip(), id=m.group(2))
+                for m in re.finditer(r"^(\S.*?\(\S+\)) - ([0-9A-F-]{36})", out, re.M)]
+    m = re.search(r"Total Disk Images: \d+ \(([\d.]+)\s*([KMGT])B?\)", out)
+    size = int(float(m.group(1)) * 1024 ** "KMGT".index(m.group(2)) * 1024) if m else 0
+    return dict(size=size, runtimes=runtimes)
+
+
 def managed_storage():
     """Big data that its own app must remove - reported, never deleted by macguard."""
     items = [
@@ -500,9 +514,13 @@ def managed_storage():
         ("Ollama models", f"{HOME}/.ollama/models", "ollama list, then ollama rm <model>"),
         ("iPhone / iPad backups", f"{HOME}/Library/Application Support/MobileSync/Backup", "Finder > your device > Manage Backups"),
         ("Xcode archives", f"{HOME}/Library/Developer/Xcode/Archives", "Xcode > Window > Organizer > Archives"),
-        ("Simulator runtimes", "/Library/Developer/CoreSimulator/Volumes", "xcrun simctl runtime list, then xcrun simctl runtime delete <id>"),
     ]
     out = []
+    rt = simulator_runtimes()
+    if rt["size"] >= 100 * 1024 ** 2:
+        ids = "; ".join(f"{r['name']}: xcrun simctl runtime delete {r['id']}" for r in rt["runtimes"][:4])
+        out.append(dict(name=f"Simulator runtimes ({len(rt['runtimes'])})", path="xcrun simctl runtime list", size=rt["size"],
+                        how=ids or "xcrun simctl runtime list, then xcrun simctl runtime delete <id>"))
     for name, path, how in items:
         n = du(path) if os.path.exists(path) else 0
         if n >= 100 * 1024 ** 2:
@@ -645,11 +663,26 @@ def split_addr(a):
     return host, (int(port) if port.isdigit() else None)
 
 
+_local_v6 = None
+
+
+def local_v6_prefixes():
+    """/48 prefixes of this Mac's global IPv6 addresses: peers inside them are on your own network."""
+    global _local_v6
+    if _local_v6 is None:
+        _, out, _ = run(["ifconfig"], timeout=10)
+        _local_v6 = {":".join(a.split(":")[:3]).lower() + ":" for a in re.findall(r"inet6 ([0-9a-fA-F:]+)", out)
+                     if not a.lower().startswith(("fe80", "fd", "fc", "::1")) and a.count(":") >= 3}
+    return _local_v6
+
+
 def is_private(host):
     if host in ("*", "127.0.0.1", "::1", "localhost"):
         return True
     # netstat truncates long IPv6 addresses, so classify link-local/ULA/multicast by prefix
     if host.lower().startswith(("fe80:", "fc", "fd", "ff0")) and ":" in host:
+        return True
+    if ":" in host and any(host.lower().startswith(p) for p in local_v6_prefixes()):
         return True
     try:
         ip = ipaddress.ip_address(host.split("%")[0])
@@ -877,10 +910,13 @@ def cmd_security(args, quiet=False):
             sig = signature(prog)
             if sig == "missing":
                 f.append(("low", "Orphaned launch item (program no longer exists)", f"{p} -> {prog}"))
-            elif sig in ("unsigned", "adhoc") and not prog.startswith("/opt/homebrew/"):
-                f.append(("medium", "Unsigned program starts automatically", f"{p} -> {prog}"))
-            elif prog.startswith(SUSPICIOUS_EXE_DIRS):
+            elif prog.startswith(SUSPICIOUS_EXE_DIRS):  # checked first: unsigned AND in a temp folder is the worst case
                 f.append(("high", "Auto-start program in temp/download folder", f"{p} -> {prog}"))
+            elif sig in ("unsigned", "adhoc") and not prog.startswith("/opt/homebrew/"):
+                if prog.startswith(HOME + "/") and p.startswith(HOME + "/"):  # user's own automation, most likely
+                    f.append(("low", "Your own unsigned script starts automatically (confirm it's yours)", f"{p} -> {prog}"))
+                else:
+                    f.append(("medium", "Unsigned program starts automatically", f"{p} -> {prog}"))
             if "ccleaner" in name.lower() or "mackeeper" in name.lower():
                 f.append(("info", "Third-party 'cleaner' with background daemons", f"{name} - consider uninstalling; macguard replaces it"))
     # secrets left in easily-synced/shared folders
@@ -896,11 +932,11 @@ def cmd_security(args, quiet=False):
                 continue
             if b"PRIVATE KEY" in head or name.endswith((".p12", ".pfx", ".ppk")) or name == ".env":
                 f.append(("medium", f"Private key / secret file in ~/{d}", f"{p.replace(HOME, '~')} - move to ~/.ssh or a password manager"))
-    # dedupe
+    # dedupe exact repeats only - two different keys (or launch items) are two findings
     seen, uniq = set(), []
     for x in f:
-        if x[:2] not in seen:
-            seen.add(x[:2])
+        if x not in seen:
+            seen.add(x)
             uniq.append(x)
     if not quiet:
         print(f"{C['B']}Security posture{C['x']}")
@@ -1529,6 +1565,195 @@ def cmd_traffic(args):
     print_findings(analyze_traffic(procs, args.seconds))
 
 
+# ---------------------------------------------------------------- deep scan
+
+SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3, "ok": 4}
+SHARING = {22: "Remote Login (SSH)", 3283: "Remote Management (Apple Remote Desktop)", 5900: "Screen Sharing",
+           445: "File Sharing", 548: "File Sharing", 5000: "AirPlay Receiver", 7000: "AirPlay Receiver"}
+
+
+def fix_for(area, title, detail):
+    """One concrete next step for a finding: the setting to change or the command to run."""
+    t = title.lower()
+    if area == "network":
+        m = re.search(r":(\d+)$", detail)
+        port = int(m.group(1)) if m else 0
+        if port in (5000, 7000):
+            return "System Settings > General > AirDrop & Handoff > AirPlay Receiver: off (or allow 'Current User' only)"
+        if port in SHARING:
+            return f"System Settings > General > Sharing > {SHARING[port]}: off if unused; keep the firewall on either way"
+        if "scan" in t or "inbound" in t:
+            return "Turn on the firewall (System Settings > Network > Firewall); check who owns the remote address"
+        if "spoof" in t:
+            return "Disconnect from this network; your router may be compromised or someone is intercepting traffic"
+        if port:
+            return f"Bind the service to 127.0.0.1, stop it, or block port {port} with the firewall"
+    if area == "security":
+        if "firewall is off" in t:
+            return "System Settings > Network > Firewall: on"
+        if "stealth" in t:
+            return "System Settings > Network > Firewall > Options: Enable stealth mode"
+        if "private key" in t:
+            f = detail.split(" - ")[0].replace("~/", "$HOME/", 1)
+            return f'mkdir -p ~/.ssh && mv "{f}" ~/.ssh/ && chmod 600 ~/.ssh/"{os.path.basename(f)}"'
+        if "orphaned launch item" in t:
+            return f"sudo rm '{detail.split(' -> ')[0]}'  (its program is already gone)"
+        if "unsigned" in t or "temp/download" in t:
+            return f"Check what it is; if you don't recognise it: launchctl bootout gui/$(id -u) '{detail.split(' -> ')[0]}'"
+        if "cleaner" in t:
+            return "macguard uninstall <app> --apply --quit"
+        if "update" in t:
+            return "System Settings > General > Software Update"
+    if area == "apps":
+        m = re.search(r"\((brew upgrade[^)]*)\)", detail)
+        if m:
+            return m.group(1)
+        if "signature broken" in t:
+            return "Reinstall it from the vendor, or uninstall: macguard uninstall <app> --apply --quit"
+        if "remote-access" in t or "end-of-life" in t or "cleaner" in t:
+            return "Uninstall it if you don't use it: macguard uninstall <app> --apply --quit"
+        if "orphaned root helper" in t:
+            return f"sudo rm '{detail}'"
+        if "intel-only" in t:
+            return "Look for an Apple Silicon version, or replace the app"
+    if area == "traffic":
+        return "macguard kill <app> to stop it now; macguard uninstall <app> if you don't recognise it"
+    if area == "disk":
+        return "macguard clean --apply (safe items), then review the rest below"
+    return ""
+
+
+def finding_key(f):
+    detail = re.sub(r"pid \d+", "pid", f["detail"])  # pids change between scans
+    return f"{f['area']}|{f['title']}|{detail}"
+
+
+def deepscan_file():
+    return os.path.join(STATE_DIR, "deepscan.json")
+
+
+def merge_findings(findings):
+    """One line per issue: same area+title merged (ports, apps), and a sharing service that the network check
+    already reports as exposed isn't repeated by the security check."""
+    exposed = " ".join(f["detail"] for f in findings if f["area"] == "network")
+    same_root = {"Screen Sharing is enabled": ":5900", "Remote Login (SSH) is enabled": ":22"}
+    findings = [f for f in findings if not (f["area"] == "security" and same_root.get(f["title"], "\0") in exposed)]
+    merged = {}
+    for f in findings:
+        k = (f["area"], f["title"])
+        if k not in merged:
+            merged[k] = dict(f)
+            continue
+        m = merged[k]
+        m["detail"] += "; " + f["detail"]
+        if f["fix"] and f["fix"] not in m["fix"]:
+            if m["fix"].startswith("brew upgrade --cask") and f["fix"].startswith("brew upgrade --cask"):
+                m["fix"] += " " + f["fix"].split()[-1]
+            else:
+                m["fix"] = " · ".join(x for x in (m["fix"], f["fix"]) if x)
+        if SEV_ORDER[f["sev"]] < SEV_ORDER[m["sev"]]:
+            m["sev"] = f["sev"]
+    for m in merged.values():
+        n = m["detail"].count("; ") + 1
+        if n > 1 and m["title"].startswith("Outdated app"):
+            m["title"] = f"{n} outdated apps (Homebrew casks)"
+    return list(merged.values())
+
+
+def health_score(findings, disk):
+    """100 = nothing to do. Each severity's penalty is capped, so many small issues can't zero the score."""
+    count = lambda sev: sum(1 for f in findings if f["sev"] == sev)  # noqa: E731
+    score = 100 - min(36, 12 * count("high")) - min(28, 4 * count("medium")) - min(8, count("low"))
+    score -= 20 if disk.get("critical") else (10 if disk.get("low") else 0)
+    return max(0, min(100, score))
+
+
+def deep_scan(traffic=False, stale_days=30):
+    """Every check in one pass, normalised into one prioritised list with fixes and 'new since last time'."""
+    space = space_report(stale_days)
+    findings = []
+
+    def add(area, items):
+        for sev, title, detail in items:
+            if sev != "ok":
+                findings.append(dict(area=area, sev=sev, title=title, detail=detail, fix=fix_for(area, title, detail)))
+    add("security", cmd_security(None, quiet=True))
+    snap = net_snapshot()
+    add("network", analyze_net(snap))
+    apps, app_findings = apps_report(online=False)
+    add("apps", app_findings)
+    if traffic:
+        add("traffic", analyze_traffic(traffic_sample(6), 6))
+    d = space["disk"]
+    if d["low"]:
+        findings.append(dict(area="disk", sev="high" if d["critical"] else "medium",
+                             title="Disk almost full" if d["critical"] else "Disk space low",
+                             detail=f"{human(d['free'])} free of {human(d['total'])}", fix=fix_for("disk", "", "")))
+    for p, before, now in space["grew"][:5]:
+        findings.append(dict(area="disk", sev="info", title="Folder grew since the last scan",
+                             detail=f"{p}: {human(before)} -> {human(now)}", fix="Check what's inside; macguard scan lists cleanable parts"))
+    findings = merge_findings(findings)
+    try:
+        prev = json.loads(read_text(deepscan_file()))
+    except (OSError, ValueError):
+        prev = None
+    known = set(prev["keys"]) if prev else None
+    for f in findings:
+        f["new"] = known is not None and finding_key(f) not in known
+    findings.sort(key=lambda f: (SEV_ORDER[f["sev"]], not f["new"], f["area"]))
+    results = space["results"]
+    report = dict(time=time.time(), since=prev["time"] if prev else None, disk=d, score=health_score(findings, d),
+                  findings=findings, apps=len(apps), listeners=len({(l["proc"], l["lport"]) for l in snap["listeners"]}),
+                  space=dict(safe=sum(r["size"] for r in results if r["risk"] == "safe"),
+                             review=sum(r["size"] for r in results if r["risk"] == "review"),
+                             managed=sum(m["size"] for m in space["managed"]), managed_items=space["managed"],
+                             safe_items=[(r["id"], r["name"], r["size"]) for r in results if r["risk"] == "safe" and r["size"]],
+                             review_items=[(r["id"], r["name"], r["size"]) for r in results if r["risk"] == "review" and r["size"]]),
+                  results=results)
+    ensure_state()
+    write_json(deepscan_file(), dict(time=report["time"], keys=[finding_key(f) for f in findings], score=report["score"]))
+    return report
+
+
+def cmd_deepscan(args):
+    print("Deep scan: disk, security, network, apps" + (", live traffic" if args.traffic else "") + " (about a minute)...",
+          flush=True)
+    r = deep_scan(traffic=args.traffic, stale_days=args.stale_days)
+    d, sp = r["disk"], r["space"]
+    col = C["g"] if r["score"] >= 80 else (C["y"] if r["score"] >= 50 else C["r"])
+    print(f"\n{C['B']}Health {col}{r['score']}/100{C['x']}   {human(d['free'])} free of {human(d['total'])}   "
+          f"{r['apps']} apps   {r['listeners']} listening services")
+    if r["since"]:
+        new = sum(f["new"] for f in r["findings"])
+        print(f"{C['d']}Compared with the deep scan of {dt.datetime.fromtimestamp(r['since']):%b %d %H:%M}: {new} new finding(s){C['x']}")
+    groups = [("Act now", ("high",)), ("Recommended", ("medium",)), ("Good to know", ("low", "info"))]
+    for label, sevs in groups:
+        items = [f for f in r["findings"] if f["sev"] in sevs]
+        if not items:
+            continue
+        print(f"\n{C['B']}{label}{C['x']}")
+        for f in items:
+            tag = f" {C['b']}NEW{C['x']}" if f["new"] else ""
+            print(f"  {C['r'] if f['sev'] == 'high' else (C['y'] if f['sev'] == 'medium' else C['d'])}{f['area']:<8}{C['x']} "
+                  f"{f['title']}{tag}\n           {C['d']}{f['detail']}{C['x']}")
+            if f["fix"]:
+                print(f"           {C['g']}-> {f['fix']}{C['x']}")
+    print(f"\n{C['B']}Space{C['x']}  safe to clean {C['g']}{human(sp['safe'])}{C['x']}  ·  needs review "
+          f"{C['y']}{human(sp['review'])}{C['x']}  ·  managed by apps {human(sp['managed'])}")
+    for m in sp["managed_items"][:4]:
+        print(f"  {human(m['size']):>7}  {m['name']}  {C['d']}- {m['how']}{C['x']}")
+    if args.clean:
+        plan = [x for x in r["results"] if x["risk"] == "safe" and x["size"] > 0]
+        if not plan:
+            print(f"\n{C['g']}Nothing safe left to clean.{C['x']}")
+        elif args.yes or input(f"\nClean the safe items ({human(sp['safe'])})? Type 'yes': ").strip() == "yes":
+            freed = sum(clean_item(x) for x in plan)
+            log_event("clean", f"deepscan freed ~{human(freed)}")
+            print(f"{C['g']}Freed ~{human(freed)}.{C['x']}")
+    elif sp["safe"]:
+        print(f"\nNext: {C['B']}macguard deepscan --clean{C['x']} to clean the safe items too.")
+
+
 # ---------------------------------------------------------------- watch mode
 
 def read_text(path):
@@ -1836,6 +2061,15 @@ def cmd_ui(args):
             if self.path == "/api/apps":
                 apps, findings = apps_report(online=False)
                 return self.send(200, {"count": len(apps), "findings": findings_json(findings)})
+            if self.path == "/api/deepscan":
+                with lock:
+                    r = deep_scan(traffic=False, stale_days=args.stale_days)
+                    state["scan"] = r["results"]  # so "Clean selected" works straight after a deep scan
+                sp = r["space"]
+                return self.send(200, dict(score=r["score"], since=r["since"], disk=r["disk"], findings=r["findings"],
+                                           apps=r["apps"], listeners=r["listeners"], items=junk_json(r["results"]),
+                                           space=dict(safe=sp["safe"], review=sp["review"], managed=sp["managed"],
+                                                      managed_items=sp["managed_items"])))
             if self.path == "/api/installed":
                 table = process_table()
                 return self.send(200, [dict(name=a["name"], version=a["version"], bundle_id=a["bundle_id"], path=a["path"],
@@ -2044,6 +2278,10 @@ def main():
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_clean)
     sub.add_parser("net").set_defaults(fn=cmd_net)
     sub.add_parser("security").set_defaults(fn=cmd_security)
+    p = sub.add_parser("deepscan", help="every check in one prioritised report with fixes")
+    p.add_argument("--clean", action="store_true", help="then clean the safe items"); p.add_argument("--yes", action="store_true")
+    p.add_argument("--traffic", action="store_true", help="also sample live traffic for 6s")
+    p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_deepscan)
     p = sub.add_parser("apps"); p.add_argument("--online", action="store_true", help="also check Apple for macOS updates")
     p.add_argument("--list", action="store_true", help="print every app"); p.set_defaults(fn=cmd_apps)
     p = sub.add_parser("uninstall", help="remove an app and its ~/Library data (to the Trash)")

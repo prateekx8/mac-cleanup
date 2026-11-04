@@ -177,6 +177,18 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 .app .lock{font-size:12px;color:var(--fg-3)}
 .chip.running{color:var(--ok);background:color-mix(in srgb,var(--ok) 16%,transparent);white-space:nowrap}
 
+/* deep scan */
+.score{min-width:64px;height:64px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:20px;flex:none;
+  background:conic-gradient(var(--sc) calc(var(--v)*1%), var(--glass-2) 0);position:relative}
+.score:after{content:"";position:absolute;inset:6px;border-radius:50%;background:var(--bg);opacity:.9}
+.score span{position:relative;z-index:1}
+.dgroup h3{font-size:13px;font-weight:700;color:var(--fg-2);padding:12px 22px 4px;text-transform:uppercase;letter-spacing:.05em}
+.df .fix{display:block;margin-top:4px;font:12px/1.5 var(--mono);color:var(--ok);word-break:break-all;cursor:copy}
+.df .area{font-size:11px;color:var(--fg-3);margin-right:6px;text-transform:uppercase;letter-spacing:.04em}
+.newtag{font-size:10px;font-weight:700;color:#fff;background:var(--accent);padding:1px 7px;border-radius:999px;margin-left:6px;vertical-align:1px}
+.dspace{display:flex;gap:18px;flex-wrap:wrap;padding:10px 22px 16px;color:var(--fg-2);font-size:13.5px}
+.dspace b{color:var(--fg)}
+
 /* watcher */
 .watch{display:flex;align-items:center;gap:18px}
 .switch{position:relative;width:52px;height:31px;flex:none}
@@ -223,6 +235,7 @@ footer code{font-family:var(--mono)}
     <p>Clear rebuildable developer junk, check your security settings and see who's on your network — all in one place.</p>
     <div class="actions">
       <button class="btn primary" id="scanBtn">✦ Scan this Mac</button>
+      <button class="btn ghost" id="deepBtn">◎ Deep scan</button>
       <button class="btn ghost" id="checkAll">Run all checks</button>
     </div>
   </header>
@@ -236,6 +249,12 @@ footer code{font-family:var(--mono)}
     <div class="stat glass"><div class="k"><span class="dot-k" style="background:var(--hi)"></span>Issues</div><b id="sIssues">—</b></div>
   </div>
   <i id="diskBar" hidden></i>
+
+  <section class="panel glass" id="deepPanel" hidden>
+    <div class="ph"><span class="ic">◎</span><div class="grow"><h2>Deep scan</h2><small id="deepSub">Everything at once, in priority order, with the fix for each</small></div>
+      <div class="score" id="deepScore">—</div></div>
+    <div id="deep"></div>
+  </section>
 
   <section class="panel glass">
     <div class="ph"><span class="ic">🧹</span><div class="grow"><h2>Cleanup</h2><small>Safe items are pre-selected. Review items are your call.</small></div></div>
@@ -514,6 +533,43 @@ async function uninstall(path, leftoversOnly, btn){
   finally { busy(btn, false, leftoversOnly ? "Reset" : "Uninstall"); }
 }
 $("manageBtn").onclick = manageApps; $("appSearch").oninput = renderInstalled;
+
+async function deepScan(){
+  const btn = $("deepBtn"); busy(btn, true); $("deepPanel").hidden = false;
+  $("deep").innerHTML = '<div class="empty"><span class="spin"></span>&nbsp; Checking disk, security, network and apps (about a minute)…</div>';
+  $("deepPanel").scrollIntoView({behavior:"smooth", block:"start"});
+  try {
+    const r = await api("/api/deepscan");
+    const col = r.score >= 80 ? "var(--ok)" : r.score >= 50 ? "var(--med)" : "var(--hi)";
+    $("deepScore").style.setProperty("--v", r.score); $("deepScore").style.setProperty("--sc", col);
+    $("deepScore").innerHTML = `<span style="color:${col}">${r.score}</span>`;
+    const nNew = r.findings.filter(f => f.new).length;
+    $("deepSub").textContent = `${r.apps} apps · ${r.listeners} listening services` +
+      (r.since ? ` · ${nNew} new since ${new Date(r.since*1000).toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"})}` : "");
+    const groups = [["Act now", ["high"]], ["Recommended", ["medium"]], ["Good to know", ["low", "info"]]];
+    let h = "";
+    for (const [label, sevs] of groups){
+      const fs = r.findings.filter(f => sevs.includes(f.sev)); if (!fs.length) continue;
+      h += `<div class="dgroup"><h3>${label}</h3><div class="list">` + fs.map(f => `<div class="f df"><span class="sev ${f.sev}">${f.sev}</span>
+        <div class="body"><span class="area">${esc(f.area)}</span>${esc(f.title)}${f.new ? '<span class="newtag">NEW</span>' : ""}
+        <small>${esc(f.detail)}</small>${f.fix ? `<span class="fix" title="Click to copy">→ ${esc(f.fix)}</span>` : ""}</div></div>`).join("") + `</div></div>`;
+    }
+    if (!r.findings.length) h += `<div class="empty">✨ Nothing to fix.</div>`;
+    h += `<div class="dspace"><span>Safe to clean <b>${human(r.space.safe)}</b></span><span>Needs review <b>${human(r.space.review)}</b></span>
+      <span>Managed by apps <b>${human(r.space.managed)}</b></span>${r.space.safe ? '<button class="btn primary sm" id="deepClean">Clean safe items</button>' : ""}</div>`;
+    $("deep").innerHTML = h;
+    $("deep").querySelectorAll(".fix").forEach(el => el.onclick = () => {
+      navigator.clipboard?.writeText(el.textContent.replace(/^→\s*/, "")).then(() => toast("Copied"), () => {}); });
+    showDisk(r.disk); items = r.items; picked = new Set(items.filter(i=>i.risk==="safe").map(i=>i.id)); open = null; renderItems();
+    if ($("deepClean")) $("deepClean").onclick = () => $("cleanBtn").click();
+    issues.sec = r.findings.filter(f => f.area==="security" && (f.sev==="high"||f.sev==="medium")).length;
+    issues.net = r.findings.filter(f => f.area==="network" && (f.sev==="high"||f.sev==="medium")).length;
+    issues.apps = r.findings.filter(f => f.area==="apps" && (f.sev==="high"||f.sev==="medium")).length; countIssues();
+    $("when").textContent = "Deep scan " + new Date().toLocaleTimeString();
+  } catch(e){ $("deep").innerHTML = `<div class="empty">Deep scan failed: ${esc(e.message)}</div>`; }
+  busy(btn, false, "◎ Deep scan");
+}
+$("deepBtn").onclick = deepScan;
 
 $("secBtn").onclick = checkSec; $("netBtn").onclick = checkNet;
 $("appsBtn").onclick = checkApps; $("trafficBtn").onclick = checkTraffic;

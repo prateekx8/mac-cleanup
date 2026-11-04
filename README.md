@@ -40,6 +40,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 
 | Command | What it does |
 |---|---|
+| `macguard deepscan [--clean] [--traffic]` | **Everything at once:** disk, security, network and apps in one prioritized report (Act now / Recommended / Good to know), each finding with its **fix**. Shows a 0–100 health score and what's **new since the last deep scan**. `--clean` then cleans the safe items. In the UI, use the **Deep scan** button. |
 | `macguard scan` | Disk junk analysis, low-disk warning, what grew since the last scan, app-managed storage. Read-only. |
 | `macguard clean` | Dry run of the **safe** cleanup. |
 | `macguard clean --apply` | Delete safe items after you type `yes`. |
@@ -60,7 +61,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 116 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 125 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

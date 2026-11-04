@@ -10,13 +10,13 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 
 | Part | File | Responsibility |
 |---|---|---|
-| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `apps`, `traffic`, `uninstall`, `kill`, `watch`, `report`, `settings`, `ui`, `doctor`). |
+| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `apps`, `traffic`, `uninstall`, `kill`, `deepscan`, `watch`, `report`, `settings`, `ui`, `doctor`). |
 | Web UI | `ui.html` | A single page with vanilla JS and glassmorphism styling. It talks to the engine's JSON API. |
 | Native app | `app/main.swift` | An AppKit window with a `WKWebView`. It starts the engine and shows the UI. |
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 116 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 125 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -88,6 +88,14 @@ flowchart LR
 - `app_process_tree()` reads `ps -axo pid,ppid,uid,comm` once. It takes every process whose executable lives inside the app bundle (main app, helpers, XPC services, login items) or in `/Library/PrivilegedHelperTools/<bundle id>*`, adds all their descendants, and removes macguard itself and its ancestors, so it never kills the app or terminal it runs in.
 - `kill_app()` first unloads the app's loaded launch agents (`launchctl bootout gui/<uid>/<label>`) so it can't respawn, which is what kept relaunching CCleaner. It sends TERM to the tree, waits up to 5 s, then sends KILL to survivors. Root-owned processes are reported for `sudo kill`. Core macOS processes (Finder, Dock, WindowServer, loginwindow…) are refused.
 - A real end-to-end test compiles a tiny app binary that forks a child, then checks both are gone.
+
+### Deep scan
+
+- `deep_scan()` runs `space_report`, the security audit, network analysis and the apps audit (plus a traffic sample with `--traffic`) and turns the results into one list of `{area, sev, title, detail, fix}`.
+- `fix_for()` maps each finding to one concrete next step: a System Settings path or a ready-to-run command (`brew upgrade --cask …`, moving a key into `~/.ssh` with `chmod 600`, `launchctl bootout …`).
+- `merge_findings()` merges findings with the same title (AirPlay on two ports, several outdated casks into one `brew upgrade` line). It also drops a security-check line when the network check already reports the same service as exposed.
+- `health_score()` caps each severity's penalty (high at most 36, medium 28, low 8, plus disk), so many small issues can't zero the score.
+- Finding keys (with pids normalized) are saved in `~/.macguard/deepscan.json`, and the next deep scan marks anything not seen before as **new**.
 
 ### Traffic
 

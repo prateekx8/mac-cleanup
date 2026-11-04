@@ -1003,6 +1003,108 @@ class TestSpaceInsights(TempHome):
             self.assertIn(want, text)
 
 
+# ---------------------------------------------------------------- deep scan
+
+def F(area, sev, title, detail, fix=""):
+    return dict(area=area, sev=sev, title=title, detail=detail, fix=fix)
+
+
+class TestDeepScan(TempHome):
+    def test_fixes(self):
+        self.assertIn("Remote Login (SSH)", mg.fix_for("network", "SSH exposed to the network", "launchd (pid 1) on *:22"))
+        self.assertIn("AirPlay Receiver", mg.fix_for("network", "AirPlay Receiver exposed", "ControlCenter (pid 6) on *:7000"))
+        self.assertEqual(mg.fix_for("apps", "Outdated app (Homebrew cask)", "zoom 5 -> 6  (brew upgrade --cask zoom)"),
+                         "brew upgrade --cask zoom")
+        key = mg.fix_for("security", "Private key / secret file in ~/Downloads", "~/Downloads/a b.key - move")
+        self.assertIn('"$HOME/Downloads/a b.key"', key)  # regression: a quoted ~ doesn't expand
+        self.assertIn("Firewall: on", mg.fix_for("security", "macOS firewall is OFF", ""))
+
+    def test_merge_and_dedupe(self):
+        fs = [F("network", "medium", "AirPlay Receiver exposed to the network", "x on *:5000", "fix A"),
+              F("network", "medium", "AirPlay Receiver exposed to the network", "x on *:7000", "fix A"),
+              F("network", "medium", "SSH exposed to the network", "launchd on *:22", "ssh fix"),
+              F("security", "medium", "Remote Login (SSH) is enabled", "", ""),
+              F("security", "medium", "Screen Sharing is enabled", "", ""),  # not exposed on :5900 here: kept
+              F("apps", "medium", "Outdated app (Homebrew cask)", "a", "brew upgrade --cask a"),
+              F("apps", "medium", "Outdated app (Homebrew cask)", "b", "brew upgrade --cask b")]
+        m = {(f["area"], f["title"]): f for f in mg.merge_findings(fs)}
+        self.assertEqual(m[("network", "AirPlay Receiver exposed to the network")]["detail"], "x on *:5000; x on *:7000")
+        self.assertNotIn(("security", "Remote Login (SSH) is enabled"), m)
+        self.assertIn(("security", "Screen Sharing is enabled"), m)
+        self.assertEqual(m[("apps", "2 outdated apps (Homebrew casks)")]["fix"], "brew upgrade --cask a b")
+
+    def test_score_is_capped_per_severity(self):
+        many = [F("x", "medium", f"t{i}", "") for i in range(13)] + [F("x", "high", "h1", ""), F("x", "high", "h2", "")]
+        self.assertEqual(mg.health_score(many, {"low": False, "critical": False}), 100 - 24 - 28)
+        self.assertEqual(mg.health_score([], {"low": True, "critical": True}), 80)
+        self.assertEqual(mg.health_score([], {}), 100)
+
+    def deep(self, sec):
+        space = dict(disk=mg.disk_health({"total": 228 * GB, "used": 200 * GB, "free": 28 * GB}),
+                     results=[dict(id="npm", name="npm", risk="safe", size=5, entries=[("x", 5, "")])],
+                     big=[], since=None, grew=[], managed=[])
+        with mock.patch.object(mg, "space_report", return_value=space), \
+                mock.patch.object(mg, "cmd_security", return_value=sec), \
+                mock.patch.object(mg, "net_snapshot", return_value=SNAP(listeners=[L(22)])), \
+                mock.patch.object(mg, "signature", return_value="apple"), \
+                mock.patch.object(mg, "apps_report", return_value=([], [])):
+            return mg.deep_scan()
+
+    def test_new_since_last_deep_scan(self):
+        first = self.deep([("high", "macOS firewall is OFF", "")])
+        self.assertIsNone(first["since"])
+        self.assertFalse(any(f["new"] for f in first["findings"]))  # nothing to compare with yet
+        second = self.deep([("high", "macOS firewall is OFF", ""), ("medium", "Private key / secret file in ~/Downloads", "~/Downloads/k.key - move")])
+        new = {f["title"]: f["new"] for f in second["findings"]}
+        self.assertEqual(new, {"macOS firewall is OFF": False, "SSH exposed to the network": False,
+                               "Private key / secret file in ~/Downloads": True})
+        self.assertEqual(second["findings"][0]["title"], "macOS firewall is OFF")  # high first
+        self.assertEqual(second["space"]["safe"], 5)
+
+    def test_cli_deepscan_clean(self):
+        rep = dict(score=72, since=None, disk=mg.disk_health({"total": 228 * GB, "used": 200 * GB, "free": 28 * GB}),
+                   findings=[dict(F("security", "high", "macOS firewall is OFF", "", "System Settings > Network > Firewall: on"), new=True)],
+                   apps=3, listeners=2, results=[dict(id="npm", name="npm", risk="safe", size=5, entries=[])],
+                   space=dict(safe=5, review=0, managed=0, managed_items=[], safe_items=[], review_items=[]))
+        out = io.StringIO()
+        with mock.patch.object(mg, "deep_scan", return_value=rep), mock.patch.object(mg, "clean_item", return_value=5) as ci, \
+                redirect_stdout(out):
+            mg.cmd_deepscan(argparse.Namespace(traffic=False, stale_days=30, clean=True, yes=True))
+        text = out.getvalue()
+        for want in ("Health", "72/100", "Act now", "NEW", "-> System Settings > Network > Firewall: on", "Freed"):
+            self.assertIn(want, text)
+        ci.assert_called_once()
+
+    def test_security_lists_every_key_and_orders_temp_folder_first(self):
+        for name in ("a.key", "b.key"):
+            with open(self.mk(f"Downloads/{name}", 0), "w") as fh:
+                fh.write("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        agent = self.mk("Library/LaunchAgents/evil.plist", 10)
+        own = self.mk("Library/LaunchAgents/mine.plist", 10)
+        progs = {agent: "/tmp/x/payload", own: f"{self.home}/.automation/run.sh"}
+        with mock.patch.object(mg, "run", return_value=(0, "", "")), mock.patch.object(mg, "plist_program", lambda p: progs.get(p)), \
+                mock.patch.object(mg, "signature", return_value="unsigned"), \
+                mock.patch.object(mg, "SUSPICIOUS_EXE_DIRS", ("/tmp/",)):  # the test HOME itself lives in a temp dir
+            res = mg.cmd_security(None, quiet=True)
+        keys = [d for _, t, d in res if t.startswith("Private key")]
+        self.assertEqual(len(keys), 2)  # regression: the second key was dropped by a title-only dedupe
+        self.assertIn(("high", "Auto-start program in temp/download folder"), {(sv, t) for sv, t, _ in res})  # regression: ordering
+        self.assertIn(("low", "Your own unsigned script starts automatically (confirm it's yours)"), {(sv, t) for sv, t, _ in res})
+
+    def test_simulator_runtimes_from_simctl(self):
+        out = ("== Disk Images ==\n-- watchOS --\nwatchOS 26.2 (23S303) - 00A89AB1-FBF9-40EA-A769-56D12799B117 (Ready)\n"
+               "Total Disk Images: 1 (3.6G)\n")
+        with mock.patch.object(mg.shutil, "which", return_value="/usr/bin/xcrun"), mock.patch.object(mg, "run", return_value=(0, out, "")):
+            r = mg.simulator_runtimes()
+        self.assertEqual(r["runtimes"], [dict(name="watchOS 26.2 (23S303)", id="00A89AB1-FBF9-40EA-A769-56D12799B117")])
+        self.assertEqual(r["size"], int(3.6 * GB))
+
+    def test_own_ipv6_prefix_is_local(self):
+        with mock.patch.object(mg, "_local_v6", {"2001:db8:1c74:"}):
+            self.assertTrue(mg.is_private("2001:db8:1c74:7"))   # truncated peer on our own network
+            self.assertFalse(mg.is_private("2001:db9:1:2"))
+
+
 # ---------------------------------------------------------------- watch / settings
 
 class TestWatchAndSettings(TempHome):
@@ -1230,6 +1332,16 @@ class TestWebUI(TempHome):
             self.assertEqual((r["stopped"], r["survivors"]), (1, []))
             self.assertEqual(self.req("/api/kill", body={"path": "/Applications/Other.app"})[0], 404)
 
+    def test_deepscan_endpoint_enables_clean(self):
+        rep = dict(score=88, since=None, disk={"total": 100, "used": 40, "free": 60, "low": True, "critical": True},
+                   findings=[dict(F("security", "high", "macOS firewall is OFF", "", "fix"), new=False)], apps=1, listeners=0,
+                   results=[dict(id="junk", name="Junk", risk="safe", note="", entries=[(self.target, 100, "")], size=100)],
+                   space=dict(safe=100, review=0, managed=0, managed_items=[], safe_items=[], review_items=[]))
+        with mock.patch.object(mg, "deep_scan", return_value=rep):
+            r = json.loads(self.req("/api/deepscan")[1])
+        self.assertEqual((r["score"], r["findings"][0]["fix"], r["items"][0]["id"]), (88, "fix", "junk"))
+        self.assertEqual(json.loads(self.req("/api/clean", body={"ids": ["junk"]})[1])["cleaned"], ["junk"])  # no separate scan needed
+
     def test_security_and_net_endpoints(self):
         with mock.patch.object(mg, "cmd_security", return_value=[("high", "Firewall off", "x")]), \
                 mock.patch.object(mg, "net_snapshot", return_value=SNAP(listeners=[L(6379)])), \
@@ -1321,7 +1433,7 @@ class LiveSystem(unittest.TestCase):
         import subprocess
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
         out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
-        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "watch", "report", "settings", "ui", "doctor"):
+        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "deepscan", "watch", "report", "settings", "ui", "doctor"):
             self.assertIn(cmd, out)
 
 
