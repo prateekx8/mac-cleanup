@@ -100,7 +100,8 @@ JUNK = [
     dict(id="maven", name="Maven repository", risk="review", paths=[f"{H}/.m2/repository"]),
     dict(id="cargo", name="Cargo registry cache", risk="safe", paths=[f"{H}/.cargo/registry/cache", f"{H}/.cargo/registry/src"]),
     dict(id="brew", name="Homebrew cache & old versions", risk="safe", paths=[f"{H}/Library/Caches/Homebrew"], cmd="brew cleanup -s --prune=all"),
-    dict(id="docker", name="Docker unused images/build cache", risk="safe", special="docker"),
+    dict(id="docker", name="Docker unused images/build cache", risk="safe", special="docker",
+         note="containers and volumes are kept; images re-download when needed"),
     dict(id="user-logs", name="User logs", risk="safe", paths=[f"{H}/Library/Logs/*"]),
     dict(id="selenium-prisma", name="Selenium / Prisma / Puppeteer caches", risk="safe",
          paths=[f"{H}/.cache/selenium", f"{H}/.cache/prisma", f"{H}/.cache/puppeteer", f"{H}/.cache/ms-playwright"]),
@@ -184,7 +185,10 @@ def docker_reclaimable():
         return 0
     total = 0
     for line in out.splitlines():
-        m = re.match(r"([\d.]+)\s*([kKMGT]?B)", json.loads(line).get("Reclaimable", "0B"))
+        row = json.loads(line)
+        if row.get("Type") not in ("Images", "Build Cache"):  # containers and volumes hold data: never pruned
+            continue
+        m = re.match(r"([\d.]+)\s*([kKMGT]?B)", row.get("Reclaimable", "0B"))
         if m:
             mult = {"B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}.get(m.group(2), 1)
             total += float(m.group(1)) * mult
@@ -216,7 +220,7 @@ def resolve(item, stale_days=30):
         paths = simctl_unavailable()
     elif sp == "docker":
         n = docker_reclaimable()
-        return [("docker system prune", n, "docker images/containers/build cache")] if n else []
+        return [("docker image prune -a + builder prune", n, "unused images and build cache")] if n else []
     elif sp == "jetbrains":
         paths = old_versions(f"{HOME}/Library/Application Support/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
             old_versions(f"{HOME}/Library/Caches/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
@@ -320,7 +324,8 @@ def clean_item(r):
         run(["xcrun", "simctl", "delete", "unavailable"], timeout=600)
         return r["size"]
     if sp == "docker":
-        run(["docker", "system", "prune", "-f"], timeout=600)
+        # not `docker system prune`: that also deletes stopped containers (and the data in them)
+        run(["docker", "image", "prune", "-a", "-f"], timeout=600)
         run(["docker", "builder", "prune", "-f"], timeout=600)
         return r["size"]
     if r.get("cmd") and shutil.which(r["cmd"].split()[0]):
