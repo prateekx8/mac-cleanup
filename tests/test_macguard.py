@@ -103,6 +103,18 @@ class TestCleanup(TempHome):
         old = mg.old_versions(os.path.join(self.home, "jb", "*"), r"([A-Za-z]+)\d{4}\.\d+")
         self.assertEqual([os.path.basename(p) for p in old], ["IntelliJIdea2025.3"])
 
+    def test_docker_counts_and_prunes_only_images_and_build_cache(self):
+        df = "\n".join(json.dumps(r) for r in (
+            {"Type": "Images", "Reclaimable": "3GB (11%)"}, {"Type": "Containers", "Reclaimable": "500MB (93%)"},
+            {"Type": "Local Volumes", "Reclaimable": "1GB (2%)"}, {"Type": "Build Cache", "Reclaimable": "21GB"}))
+        with mock.patch.object(mg, "run", return_value=(0, df, "")):
+            self.assertEqual(mg.docker_reclaimable(), 24 * 10 ** 9)
+        with mock.patch.object(mg, "run", return_value=(0, "", "")) as r:
+            quiet(mg.clean_item, {"special": "docker", "name": "Docker", "size": 1})
+        cmds = [" ".join(c.args[0]) for c in r.call_args_list]
+        self.assertEqual(cmds, ["docker image prune -a -f", "docker builder prune -f"])
+        self.assertFalse(any("system prune" in c or "container" in c or "volume" in c for c in cmds))
+
     def test_old_versions_ignores_backup_folders(self):
         # a "-backup" copy must not be taken for the newest version (that deleted the live settings)
         for d in ("IntelliJIdea2026.1", "IntelliJIdea2026.2", "IntelliJIdea2026.2-backup"):
