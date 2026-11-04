@@ -16,7 +16,7 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 125 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 143 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -89,6 +89,14 @@ flowchart LR
 - `kill_app()` first unloads the app's loaded launch agents (`launchctl bootout gui/<uid>/<label>`) so it can't respawn, which is what kept relaunching CCleaner. It sends TERM to the tree, waits up to 5 s, then sends KILL to survivors. Root-owned processes are reported for `sudo kill`. Core macOS processes (Finder, Dock, WindowServer, loginwindow…) are refused.
 - A real end-to-end test compiles a tiny app binary that forks a child, then checks both are gone.
 
+### Performance (`perf`)
+
+- `perf_table()` reads `ps -axo pid,ppid,uid,pcpu,rss,comm` plus `ps -axww -o pid,args` (full command lines, so a Gradle daemon or a Vite server can be told apart from any other `java` or `node`).
+- `dev_items()` matches processes against `DEV_RULES` (Docker Desktop, Ollama, simulators, Gradle and Kotlin daemons, Unity, Android emulator, Spotlight, renders, Node dev servers). Children join their parent's group, and Docker's Apple Virtualization VM counts as Docker. A render whose top process now has launchd (pid 1) as parent, and isn't a launchd job (`launchctl list`), is a **leftover**; any other such process outside an app bundle is an **orphan**.
+- Each item is **safe** (idle Docker with no running containers, Ollama with no model loaded, idle Gradle/Kotlin daemons, simulators, leftover renders), **review** (anything busy or holding your work) or **system** (Spotlight: advice only). It carries its stop steps (`quit` an app via AppleScript, a fixed command such as `xcrun simctl shutdown all`, or `term` pids) and a restart hint.
+- `stop_pids()` re-reads the process table and only signals pids that still run the same program, belong to you, live outside macOS paths and aren't macguard or its ancestors. It sends TERM, then KILL after a grace period. Nothing runs with `sudo`.
+- `system_load()` reads `vm.loadavg`, `kern.memorystatus_vm_pressure_level`, `memory_pressure -Q`, `vm.swapusage` and `pmset -g therm/batt`. `--before heavy` adds free-space, power and "what to close" checks.
+
 ### Deep scan
 
 - `deep_scan()` runs `space_report`, the security audit, network analysis and the apps audit (plus a traffic sample with `--traffic`) and turns the results into one list of `{area, sev, title, detail, fix}`.
@@ -119,7 +127,7 @@ The UI server binds to **127.0.0.1 only**. Every API call needs:
 1. a **per-launch random token**, embedded in the page and sent as `X-Token`, so other websites can't call the API (CSRF), and
 2. a `Host` header of `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS-rebinding attacks.
 
-`/api/clean` only accepts category ids from the most recent scan. It never takes paths from the client.
+`/api/clean` only accepts category ids from the most recent scan. It never takes paths from the client. `/api/perf/stop` likewise takes only item ids and re-plans from a fresh process snapshot, so the page never chooses pids or commands.
 
 ## Native app process model
 

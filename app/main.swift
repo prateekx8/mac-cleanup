@@ -144,7 +144,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let lines = message.components(separatedBy: "\n")
         a.messageText = lines.first ?? "Confirm"
         a.informativeText = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        a.addButton(withTitle: "Delete")
+        // the button says what happens: "Stop 2 item(s)?" -> Stop, "Quit Docker…" -> Quit, cleanup -> Delete
+        let verb = String(lines.first?.split(separator: " ").first ?? "")
+        a.addButton(withTitle: ["Stop", "Quit", "Uninstall", "Reset"].contains(verb) ? verb
+                    : (message.hasPrefix("Permanently delete") ? "Delete" : "Continue"))
         a.addButton(withTitle: "Cancel")
         a.buttons.first?.hasDestructiveAction = true
         a.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn) }

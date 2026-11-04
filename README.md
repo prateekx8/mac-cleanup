@@ -9,6 +9,7 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
 - **Apps and traffic**: flags installed apps with broken or missing signatures, outdated, end-of-life or remote-access apps and orphaned root helpers, and samples live traffic per process to spot heavy uploads, scanning or odd destinations.
 - **Full uninstall and app reset**: removes an app plus its scattered data (Application Support, Caches, Preferences, Containers, saved state, cookies, launch agents and system launch daemons) by exact bundle ID or name, and finds leftovers from apps you've already deleted. Everything goes to the **Trash**, so it's recoverable. Apple apps and running apps are refused.
+- **Performance for dev work**: finds what is hogging CPU, memory and heat, grouped by app: Docker Desktop and its VM, Ollama, Remotion/headless-Chrome renders and ffmpeg, Spotlight indexing, booted iOS simulators, Gradle and Kotlin daemons, Unity, Android emulators, Node dev servers, and leftover processes whose parent has exited. Shows thermal throttling, load, memory pressure and swap. Each item is **safe** to stop or **review**, and stopping one always tells you how to start it again. `--before heavy` checks you're ready for a Unity, Xcode or Android build or a video render.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
 - **Three front ends**: a native **Mac Cleanup.app**, a local **web UI** with a glass design, and the **`macguard` CLI**.
@@ -51,6 +52,10 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
 | `macguard uninstall <app> [--apply] [--leftovers-only]` | Dry-run by default: lists the app and every leftover. `--apply` moves them to the Trash; `--leftovers-only` resets the app and keeps it. Also in the UI under Applications → Manage apps. |
 | `macguard kill <app> [--keep-agents]` | Quit an app **and everything under it**: helpers, XPC services, child processes and root helpers. It unloads the app's launch agents first so it can't relaunch, then sends TERM, then KILL after 5 s. Root processes get a ready `sudo kill` line. In the UI, running apps show a badge and a **Quit** button. `uninstall --quit` stops the app before removing it. |
+| `macguard perf` | What's using CPU, memory and heat: dev daemons and leftover processes marked **safe** or **review**, the heaviest apps, thermal state, load, memory pressure and swap. Read-only. In the UI: **Performance**. |
+| `macguard perf --apply` | Stop the **safe** items after you type `yes`: idle Docker Desktop and Ollama, idle Gradle daemons (`gradle --stop`), booted simulators (`xcrun simctl shutdown all`), leftover render helpers. Prints what it stopped and how to start each again. Never touches macOS or root processes, never uses `sudo`. |
+| `macguard perf --only docker,unity --apply` | Stop specific **review** items (a busy Docker, Unity, an emulator, a running render, dev servers, orphans). |
+| `macguard perf --before heavy` | Also checks free space (~30 GB for Unity or Xcode), Low Power Mode and battery, and lists what to close before a heavy build. |
 | `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
@@ -61,7 +66,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 125 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 143 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

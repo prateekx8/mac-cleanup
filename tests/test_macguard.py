@@ -797,6 +797,290 @@ class TestKill(TempHome):
             proc.wait()
 
 
+# ---------------------------------------------------------------- performance
+
+def P(pid, exe, ppid=1, uid=None, cpu=0.0, mem=0, args=None):
+    return dict(pid=pid, ppid=ppid, uid=os.getuid() if uid is None else uid, cpu=cpu, mem=mem, exe=exe, args=args or exe)
+
+
+CHS = "/Users/me/proj/node_modules/.remotion/chrome-headless-shell/mac-arm64/chrome-headless-shell"
+PERF_RUN = {  # longer prefixes first: fake_run takes the first prefix that matches
+    "docker ps -q": "",
+    "ollama ps": "NAME    ID    SIZE    PROCESSOR    UNTIL\n",
+    "xcrun simctl list devices booted -j": json.dumps({"devices": {"iOS-26": [{"name": "iPhone 17 Pro", "state": "Booted"}]}}),
+    "sysctl -n vm.loadavg": "{ 12.50 8.00 6.00 }",
+    "sysctl -n hw.memsize": "17179869184",
+    "sysctl -n kern.memorystatus_vm_pressure_level": "2",
+    "memory_pressure -Q": "The system has 17179869184 (1048576 pages).\nSystem-wide memory free percentage: 12%\n",
+    "sysctl -n vm.swapusage": "total = 8192.00M  used = 6144.00M  free = 2048.00M  (encrypted)",
+    "pmset -g therm": "CPU_Scheduler_Limit \t= 100\nCPU_Available_CPUs \t= 10\nCPU_Speed_Limit \t= 70\n",
+    "pmset -g batt": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1)\t80%; discharging\n",
+    "pmset -g": "System-wide power settings:\n lowpowermode         1\n",
+}
+
+
+class TestPerf(TempHome):
+    def table(self):
+        me, parent = os.getpid(), os.getppid()
+        java = "/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home/bin/java"
+        return [P(1, "/sbin/launchd", ppid=0, uid=0),
+                P(parent, "/bin/zsh"), P(me, "/usr/bin/python3", ppid=parent),
+                P(100, "/Applications/Docker.app/Contents/MacOS/com.docker.backend", cpu=2, mem=500 << 20),
+                P(101, "/Applications/Docker.app/Contents/MacOS/Docker Desktop.app/Contents/MacOS/Docker Desktop", ppid=100),
+                P(102, "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization."
+                       "VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine", cpu=20, mem=2 * GB),
+                P(200, "/opt/homebrew/bin/ollama", args="/opt/homebrew/bin/ollama serve", mem=100 << 20),
+                P(300, java, cpu=0.5, mem=1536 << 20, args=f"{java} -Xmx2g org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10"),
+                P(310, java, cpu=40, args=f"{java} org.jetbrains.kotlin.daemon.KotlinCompileDaemon --daemon-runFilesPath x"),
+                P(400, "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Resources/bin/launchd_sim"),
+                P(401, "/Library/Developer/CoreSimulator/Volumes/iOS_23F77/RuntimeRoot/SpringBoard.app/SpringBoard", ppid=400),
+                P(500, "/Applications/Unity Hub.app/Contents/MacOS/Unity Hub", cpu=6),
+                P(510, "/Users/me/Library/Android/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64", cpu=30),
+                # a live MCP server that renders: the server itself is not a render, its render is (and is busy)
+                P(650, "node", ppid=parent, args="node /Users/me/proj/apps/remotion-engine/src/mcp/stdio.ts"),
+                P(600, "node", ppid=650, args="node /Users/me/proj/node_modules/@remotion/cli/remotion-cli.js render src/index.ts"),
+                P(601, CHS, ppid=600, cpu=120),
+                # leftovers from a finished render: parent is launchd now
+                P(700, CHS, cpu=90, mem=800 << 20), P(701, CHS, ppid=700, cpu=10), P(710, "/opt/homebrew/bin/ffmpeg", cpu=60),
+                P(720, "/opt/homebrew/bin/ffmpeg", uid=0, cpu=5),  # someone else's: never ours to stop
+                P(799, "/bin/zsh", ppid=parent),
+                P(800, "node", ppid=799, args="node /Users/me/web/node_modules/.bin/vite --port 5173"),
+                P(801, "/Users/me/web/node_modules/@esbuild/darwin-arm64/bin/esbuild", ppid=800, args="esbuild --service=0.21.5 --ping"),
+                P(900, "/Users/me/bin/stray-worker", cpu=3), P(901, "/Users/me/bin/stray-child", ppid=900),
+                P(910, "/Users/me/bin/my-agent"),  # started by launchd on purpose
+                P(930, "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds_stores",
+                  uid=0, cpu=50, mem=300 << 20),
+                P(950, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", cpu=10, mem=3 * GB)]
+
+    JOBS = {200: "homebrew.mxcl.ollama", 910: "com.me.agent"}
+
+    def items(self, extra=None, which=("docker", "ollama")):
+        runs = dict(extra or {}, **{k: v for k, v in PERF_RUN.items() if k not in (extra or {})})
+        with mock.patch.object(mg, "run", fake_run(runs)), \
+                mock.patch.object(mg.shutil, "which", lambda n: f"/usr/local/bin/{n}" if n in which else None):
+            return {it["id"]: it for it in mg.dev_items(self.table(), dict(self.JOBS))}
+
+    @staticmethod
+    def pids(it):
+        return sorted(p["pid"] for p in it["procs"])
+
+    @staticmethod
+    def targets(it):
+        return sorted(pid for kind, what in it["stop"] if kind == "term" for pid in what)
+
+    def test_perf_table_parses_ps_and_args(self):
+        ps = ("  456     1    88  45.6  58032 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n"
+              " 1025   947   501  25.7 1259776 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/"
+              "Contents/MacOS/Google Chrome Helper\n 1177  1080   501   0.0  9000 node\ngarbage\n")
+        args = "  456 WindowServer -daemon\n 1177 node /x/node_modules/.bin/vite --port 5173\n"
+        out = lambda cmd, timeout=60: (0, args if "args=" in " ".join(cmd) else ps, "")  # noqa: E731
+        with mock.patch.object(mg, "run", out):
+            rows = mg.perf_table()
+        self.assertEqual([r["pid"] for r in rows], [456, 1025, 1177])
+        self.assertEqual((rows[1]["cpu"], rows[1]["mem"]), (25.7, 1259776 * 1024))
+        self.assertTrue(rows[1]["exe"].endswith("Google Chrome Helper"))
+        self.assertEqual(rows[1]["args"], rows[1]["exe"])  # no args row -> falls back to the path
+        self.assertEqual(rows[2]["args"], "node /x/node_modules/.bin/vite --port 5173")
+
+    def test_parse_therm(self):
+        self.assertEqual(mg.parse_therm("Note: No thermal warning level has been recorded\n"
+                                        "Note: No performance warning level has been recorded\n")["state"], "nominal")
+        self.assertEqual(mg.parse_therm(PERF_RUN["pmset -g therm"])["state"], "throttled")
+        self.assertEqual(mg.parse_therm(PERF_RUN["pmset -g therm"])["speed_limit"], 70)
+        self.assertEqual(mg.parse_therm("CPU_Speed_Limit = 100\nThermal warning level set to 2.\n")["state"], "warning")
+
+    def test_system_load(self):
+        with mock.patch.object(mg, "run", fake_run(PERF_RUN)):
+            s = mg.system_load()
+        self.assertEqual(s["load"], [12.5, 8.0, 6.0])
+        self.assertEqual((s["pressure"], s["mem_free_pct"], s["mem_total"]), ("warning", 12, 16 * GB))
+        self.assertEqual((s["swap_used"], s["swap_total"]), (6 * GB, 8 * GB))
+        self.assertEqual(s["thermal"]["state"], "throttled")
+        self.assertTrue(s["low_power"] and s["on_battery"])
+
+    def test_groups_known_dev_daemons(self):
+        items = self.items()
+        self.assertEqual(self.pids(items["docker"]), [100, 101, 102])  # the Linux VM counts as Docker's
+        self.assertEqual(self.pids(items["ollama"]), [200])
+        self.assertEqual(self.pids(items["gradle"]), [300])
+        self.assertEqual(self.pids(items["kotlin"]), [310])
+        self.assertEqual(self.pids(items["simulators"]), [400, 401])
+        self.assertEqual(self.pids(items["unity"]), [500])
+        self.assertEqual(self.pids(items["android-emulator"]), [510])
+        self.assertEqual(self.pids(items["spotlight"]), [930])
+        self.assertEqual(self.pids(items["render"]), [600, 601, 720])  # the MCP server (650) is not a render
+        self.assertEqual(self.pids(items["leftover-renders"]), [700, 701, 710])
+        self.assertEqual(self.pids(items["node-dev"]), [800, 801])  # esbuild joins the vite server that started it
+        self.assertEqual(self.pids(items["orphans"]), [900, 901])  # 910 is a launchd job, not an orphan
+        self.assertEqual(items["docker"]["mem"], 500 * 2 ** 20 + 2 * GB)
+
+    def test_safe_or_review(self):
+        items = self.items()
+        risk = {k: v["risk"] for k, v in items.items()}
+        self.assertEqual(risk, {"docker": "safe", "ollama": "safe", "gradle": "safe", "kotlin": "review", "simulators": "safe",
+                                "unity": "review", "android-emulator": "review", "spotlight": "system", "render": "review",
+                                "leftover-renders": "safe", "node-dev": "review", "orphans": "review"})
+        self.assertIn("idle", items["docker"]["why"])
+        self.assertIn("iPhone 17 Pro", items["simulators"]["why"])
+        self.assertTrue(items["leftover-renders"]["orphan"])
+        self.assertFalse(items["docker"]["orphan"])
+        busy = self.items({"docker ps -q": "abc\ndef\n", "ollama ps": "NAME ID SIZE\nllama3:8b 1 5GB\n"})
+        self.assertEqual((busy["docker"]["risk"], busy["ollama"]["risk"]), ("review", "review"))
+        self.assertIn("2 container", busy["docker"]["why"])
+        self.assertIn("llama3:8b", busy["ollama"]["why"])
+        unknown = self.items(which=())  # no docker/ollama CLI: can't tell if idle -> review
+        self.assertEqual((unknown["docker"]["risk"], unknown["ollama"]["risk"]), ("review", "review"))
+
+    def test_spotlight_only_while_busy(self):
+        table = [P(930, "/System/Library/Metadata.framework/Support/mds_stores", uid=0, cpu=1)]
+        with mock.patch.object(mg, "run", fake_run(PERF_RUN)):
+            self.assertEqual(mg.dev_items(table, {}), [])
+
+    def test_stop_steps_and_restart_hints(self):
+        items = self.items(which=("docker", "ollama", "gradle"))
+        self.assertEqual(items["docker"]["stop"], [("quit", "Docker")])
+        self.assertEqual(items["docker"]["start"], "open -a Docker")
+        self.assertEqual(items["ollama"]["stop"], [("cmd", ["launchctl", "bootout", f"gui/{os.getuid()}/homebrew.mxcl.ollama"])])
+        self.assertEqual(items["ollama"]["start"], "brew services start ollama")
+        self.assertEqual(items["gradle"]["stop"], [("cmd", ["gradle", "--stop"]), ("term", [300])])
+        self.assertEqual(items["simulators"]["stop"], [("cmd", ["xcrun", "simctl", "shutdown", "all"])])
+        self.assertEqual(items["spotlight"]["stop"], [])
+        for it in items.values():
+            self.assertTrue(it["start"] or it["risk"] == "system", it["id"])
+
+    def test_never_targets_system_root_or_session(self):
+        items = self.items()
+        targets = {pid for it in items.values() for pid in self.targets(it)}
+        for pid in (1, os.getpid(), os.getppid(), 102, 401, 720, 930):
+            self.assertNotIn(pid, targets)
+        self.assertEqual(self.targets(items["leftover-renders"]), [700, 701, 710])
+        self.assertEqual(self.targets(items["render"]), [600, 601])
+        steps = [what for it in items.values() for kind, what in it["stop"] if kind == "cmd"]
+        self.assertFalse(any("sudo" in cmd for cmd in steps))
+
+    def test_findings(self):
+        state = dict(cores=10, load=[12.5, 8, 6], pressure="critical", mem_free_pct=4, mem_total=16 * GB, swap_used=6 * GB,
+                     swap_total=8 * GB, thermal=dict(state="throttled", speed_limit=70, detail="CPU speed limited to 70%"),
+                     low_power=True, on_battery=True)
+        items = list(self.items().values())
+        disk = dict(free=100 * GB, total=1000 * GB)
+        titles = {t: s for s, t, _ in mg.perf_findings(state, items, disk)}
+        self.assertEqual(titles["The Mac is hot and throttling the CPU"], "high")
+        self.assertEqual(titles["Memory pressure is critical"], "high")
+        self.assertEqual(titles["Heavy swap use"], "medium")
+        self.assertEqual(titles["CPU is saturated"], "medium")
+        self.assertEqual(titles["Leftover render helpers still running"], "medium")
+        self.assertEqual(titles["Orphaned processes (their parent has exited)"], "low")
+        self.assertEqual(titles["Spotlight is indexing"], "info")
+        self.assertEqual(titles["Low Power Mode is on"], "low")
+        self.assertEqual(titles[f"Stopping Docker Desktop frees {mg.human(500 * 2 ** 20 + 2 * GB)}"], "low")
+        self.assertNotIn("Running on battery", titles)  # only in --before heavy
+        calm = dict(state, load=[1, 1, 1], pressure="normal", swap_used=0, low_power=False,
+                    thermal=dict(state="nominal", speed_limit=None, detail=""))
+        self.assertEqual(mg.perf_findings(calm, [], disk), [])
+
+    def test_before_heavy(self):
+        state = dict(cores=10, load=[1, 1, 1], pressure="normal", mem_free_pct=50, mem_total=16 * GB, swap_used=0, swap_total=0,
+                     thermal=dict(state="nominal", speed_limit=None, detail=""), low_power=True, on_battery=True)
+        f = {t: s for s, t, _ in mg.perf_findings(state, [], dict(free=20 * GB, total=500 * GB), before="heavy")}
+        self.assertEqual(f["Not much free space for a big build"], "medium")
+        self.assertEqual(f["Low Power Mode is on"], "medium")
+        self.assertEqual(f["Running on battery"], "low")
+        f = {t: s for s, t, _ in mg.perf_findings(state, [], dict(free=10 * GB, total=500 * GB), before="heavy")}
+        self.assertEqual(f["Not much free space for a big build"], "high")
+        f = {t for _, t, _ in mg.perf_findings(state, [], dict(free=200 * GB, total=500 * GB), before="heavy")}
+        self.assertNotIn("Not much free space for a big build", f)
+
+    def test_heavy_suggestions(self):
+        items = self.items()
+        with mock.patch.object(mg, "session_pids", return_value={1, 960}):
+            owners = mg.top_owners(self.table() + [P(960, "/Applications/Claude.app/Contents/MacOS/Claude", mem=4 * GB)],
+                                   list(items.values()))
+        s = "\n".join(mg.heavy_suggestions(list(items.values()), owners))
+        self.assertIn("Stop Docker Desktop", s)
+        self.assertIn("Close Android emulator", s)
+        self.assertIn("Quit Google Chrome", s)
+        self.assertNotIn("Unity", s)  # the build you are about to run
+        self.assertNotIn("Claude", s)  # runs this session
+        self.assertIn("Spotlight", s)
+
+    def test_top_owners(self):
+        owners = {o["name"]: o for o in mg.top_owners(self.table(), list(self.items().values()))}
+        self.assertEqual(owners["Spotlight indexing"]["kind"], "system")
+        self.assertEqual(owners["Google Chrome"]["kind"], "app")
+        self.assertEqual(owners["Video renders (Remotion, headless Chrome, ffmpeg)"]["cpu"], 125)
+        self.assertEqual(owners["Leftover render helpers (parent gone)"]["count"], 3)
+
+    def test_plan(self):
+        items = list(self.items().values())
+        self.assertEqual(sorted(it["id"] for it in mg.perf_plan(items)),
+                         ["docker", "gradle", "leftover-renders", "ollama", "simulators"])
+        self.assertEqual([it["id"] for it in mg.perf_plan(items, {"unity", "spotlight", "nope"})], ["unity"])
+
+    def test_apply_runs_steps_logs_and_never_sudo(self):
+        calls = []
+        plan = mg.perf_plan(list(self.items(which=("docker", "ollama", "gradle")).values()))
+        with mock.patch.object(mg, "run", side_effect=lambda cmd, timeout=60: calls.append(cmd) or (0, "", "")), \
+                mock.patch.object(mg, "stop_pids", return_value=3) as sp:
+            res = {r["id"]: r for r in mg.apply_perf(plan)}
+        self.assertIn(["osascript", "-e", 'quit app "Docker"'], calls)
+        self.assertIn(["xcrun", "simctl", "shutdown", "all"], calls)
+        self.assertIn(["gradle", "--stop"], calls)
+        self.assertFalse(any("sudo" in c for c in calls))
+        self.assertEqual(sorted(c.args[0] for c in sp.call_args_list), [[300], [700, 701, 710]])
+        self.assertTrue(all(r["ok"] for r in res.values()))
+        self.assertEqual(res["docker"]["start"], "open -a Docker")
+        self.assertIn("ended 3 process(es)", res["leftover-renders"]["detail"])
+        self.assertIn("[perf] stopped docker", mg.read_text(mg.EVENTS_LOG))
+
+    def test_stop_pids_rechecks_before_signalling(self):
+        before = [P(700, CHS), P(701, CHS, ppid=700), P(702, CHS), P(720, "/opt/homebrew/bin/ffmpeg", uid=0)]
+        now = [P(700, "/Users/me/other-program"),  # pid reused since the snapshot
+               P(701, CHS, ppid=700), P(702, CHS), P(720, "/opt/homebrew/bin/ffmpeg", uid=0)]
+        alive, sent = {701, 702}, []
+
+        def fake_kill(pid, sig):
+            if sig == 0:
+                if pid not in alive:
+                    raise ProcessLookupError
+                return
+            sent.append((pid, sig))
+            if sig == 9 or pid == 701:  # 702 ignores TERM
+                alive.discard(pid)
+        with mock.patch.object(mg, "perf_table", return_value=now), mock.patch.object(mg.os, "kill", fake_kill):
+            n = mg.stop_pids([700, 701, 702, 720], before, grace=0.3)
+        self.assertEqual(n, 2)
+        self.assertNotIn(700, {p for p, _ in sent})
+        self.assertNotIn(720, {p for p, _ in sent})
+        self.assertIn((702, 9), sent)
+        self.assertNotIn((701, 9), sent)
+
+    def report(self):
+        items = list(self.items().values())
+        state = dict(cores=10, load=[1, 1, 1], pressure="normal", mem_free_pct=50, mem_total=16 * GB, swap_used=0, swap_total=0,
+                     thermal=dict(state="nominal", speed_limit=None, detail=""), low_power=False, on_battery=False)
+        return dict(state=state, items=items, owners=mg.top_owners(self.table(), items), disk=dict(free=100 * GB, total=500 * GB),
+                    before=None, findings=[("medium", "Leftover render helpers still running", "x")], suggestions=[])
+
+    def test_cmd_perf_dry_run_and_confirm(self):
+        args = argparse.Namespace(before=None, apply=False, only=None, yes=False)
+        with mock.patch.object(mg, "perf_report", return_value=self.report()), mock.patch.object(mg, "apply_perf") as ap:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_perf(args)
+            self.assertIn("macguard perf --apply", out.getvalue())
+            self.assertIn("review items need --only", out.getvalue())
+            with mock.patch("builtins.input", return_value="no"):
+                quiet(mg.cmd_perf, argparse.Namespace(before=None, apply=True, only=None, yes=False))
+            ap.assert_not_called()
+            ap.return_value = [dict(id="docker", name="Docker Desktop", ok=True, detail="asked Docker to quit", start="open -a Docker")]
+            out = io.StringIO()
+            with mock.patch("builtins.input", return_value="yes"), redirect_stdout(out):
+                mg.cmd_perf(argparse.Namespace(before=None, apply=True, only="docker,unity", yes=False))
+        self.assertEqual([it["id"] for it in ap.call_args.args[0]], ["docker", "unity"])
+        self.assertIn("start again: open -a Docker", out.getvalue())
+
+
 # ---------------------------------------------------------------- traffic
 
 def SOCK(pid, proc, rhost, rport, rx, tx, state="ESTABLISHED", lport=50000):
@@ -1359,6 +1643,24 @@ class TestWebUI(TempHome):
         self.assertTrue(net["listeners"][0]["exposed"])
         self.assertEqual(net["findings"][0]["sev"], "high")
 
+    def test_perf_endpoints(self):
+        def it(i, risk):
+            return dict(id=i, name=i.title(), risk=risk, why="w", cpu=1.0, mem=1, count=1, orphan=False, procs=[],
+                        stop=[] if risk == "system" else [("term", [1])], stop_text="s", start="st")
+        rep = dict(state=dict(load=[1, 1, 1]), disk={"free": 1}, owners=[], findings=[("low", "x", "y")], suggestions=[],
+                   items=[it("docker", "safe"), it("unity", "review"), it("spotlight", "system")])
+        with mock.patch.object(mg, "perf_report", side_effect=lambda before=None: dict(rep, before=before)), \
+                mock.patch.object(mg, "apply_perf", side_effect=lambda plan: [dict(id=x["id"]) for x in plan]):
+            r = json.loads(self.req("/api/perf?before=heavy")[1])
+            self.assertEqual((r["before"], r["findings"][0]["sev"]), ("heavy", "low"))
+            self.assertNotIn("procs", r["items"][0])  # the page never sees pids or commands
+            self.assertNotIn("stop", r["items"][0])
+            self.assertIsNone(json.loads(self.req("/api/perf")[1])["before"])
+            stop = lambda ids: json.loads(self.req("/api/perf/stop", body={"ids": ids})[1])["stopped"]  # noqa: E731
+            self.assertEqual(stop(["unity", "spotlight", "../x"]), [{"id": "unity"}])  # system items never stop
+            self.assertEqual(stop([]), [])  # no ids means nothing, not "the safe ones"
+            self.assertEqual(self.req("/api/perf/stop", body={"ids": ["docker"]}, token=None)[0], 403)
+
 
 # ---------------------------------------------------------------- doctor / report
 
@@ -1429,11 +1731,19 @@ class LiveSystem(unittest.TestCase):
                     p.kill()
             eng.stdout.close()
 
+    def test_perf_report_read_only(self):
+        r = mg.perf_report("heavy")
+        self.assertGreater(r["state"]["cores"], 0)
+        self.assertIn(r["state"]["thermal"]["state"], ("nominal", "warning", "throttled"))
+        self.assertIn(r["state"]["pressure"], ("normal", "warning", "critical", "unknown"))
+        self.assertTrue(r["owners"])
+        json.dumps(mg.perf_json(r))
+
     def test_cli_help(self):
         import subprocess
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
         out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
-        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "deepscan", "watch", "report", "settings", "ui", "doctor"):
+        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "perf", "deepscan", "watch", "report", "settings", "ui", "doctor"):
             self.assertIn(cmd, out)
 
 

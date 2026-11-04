@@ -214,7 +214,17 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 footer{text-align:center;color:var(--fg-3);font-size:12.5px;margin-top:28px}
 footer code{font-family:var(--mono)}
 
-@media (max-width:820px){.stats{grid-template-columns:1fr 1fr}.stat.disk{grid-column:1/-1}.netinfo{grid-template-columns:1fr}}
+/* performance */
+.netinfo.perfinfo{grid-template-columns:repeat(4,1fr)}
+.lvl{font-weight:600;text-transform:capitalize}
+.lvl.normal,.lvl.nominal{color:var(--ok)} .lvl.warning{color:var(--med)} .lvl.critical,.lvl.throttled{color:var(--hi)}
+.chip.system{color:var(--fg-3);background:var(--glass-2)}
+.item.sys{cursor:default}.item.sys:hover{transform:none}
+.item .how{color:var(--fg-3);font:11.5px/1.5 var(--mono);margin-top:6px;word-break:break-word}
+.perfbar{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:2px 16px 14px;color:var(--fg-3);font-size:13px}
+.sugg{margin:0;padding:2px 22px 12px 42px;color:var(--fg-2);font-size:13.5px;line-height:1.7}
+
+@media (max-width:820px){.stats{grid-template-columns:1fr 1fr}.stat.disk{grid-column:1/-1}.netinfo{grid-template-columns:1fr}.netinfo.perfinfo{grid-template-columns:1fr 1fr}}
 @media (max-width:520px){.bar .grow{display:none}.stats{grid-template-columns:1fr 1fr}.items{grid-template-columns:1fr}.hero{padding-top:48px}}
 </style></head>
 <body>
@@ -293,6 +303,13 @@ footer code{font-family:var(--mono)}
   </section>
 
   <section class="panel glass">
+    <div class="ph"><span class="ic">⚡</span><div class="grow"><h2>Performance</h2><small>What's using CPU, memory and heat · free resources before a big build</small></div>
+      <button class="btn ghost sm" id="perfHeavyBtn" title="Also checks free space and what to close before a Unity, Xcode or Android build">Before a build</button>
+      <button class="btn ghost sm" id="perfBtn">Check</button></div>
+    <div id="perf" class="empty">Not checked yet.</div>
+  </section>
+
+  <section class="panel glass">
     <div class="ph watch"><span class="ic">👁️</span><div class="grow"><h2>Background watcher</h2><small id="wTxt">Off unless you turn it on.</small></div>
       <label class="switch" aria-label="Background watcher"><input type="checkbox" id="wToggle"><span></span></label></div>
   </section>
@@ -357,7 +374,7 @@ function showDisk(d){
   $("ringTxt").textContent = Math.round(freePct) + "%";
 }
 
-let items = [], picked = new Set(), open = null, issues = {sec:null, net:null, apps:null, traffic:null};
+let items = [], picked = new Set(), open = null, issues = {sec:null, net:null, apps:null, traffic:null, perf:null};
 function countIssues(){
   const v = Object.values(issues);
   $("sIssues").textContent = v.every(x => x===null) ? "—" : v.reduce((a,b)=>a+(b??0),0);
@@ -571,9 +588,70 @@ async function deepScan(){
 }
 $("deepBtn").onclick = deepScan;
 
+let perf = null, perfPick = new Set();
+async function checkPerf(before){
+  const btn = before ? $("perfHeavyBtn") : $("perfBtn"); busy(btn, true);
+  $("perf").className="empty"; $("perf").innerHTML='<span class="spin"></span>&nbsp; Reading processes, memory and thermal state…';
+  try { perf = await api("/api/perf" + (before ? "?before=heavy" : "")); $("perf").className="";
+        perfPick = new Set(perf.items.filter(i=>i.risk==="safe").map(i=>i.id)); renderPerf();
+        issues.perf = serious(perf.findings); countIssues(); }
+  catch(e){ $("perf").textContent = "Failed: " + e.message; }
+  busy(btn, false, before ? "Before a build" : "Recheck");
+}
+function renderPerf(){
+  const s = perf.state, t = s.thermal;
+  let h = `<div class="netinfo perfinfo">
+      <div><span class="k">CPU load</span>${s.load[0].toFixed(1)} <span style="opacity:.6">on ${s.cores} cores</span></div>
+      <div><span class="k">Memory pressure</span><span class="lvl ${esc(s.pressure)}">${esc(s.pressure)}</span>${s.mem_free_pct!=null?` · ${s.mem_free_pct}% free`:""}</div>
+      <div><span class="k">Swap</span>${human(s.swap_used)} <span style="opacity:.6">of ${human(s.swap_total)}</span></div>
+      <div><span class="k">Thermal</span><span class="lvl ${esc(t.state)}">${esc(t.state)}</span>${s.low_power?" · Low Power Mode":""}</div></div>`;
+  h += renderFindings(perf.findings);
+  if (perf.items.length){
+    h += `<div class="dgroup"><h3>Dev daemons and background jobs</h3></div><div class="items" id="perfItems">` + perf.items.map((it,i) => {
+      const sys = it.risk === "system", on = perfPick.has(it.id);
+      return `<label class="item ${sys?"sys":""} ${on?"on":""}" data-p="${i}" title="${esc(it.id)}">
+        <div class="top"><span class="size">${it.cpu.toFixed(0)}%</span>${sys?"":'<span class="chk"></span>'}</div>
+        <div class="name">${esc(it.name)}</div><div class="note">${esc(it.why)}</div>
+        <div class="how">${sys ? esc(it.stop_text) : `stop: ${esc(it.stop_text)}<br>start again: ${esc(it.start)}`}</div>
+        <div class="foot"><span class="chip ${esc(it.risk)}">${esc(it.risk)}</span><span>${human(it.mem)} · ${it.count} proc${it.count===1?"":"s"}${it.orphan?" · orphan":""}</span></div>
+      </label>`; }).join("") + `</div>
+      <div class="perfbar"><span id="perfSel"></span><button class="btn danger sm" id="perfStop">Stop selected</button></div>`;
+  }
+  if (perf.before) h += `<div class="dgroup"><h3>Before a heavy build · ${human(perf.disk.free)} free</h3></div><ul class="sugg">` +
+    (perf.suggestions.length ? perf.suggestions.map(x => `<li>${esc(x)}</li>`).join("") : "<li>Nothing to close — good to go.</li>") + `</ul>`;
+  const maxc = Math.max(1, ...perf.owners.map(o => o.cpu)), maxm = Math.max(1, ...perf.owners.map(o => o.mem));
+  h += `<div class="dgroup"><h3>Heaviest by app</h3></div><div class="legend"><span><i style="background:linear-gradient(90deg,#3fa9ff,#2ee6c5)"></i>CPU (% of one core)</span>
+      <span><i style="background:linear-gradient(90deg,#7c5cff,#ff4d9d)"></i>Memory</span></div><div class="top">` +
+    perf.owners.map(o => `<div class="tr"><div class="n">${esc(o.name)}<small>${o.kind} · ${o.count} process${o.count===1?"":"es"}</small></div>
+      <div class="bars"><i class="d" style="width:${(o.cpu/maxc*100).toFixed(1)}%"></i><i class="u" style="width:${(o.mem/maxm*100).toFixed(1)}%"></i></div>
+      <div class="v">${o.cpu.toFixed(1)}%</div><div class="v">${human(o.mem)}</div></div>`).join("") + `</div>`;
+  $("perf").innerHTML = h;
+  $("perf").querySelectorAll("#perfItems .item").forEach(el => el.onclick = ev => {
+    ev.preventDefault(); const it = perf.items[+el.dataset.p]; if (it.risk === "system") return;
+    perfPick.has(it.id) ? perfPick.delete(it.id) : perfPick.add(it.id); renderPerf();
+  });
+  if ($("perfStop")){
+    const sel = perf.items.filter(i => perfPick.has(i.id));
+    $("perfSel").textContent = `${sel.length} selected` + (sel.some(i => i.risk==="review") ? " · incl. review items" : "");
+    $("perfStop").disabled = !sel.length; $("perfStop").onclick = stopPerf;
+  }
+}
+async function stopPerf(){
+  const sel = perf.items.filter(i => perfPick.has(i.id));
+  if (!confirm(`Stop ${sel.length} item(s)?\nUnsaved work in them is lost. Nothing from macOS is touched.\n\n` +
+               sel.map(i => `• ${i.name}: ${i.stop_text}\n   start again: ${i.start}`).join("\n"))) return;
+  busy($("perfStop"), true);
+  try {
+    const r = await api("/api/perf/stop", {ids: sel.map(i => i.id)});
+    alert("Stopped\n\n" + r.stopped.map(x => `• ${x.name}${x.ok ? "" : " (partly)"}: ${x.detail}\n   start again: ${x.start}`).join("\n"));
+  } catch(e){ toast("Stop failed: " + e.message); }
+  checkPerf(perf.before === "heavy");
+}
+$("perfBtn").onclick = () => checkPerf(false); $("perfHeavyBtn").onclick = () => checkPerf(true);
+
 $("secBtn").onclick = checkSec; $("netBtn").onclick = checkNet;
 $("appsBtn").onclick = checkApps; $("trafficBtn").onclick = checkTraffic;
-$("checkAll").onclick = () => { checkSec(); checkNet(); checkApps(); checkTraffic(); };
+$("checkAll").onclick = () => { checkSec(); checkNet(); checkApps(); checkTraffic(); checkPerf(false); };
 
 async function loadSettings(){
   const s = await api("/api/settings"); $("wToggle").checked = s.background_watcher;
