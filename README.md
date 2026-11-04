@@ -8,6 +8,8 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
 - **Apps and traffic**: flags installed apps with broken or missing signatures, outdated, end-of-life or remote-access apps and orphaned root helpers, and samples live traffic per process to spot heavy uploads, scanning or odd destinations.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
+- **Heavy processes**: lists what is eating CPU or memory and says which are safe to stop. macOS, root-owned and the session's own processes are never killed.
+- **MCP server**: exposes all of it to AI clients such as Claude (`macguard mcp`).
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
 - **Three front ends**: a native **Mac Cleanup.app**, a local **web UI** with a glass design, and the **`macguard` CLI**.
 
@@ -46,16 +48,39 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard net` | Network snapshot and threat findings. |
 | `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
 | `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
+| `macguard procs [--cpu 30] [--mem-mb 1024]` | Heavy processes, classed **system** (never killed), **app** (quit the app instead) or **background** (safe for macOS to stop). |
+| `macguard procs --kill <pid> [--force]` | Stop one non-system process after you type `yes` (SIGTERM, or SIGKILL with `--force`). |
+| `macguard mcp` | MCP server on stdio for AI clients. See below. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
 | `macguard report` | Static HTML report in `~/.macguard/report.html`. |
 | `macguard settings [key value]` | `background_watcher on/off` (off by default), `watch_interval <sec>`. |
 | `macguard doctor [--bundle]` | Check prerequisites and optionally write a support file. |
 
+## MCP server
+
+`macguard mcp` (or `macguard_mcp.py`) is a Model Context Protocol server on stdio, so Claude and other MCP clients can run the checks for you. Add it to Claude Code:
+
+```bash
+claude mcp add mac-cleanup -- /usr/bin/python3 /path/to/mac-cleanup/macguard.py mcp
+```
+
+| Tool | What it does |
+|---|---|
+| `disk_info`, `scan_junk` | Free space and junk by category. Read-only. |
+| `plan_cleanup` | Dry run: the exact paths that would go, plus a `plan_id`. Safe categories by default, review ones only by id. |
+| `apply_cleanup` | Deletes only the paths in that plan, needs `confirm: true`, and each plan works once (15 min). |
+| `process_check` | Heavy CPU/memory processes with `kind` and `killable`. Read-only. |
+| `kill_process` | Stops one non-system process. Needs the `exe` path from `process_check` (guards against pid reuse) and `confirm: true`. |
+| `security_audit`, `network_snapshot`, `apps_audit`, `traffic_sample` | The same audits as the CLI. Read-only. |
+| `doctor`, `recent_events` | Prerequisites, and the event log with settings. |
+
+`apply_cleanup` and `kill_process` are marked destructive, so clients ask before running them. The server is standard-library Python like the rest.
+
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 75 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 91 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

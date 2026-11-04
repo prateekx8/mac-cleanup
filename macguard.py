@@ -8,10 +8,12 @@ Commands:
   security             Security posture audit (firewall, SIP, launch agents, ...)
   apps                 Installed apps: broken/missing signatures, outdated, risky, EOL
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
+  procs                Heavy CPU/memory processes, which are safe to stop; --kill PID
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
   ui                   Small local web UI: scan, pick categories, clean, run checks
   doctor               Check prerequisites; --bundle writes a support file
+  mcp                  MCP server on stdio, so AI clients (Claude, ...) can use the tools
   settings             Show/change settings; `settings background_watcher on` runs
                        `watch` in the background at login (off by default)
 
@@ -29,6 +31,7 @@ import os
 import plistlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -49,7 +52,8 @@ if not sys.stdout.isatty():
 
 def run(cmd, timeout=60):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=isinstance(cmd, str))
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, shell=isinstance(cmd, str),
+                           stdin=subprocess.DEVNULL)  # never read our stdin (it is the MCP pipe under `macguard mcp`)
         return p.returncode, p.stdout, p.stderr
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return 1, "", str(e)
@@ -195,7 +199,7 @@ def old_versions(pattern, group_re):
     """For dirs like IntelliJIdea2025.3 / IntelliJIdea2026.2, return all but the newest per product."""
     groups = {}
     for p in glob.glob(pattern):
-        m = re.match(group_re, os.path.basename(p))
+        m = re.fullmatch(group_re, os.path.basename(p))  # full match: "IntelliJIdea2026.2-backup" is not a version
         if m and os.path.isdir(p):
             groups.setdefault(m.group(1), []).append(p)
     old = []
@@ -722,7 +726,8 @@ def brew_outdated():
         return [], []
     env = dict(os.environ, HOMEBREW_NO_AUTO_UPDATE="1", HOMEBREW_NO_ANALYTICS="1")
     try:
-        p = subprocess.run(["brew", "outdated", "--json=v2"], capture_output=True, text=True, timeout=90, env=env)
+        p = subprocess.run(["brew", "outdated", "--json=v2"], capture_output=True, text=True, timeout=90, env=env,
+                           stdin=subprocess.DEVNULL)
         d = json.loads(p.stdout or "{}")
     except (subprocess.TimeoutExpired, ValueError, OSError):
         return [], []
@@ -918,6 +923,133 @@ def cmd_traffic(args):
         print(f"  {p['proc'][:26]:<26} {human(p['rx_rate']):>9} {human(p['tx_rate']):>9}  {len(p['hosts'])}")
     print(f"\n{C['B']}Findings{C['x']}")
     print_findings(analyze_traffic(procs, args.seconds))
+
+
+# ---------------------------------------------------------------- processes
+
+SYSTEM_DIRS = ("/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/", "/private/var/db/", "/Library/Developer/CoreSimulator/")
+HEAVY_CPU, HEAVY_MEM = 30.0, 1 << 30  # % of one core, bytes resident
+
+
+def process_table():
+    """Every process: pid, ppid, uid, cpu (% of one core), mem (bytes resident), elapsed, exe."""
+    _, out, _ = run(["ps", "-axo", "pid=,ppid=,uid=,pcpu=,rss=,etime=,comm="])
+    procs = []
+    for line in out.splitlines():
+        f = line.split(None, 6)
+        if len(f) < 7:
+            continue
+        try:
+            procs.append(dict(pid=int(f[0]), ppid=int(f[1]), uid=int(f[2]), cpu=float(f[3]), mem=int(f[4]) * 1024,
+                              elapsed=f[5], exe=f[6].strip()))
+        except ValueError:
+            continue
+    return procs
+
+
+def ancestors(procs, pid=None):
+    """This process and everything above it (the shell, terminal, AI client) - never offered for killing."""
+    parent = {p["pid"]: p["ppid"] for p in procs}
+    chain, pid = set(), pid or os.getpid()
+    while pid and pid not in chain:
+        chain.add(pid)
+        pid = parent.get(pid)
+    return chain
+
+
+def app_bundle(exe):
+    """Outermost .app the executable lives in ('Google Chrome' for its helpers), or ''."""
+    m = re.search(r"/([^/]+)\.app/Contents/", exe)
+    return m.group(1) if m else ""
+
+
+def classify_process(p, protected_pids=(), me=None):
+    """(kind, advice). kind: system (never kill) | app (quit it from the app) | background (safe for macOS to stop)."""
+    me = os.getuid() if me is None else me
+    exe = p["exe"]
+    if p["pid"] <= 1 or p["pid"] in protected_pids:
+        return "system", "runs this tool or the session above it"
+    if p["uid"] != me:
+        return "system", "owned by root or a system account"
+    if exe.startswith(SYSTEM_DIRS) or not exe.startswith("/"):
+        return "system", "part of macOS"
+    app = app_bundle(exe)
+    if app:
+        return "app", f"part of {app}: quit {app} normally to keep unsaved work"
+    return "background", "your own program; stopping it does not affect macOS"
+
+
+def heavy_processes(cpu=HEAVY_CPU, mem=HEAVY_MEM, include_system=True):
+    """Processes over the CPU or memory threshold, heaviest first, each with kind/advice/killable."""
+    procs = process_table()
+    protected = ancestors(procs)
+    out = []
+    for p in procs:
+        if p["cpu"] < cpu and p["mem"] < mem:
+            continue
+        kind, advice = classify_process(p, protected)
+        if kind == "system" and not include_system:
+            continue
+        out.append({**p, "name": app_bundle(p["exe"]) or os.path.basename(p["exe"]), "kind": kind,
+                    "advice": advice, "killable": kind != "system"})
+    return sorted(out, key=lambda p: (-p["cpu"], -p["mem"]))
+
+
+def kill_process(pid, expected_exe, force=False, wait=3.0):
+    """Stop one non-system process. expected_exe guards against the pid being reused since it was listed."""
+    procs = process_table()
+    p = next((x for x in procs if x["pid"] == pid), None)
+    if not p:
+        return {"ok": True, "pid": pid, "detail": "already gone"}
+    if p["exe"] != expected_exe:
+        return {"ok": False, "pid": pid, "detail": f"pid {pid} is now {p['exe']}, not {expected_exe} - list again"}
+    kind, advice = classify_process(p, ancestors(procs))
+    if kind == "system":
+        return {"ok": False, "pid": pid, "detail": f"refused: {advice}"}
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return {"ok": True, "pid": pid, "detail": "already gone"}
+    except PermissionError:
+        return {"ok": False, "pid": pid, "detail": "permission denied"}
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            log_event("kill", f"{sig.name} {pid} {expected_exe}")
+            return {"ok": True, "pid": pid, "detail": f"stopped with {sig.name}"}
+        time.sleep(0.1)
+    log_event("kill", f"{sig.name} {pid} {expected_exe} (still running)")
+    return {"ok": False, "pid": pid, "detail": f"sent {sig.name} but it is still running" + ("" if force else "; try force")}
+
+
+def cmd_procs(args):
+    heavy = heavy_processes(args.cpu, args.mem_mb << 20)
+    if args.kill:
+        p = next((x for x in heavy_processes(0, 0) if x["pid"] == args.kill), None)
+        if not p:
+            print(f"No process {args.kill}.")
+            return
+        if not p["killable"]:
+            print(f"{C['r']}Refused{C['x']}: {p['name']} (pid {p['pid']}) - {p['advice']}")
+            return
+        print(f"{p['name']} (pid {p['pid']}) {p['exe']}\n  {p['advice']}")
+        if not args.yes and input(f"{'Force-kill' if args.force else 'Stop'} it? Type 'yes': ").strip() != "yes":
+            print("Aborted.")
+            return
+        ensure_state()
+        print(kill_process(p["pid"], p["exe"], args.force)["detail"])
+        return
+    col = {"system": C["d"], "app": C["y"], "background": C["g"]}
+    print(f"{C['B']}Heavy processes{C['x']} {C['d']}(>= {args.cpu:g}% CPU or >= {args.mem_mb} MB){C['x']}")
+    if not heavy:
+        print(f"  {C['g']}Nothing heavy right now.{C['x']}")
+    for p in heavy:
+        print(f"  {p['pid']:>6} {p['cpu']:>6.1f}% {human(p['mem']):>7}  {col[p['kind']]}{p['kind']:<10}{C['x']} {p['name'][:40]}"
+              f"\n         {C['d']}{p['advice']}{C['x']}")
+    print(f"\n{C['d']}system = never killed by macguard. Stop one: macguard procs --kill <pid> [--force]{C['x']}")
 
 
 # ---------------------------------------------------------------- watch mode
@@ -1281,6 +1413,12 @@ def cmd_ui(args):
         pass
 
 
+def cmd_mcp(args):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import macguard_mcp
+    macguard_mcp.serve()
+
+
 # ---------------------------------------------------------------- HTML report
 
 def cmd_report(args):
@@ -1387,6 +1525,10 @@ def main():
     p = sub.add_parser("apps"); p.add_argument("--online", action="store_true", help="also check Apple for macOS updates")
     p.add_argument("--list", action="store_true", help="print every app"); p.set_defaults(fn=cmd_apps)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
+    p = sub.add_parser("procs"); p.add_argument("--cpu", type=float, default=HEAVY_CPU, help="CPU %% threshold")
+    p.add_argument("--mem-mb", type=int, default=HEAVY_MEM >> 20, help="memory threshold in MB")
+    p.add_argument("--kill", type=int, metavar="PID"); p.add_argument("--force", action="store_true")
+    p.add_argument("--yes", action="store_true"); p.set_defaults(fn=cmd_procs)
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=30); p.add_argument("--once", action="store_true")
     p.add_argument("--reset", action="store_true", help="re-learn the baseline")
     p.add_argument("--agent", action="store_true", help=argparse.SUPPRESS); p.set_defaults(fn=cmd_watch)
@@ -1398,6 +1540,7 @@ def main():
     p = sub.add_parser("ui"); p.add_argument("--port", type=int, default=8787); p.add_argument("--no-open", action="store_true")
     p.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_ui)
+    sub.add_parser("mcp", help="MCP server on stdio for AI clients").set_defaults(fn=cmd_mcp)
     args = ap.parse_args()
     args.fn(args)
 

@@ -103,6 +103,13 @@ class TestCleanup(TempHome):
         old = mg.old_versions(os.path.join(self.home, "jb", "*"), r"([A-Za-z]+)\d{4}\.\d+")
         self.assertEqual([os.path.basename(p) for p in old], ["IntelliJIdea2025.3"])
 
+    def test_old_versions_ignores_backup_folders(self):
+        # a "-backup" copy must not be taken for the newest version (that deleted the live settings)
+        for d in ("IntelliJIdea2026.1", "IntelliJIdea2026.2", "IntelliJIdea2026.2-backup"):
+            os.makedirs(os.path.join(self.home, "jb", d))
+        old = mg.old_versions(os.path.join(self.home, "jb", "*"), r"([A-Za-z]+)\d{4}\.\d+")
+        self.assertEqual([os.path.basename(p) for p in old], ["IntelliJIdea2026.1"])
+
     def test_du_and_resolve_glob(self):
         self.mk("cache/a/f1", 4096)
         self.mk("cache/b/f2", 4096)
@@ -757,6 +764,85 @@ class TestDoctorAndReport(TempHome):
         page = mg.read_text(out)
         self.assertIn("Firewall &lt;off&gt;", page)  # escaped
         self.assertIn("Screen Sharing (VNC) exposed", page)
+
+
+# ---------------------------------------------------------------- processes
+
+def PROC(pid, exe, uid=None, cpu=0.0, mem=0, ppid=1):
+    return dict(pid=pid, ppid=ppid, uid=os.getuid() if uid is None else uid, cpu=cpu, mem=mem, elapsed="01:00", exe=exe)
+
+
+class TestProcesses(TempHome):
+    PS = ("  456     1    88  45.6  58032 19:24:18 /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer\n"
+          " 1025   947   {me}  25.7 1259776 19:23:44 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper "
+          "(Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)\n"
+          " 2000     1   {me}  80.0  2048 01:00 /Users/me/.nvm/versions/node/v22/bin/node\n"
+          " 2001     1   {me}   0.1   1024 01:00 /Users/me/bin/idle\n"
+          "garbage line\n")
+
+    def test_process_table_parses_paths_with_spaces(self):
+        with mock.patch.object(mg, "run", return_value=(0, self.PS.format(me=os.getuid()), "")):
+            procs = mg.process_table()
+        self.assertEqual([p["pid"] for p in procs], [456, 1025, 2000, 2001])
+        self.assertTrue(procs[1]["exe"].endswith("Google Chrome Helper (Renderer)"))
+        self.assertEqual(procs[1]["mem"], 1259776 * 1024)
+
+    def test_classify(self):
+        self.assertEqual(mg.classify_process(PROC(10, "/Users/me/x", uid=0))[0], "system")
+        self.assertEqual(mg.classify_process(PROC(10, "/usr/libexec/sharingd"))[0], "system")
+        self.assertEqual(mg.classify_process(PROC(10, "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"))[0], "system")
+        self.assertEqual(mg.classify_process(PROC(1, "/Users/me/x"))[0], "system")
+        self.assertEqual(mg.classify_process(PROC(10, "/Users/me/x"), protected_pids={10})[0], "system")
+        kind, advice = mg.classify_process(PROC(10, "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/x"))
+        self.assertEqual((kind, "Slack" in advice), ("app", True))
+        self.assertEqual(mg.classify_process(PROC(10, "/opt/homebrew/bin/node"))[0], "background")
+
+    def test_ancestors_protects_the_session(self):
+        procs = [PROC(1, "/sbin/launchd", ppid=0), PROC(50, "/Applications/Claude.app/Contents/MacOS/Claude"),
+                 PROC(60, "/bin/zsh", ppid=50), PROC(os.getpid(), "/usr/bin/python3", ppid=60), PROC(70, "/x", ppid=60)]
+        chain = mg.ancestors(procs)
+        self.assertTrue({1, 50, 60, os.getpid()} <= chain)
+        self.assertNotIn(70, chain)
+
+    def test_heavy_processes_filters_and_sorts(self):
+        with mock.patch.object(mg, "run", return_value=(0, self.PS.format(me=os.getuid()), "")):
+            heavy = mg.heavy_processes(30, 1 << 30)
+            no_sys = mg.heavy_processes(30, 1 << 30, include_system=False)
+        self.assertEqual([p["pid"] for p in heavy], [2000, 456, 1025])  # idle 2001 dropped, cpu order
+        self.assertEqual({p["pid"]: p["kind"] for p in heavy}, {2000: "background", 456: "system", 1025: "app"})
+        self.assertEqual(heavy[2]["name"], "Google Chrome")
+        self.assertFalse(heavy[1]["killable"])
+        self.assertEqual([p["pid"] for p in no_sys], [2000, 1025])
+
+    def test_kill_refuses_system_and_reused_pid(self):
+        table = [PROC(456, "/usr/sbin/coreaudiod", uid=202), PROC(2000, "/Users/me/node")]
+        with mock.patch.object(mg, "process_table", return_value=table), mock.patch.object(mg.os, "kill") as k:
+            self.assertIn("refused", mg.kill_process(456, "/usr/sbin/coreaudiod")["detail"])
+            self.assertIn("list again", mg.kill_process(2000, "/Users/me/other")["detail"])
+            self.assertEqual(mg.kill_process(9999, "/x")["detail"], "already gone")
+            k.assert_not_called()
+
+    @unittest.skipUnless(ON_MAC, "macOS only")
+    def test_kill_real_background_process(self):
+        # a copied /bin/sleep is killed by macOS outside system paths, so build a tiny one
+        if not shutil.which("cc"):
+            self.skipTest("needs Command Line Tools (cc)")
+        exe, src = os.path.join(self.tmp, "mg-sleeper"), os.path.join(self.tmp, "s.c")
+        with open(src, "w") as fh:
+            fh.write("#include <unistd.h>\nint main(int c, char **v) { sleep(60); return 0; }\n")
+        __import__("subprocess").run(["cc", "-o", exe, src], check=True, capture_output=True)
+        # detach via sh so launchd reaps it (a zombie child of ours would still answer kill -0)
+        pid = int(__import__("subprocess").check_output(["/bin/sh", "-c", f"'{exe}' >/dev/null 2>&1 & echo $!"]))
+        self.addCleanup(lambda: __import__("subprocess").run(["kill", "-9", str(pid)], capture_output=True))
+        for _ in range(50):  # wait until ps shows it
+            p = next((x for x in mg.process_table() if x["pid"] == pid), None)
+            if p and p["exe"].endswith("mg-sleeper"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(mg.classify_process(p, mg.ancestors(mg.process_table()))[0], "background")
+        res = mg.kill_process(pid, p["exe"])
+        self.assertTrue(res["ok"], res)
+        self.assertIn("kill", mg.read_text(mg.EVENTS_LOG))
 
 
 # ---------------------------------------------------------------- live, read-only system checks
