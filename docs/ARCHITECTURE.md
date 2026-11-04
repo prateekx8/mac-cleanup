@@ -16,7 +16,7 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 143 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 153 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -96,6 +96,12 @@ flowchart LR
 - Each item is **safe** (idle Docker with no running containers, Ollama with no model loaded, idle Gradle/Kotlin daemons, simulators, leftover renders), **review** (anything busy or holding your work) or **system** (Spotlight: advice only). It carries its stop steps (`quit` an app via AppleScript, a fixed command such as `xcrun simctl shutdown all`, or `term` pids) and a restart hint.
 - `stop_pids()` re-reads the process table and only signals pids that still run the same program, belong to you, live outside macOS paths and aren't macguard or its ancestors. It sends TERM, then KILL after a grace period. Nothing runs with `sudo`.
 - `system_load()` reads `vm.loadavg`, `kern.memorystatus_vm_pressure_level`, `memory_pressure -Q`, `vm.swapusage` and `pmset -g therm/batt`. `--before heavy` adds free-space, power and "what to close" checks.
+
+### Dev focus (`perf --focus` / `--resume`)
+
+- `focus_plan()` groups your own processes inside `.app` bundles by owning app and keeps every app that is a dev tool (`DEV_APPS`), that starts a dev process (`DEV_BINS`/`DEV_PATHS`, for example Terminal → zsh → node), that runs macguard, that is in front (`lsappinfo front`), that is listed in `NEVER_PAUSE` (password managers, VPNs, input tools, call apps) or in the `focus_allow` setting, and Ollama while it has a model loaded. What's left, if it uses at least 0.5% CPU or 256 MB, is paused.
+- `focus_pause()` re-checks each pid like `stop_pids()`, sends SIGSTOP, and appends `{pid, exe, name}` to `~/.macguard/focus.json` with an `until` time. `focus_resume()` sends SIGCONT only to pids that still run the same program, then deletes the file.
+- Auto-resume has three triggers: a detached `macguard focus-timer` process (survives the terminal), `focus_check_expired()` at the start of every command and in each watcher loop, and the UI server's exit (app quit, SIGTERM from `launchctl bootout`, or Ctrl-C) for focus turned on from the UI.
 
 ### Deep scan
 

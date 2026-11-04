@@ -1063,7 +1063,7 @@ class TestPerf(TempHome):
                     before=None, findings=[("medium", "Leftover render helpers still running", "x")], suggestions=[])
 
     def test_cmd_perf_dry_run_and_confirm(self):
-        args = argparse.Namespace(before=None, apply=False, only=None, yes=False)
+        args = argparse.Namespace(focus=False, resume=False, before=None, apply=False, only=None, yes=False)
         with mock.patch.object(mg, "perf_report", return_value=self.report()), mock.patch.object(mg, "apply_perf") as ap:
             out = io.StringIO()
             with redirect_stdout(out):
@@ -1071,14 +1071,192 @@ class TestPerf(TempHome):
             self.assertIn("macguard perf --apply", out.getvalue())
             self.assertIn("review items need --only", out.getvalue())
             with mock.patch("builtins.input", return_value="no"):
-                quiet(mg.cmd_perf, argparse.Namespace(before=None, apply=True, only=None, yes=False))
+                quiet(mg.cmd_perf, argparse.Namespace(focus=False, resume=False, before=None, apply=True, only=None, yes=False))
             ap.assert_not_called()
             ap.return_value = [dict(id="docker", name="Docker Desktop", ok=True, detail="asked Docker to quit", start="open -a Docker")]
             out = io.StringIO()
             with mock.patch("builtins.input", return_value="yes"), redirect_stdout(out):
-                mg.cmd_perf(argparse.Namespace(before=None, apply=True, only="docker,unity", yes=False))
+                mg.cmd_perf(argparse.Namespace(focus=False, resume=False, before=None, apply=True, only="docker,unity", yes=False))
         self.assertEqual([it["id"] for it in ap.call_args.args[0]], ["docker", "unity"])
         self.assertIn("start again: open -a Docker", out.getvalue())
+
+
+class TestFocus(TempHome):
+    def table(self):
+        me, parent = os.getpid(), os.getppid()
+        A = "/Applications/{0}.app/Contents/MacOS/{0}".format
+        return [P(1, "/sbin/launchd", ppid=0, uid=0),
+                P(parent, A("Launcher"), cpu=5), P(me, "/usr/bin/python3", ppid=parent),  # runs this tool
+                P(120, "/Applications/Launcher.app/Contents/MacOS/Launcher Helper", ppid=parent, cpu=1),
+                P(100, A("Google Chrome"), cpu=5, mem=GB),
+                P(101, "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/"
+                       "Google Chrome Helper", ppid=100, cpu=2),
+                P(200, A("Slack"), cpu=1),
+                P(210, A("Spotify"), cpu=3),                    # in focus_allow
+                P(220, A("Dropbox"), cpu=0.1, mem=10 << 20),    # too small to bother
+                P(300, A("Unity Hub"), cpu=10),                 # dev tool
+                P(310, A("Terminal")), P(311, "/bin/zsh", ppid=310),
+                P(320, A("Raycast"), cpu=2),                    # never paused
+                P(330, A("Widgetly"), cpu=2), P(331, "/opt/homebrew/bin/node", ppid=330),  # starts a dev process
+                P(340, A("Ollama"), cpu=1),
+                P(350, A("Safari"), cpu=4),                     # frontmost
+                P(370, A("Root Thing"), uid=0, cpu=50),         # someone else's
+                P(380, "/System/Applications/Music.app/Contents/MacOS/Music", cpu=5)]  # macOS
+
+    def plan(self, **kw):
+        kw = dict(dict(front=350, allow=("spotify",), ollama_idle=False), **kw)
+        return mg.focus_plan(self.table(), **kw)
+
+    def test_plan_pauses_only_non_dev_apps(self):
+        plan = self.plan()
+        self.assertEqual([g["name"] for g in plan["pause"]], ["Google Chrome", "Slack"])
+        self.assertEqual(sorted(p["pid"] for p in plan["pause"][0]["procs"]), [100, 101])  # helpers go with their app
+        kept = {k["name"]: k["reason"] for k in plan["kept"]}
+        self.assertEqual(kept["Unity Hub"], "development tool")
+        self.assertEqual(kept["Terminal"], "development tool")
+        self.assertIn("input", kept["Raycast"])
+        self.assertEqual(kept["Spotify"], "in your focus_allow setting")
+        self.assertEqual(kept["Widgetly"], "runs node")
+        self.assertEqual(kept["Safari"], "the app in front")
+        self.assertEqual(kept["Launcher"], "runs this tool")
+        self.assertEqual(kept["Ollama"], "serving a model")
+        names = {g["name"] for g in plan["pause"]} | set(kept)
+        for n in ("Dropbox", "Root Thing", "Music"):
+            self.assertNotIn(n, names)
+        self.assertIn("Ollama", [g["name"] for g in self.plan(ollama_idle=True)["pause"]])
+        self.assertIn("Safari", [g["name"] for g in self.plan(front=None)["pause"]])
+
+    def test_pause_records_and_resume_rechecks(self):
+        sent = []
+        with mock.patch.object(mg, "perf_table", return_value=self.table()), mock.patch.object(mg, "start_focus_timer") as timer, \
+                mock.patch.object(mg.os, "kill", lambda pid, sig: sent.append((pid, sig))):
+            paused, until = mg.focus_pause(self.plan()["pause"], 4)
+            self.assertEqual(sorted((p, s) for p, s in sent), [(100, mg.signal.SIGSTOP), (101, mg.signal.SIGSTOP), (200, mg.signal.SIGSTOP)])
+            timer.assert_called_once()
+            state = mg.load_focus()
+            self.assertEqual((len(state["paused"]), state["source"]), (3, "cli"))
+            self.assertAlmostEqual(until, time.time() + 4 * 3600, delta=5)
+            self.assertNotIn("Google Chrome", [g["name"] for g in self.plan()["pause"]])  # already paused: not again
+            self.assertTrue(mg.focus_status()["active"])
+        sent.clear()
+        reused = [P(200, "/Users/me/other")] + [p for p in self.table() if p["pid"] != 200]
+        with mock.patch.object(mg, "perf_table", return_value=reused), \
+                mock.patch.object(mg.os, "kill", lambda pid, sig: sent.append((pid, sig))):
+            resumed = mg.focus_resume()
+        self.assertEqual(sorted(sent), [(100, mg.signal.SIGCONT), (101, mg.signal.SIGCONT)])  # 200 is someone else now
+        self.assertEqual(len(resumed), 2)
+        self.assertIsNone(mg.load_focus())
+        self.assertIn("[focus] resumed 2", mg.read_text(mg.EVENTS_LOG))
+
+    def test_pause_skips_reused_or_protected_pids(self):
+        now = [P(100, "/Users/me/other")] + [p for p in self.table() if p["pid"] != 100]
+        sent = []
+        with mock.patch.object(mg, "perf_table", return_value=now), mock.patch.object(mg, "start_focus_timer"), \
+                mock.patch.object(mg.os, "kill", lambda pid, sig: sent.append(pid)):
+            mg.focus_pause(self.plan()["pause"] + [dict(name="Launcher", procs=[P(os.getppid(), "/Applications/Launcher.app/"
+                                                                                   "Contents/MacOS/Launcher")])], 4)
+        self.assertEqual(sorted(sent), [101, 200])
+
+    def test_auto_resume_after_timeout(self):
+        mg.ensure_state()
+        mg.write_json(mg.focus_file(), dict(paused=[dict(pid=200, exe="/Applications/Slack.app/Contents/MacOS/Slack", name="Slack")],
+                                            until=time.time() + 3600, source="cli"))
+        sent = []
+        with mock.patch.object(mg, "perf_table", return_value=self.table()), \
+                mock.patch.object(mg.os, "kill", lambda pid, sig: sent.append((pid, sig))):
+            self.assertIsNone(mg.focus_check_expired())
+            self.assertEqual(sent, [])
+            state = mg.load_focus()
+            mg.write_json(mg.focus_file(), dict(state, until=time.time() - 1))
+            mg.focus_check_expired()
+        self.assertEqual(sent, [(200, mg.signal.SIGCONT)])
+        self.assertIsNone(mg.load_focus())
+
+    def test_focus_timer_resumes_at_deadline(self):
+        mg.ensure_state()
+        mg.write_json(mg.focus_file(), dict(paused=[dict(pid=200, exe="/Applications/Slack.app/Contents/MacOS/Slack", name="Slack")],
+                                            until=time.time() + 0.2, source="ui"))
+        sent = []
+        with mock.patch.object(mg, "perf_table", return_value=self.table()), \
+                mock.patch.object(mg.os, "kill", lambda pid, sig: sent.append((pid, sig))):
+            mg.cmd_focus_timer(None)
+        self.assertEqual(sent, [(200, mg.signal.SIGCONT)])
+        mg.cmd_focus_timer(None)  # nothing paused: returns straight away
+
+    def test_frontmost_pid(self):
+        runs = {"lsappinfo front": "ASN:0x0-0x1a01a:\n", "lsappinfo info": '"LSDisplayName"="Claude"\n pid = 947 !cgsConnection\n'}
+        with mock.patch.object(mg, "run", fake_run(runs)):
+            self.assertEqual(mg.frontmost_pid(), 947)
+        with mock.patch.object(mg, "run", fake_run({})):
+            self.assertIsNone(mg.frontmost_pid())
+
+    def test_settings_focus_allow_and_hours(self):
+        with mock.patch.object(mg, "install_agent") as inst, mock.patch.object(mg, "remove_agent") as rem:
+            quiet(mg.cmd_settings, argparse.Namespace(key="focus_allow", value="Spotify, Figma ,"))
+            quiet(mg.cmd_settings, argparse.Namespace(key="focus_hours", value="2"))
+            inst.assert_not_called()
+            rem.assert_not_called()
+        s = mg.load_settings()
+        self.assertEqual((s["focus_allow"], s["focus_hours"]), (["spotify", "figma"], 2))
+        self.assertEqual(mg.focus_status()["hours"], 2)
+
+    def test_cmd_focus_dry_run_confirm_and_resume(self):
+        plan = self.plan()
+        args = lambda **kw: argparse.Namespace(**dict(dict(focus=True, resume=False, apply=False, yes=False, before=None, only=None), **kw))  # noqa: E731
+        with mock.patch.object(mg, "focus_snapshot", return_value=(self.table(), plan)), \
+                mock.patch.object(mg, "focus_pause", return_value=([dict(pid=100, exe="x", name="Google Chrome")], time.time())) as fp:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_perf(args())
+            self.assertIn("Dry run", out.getvalue())
+            self.assertIn("Unity Hub (development tool)", out.getvalue())
+            with mock.patch("builtins.input", return_value="no"):
+                quiet(mg.cmd_perf, args(apply=True))
+            fp.assert_not_called()
+            out = io.StringIO()
+            with mock.patch("builtins.input", return_value="yes"), redirect_stdout(out):
+                mg.cmd_perf(args(apply=True))
+            fp.assert_called_once()
+            self.assertIn("Not Responding", out.getvalue())
+            self.assertIn("macguard perf --resume", out.getvalue())
+        with mock.patch.object(mg, "focus_resume", return_value=[dict(pid=1, exe="x", name="Slack")]) as fr:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_perf(args(focus=False, resume=True))
+        fr.assert_called_once()
+        self.assertIn("Resumed 1 process(es): Slack", out.getvalue())
+
+    def test_pause_and_resume_real_process(self):
+        """End to end: a tiny app binary is really stopped (ps state T) and continues on resume."""
+        import subprocess
+        cc = shutil.which("cc")
+        if not cc:
+            self.skipTest("needs a C compiler (Xcode Command Line Tools)")
+        exe = os.path.join(self.tmp, "Busy.app", "Contents", "MacOS", "Busy")
+        os.makedirs(os.path.dirname(exe))
+        src = os.path.join(self.tmp, "busy.c")
+        with open(src, "w") as fh:
+            fh.write("#include <unistd.h>\nint main(void){ sleep(120); return 0; }\n")
+        subprocess.run([cc, "-o", exe, src], check=True, capture_output=True)
+        proc = subprocess.Popen([exe])
+        state = lambda: subprocess.run(["ps", "-o", "state=", "-p", str(proc.pid)], capture_output=True, text=True).stdout.strip()  # noqa: E731
+        try:
+            for _ in range(40):
+                procs = [p for p in mg.perf_table() if p["pid"] == proc.pid and p["exe"].endswith("/Busy")]
+                if procs:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(procs, "test app not visible in the process table")
+            with mock.patch.object(mg, "start_focus_timer"):
+                paused, _ = mg.focus_pause([dict(name="Busy", procs=procs)], 1)
+            self.assertEqual(len(paused), 1)
+            self.assertTrue(state().startswith("T"), state())
+            self.assertEqual(len(mg.focus_resume()), 1)
+            time.sleep(0.1)
+            self.assertFalse(state().startswith("T"), state())
+        finally:
+            proc.kill()
+            proc.wait()
 
 
 # ---------------------------------------------------------------- traffic
@@ -1660,6 +1838,23 @@ class TestWebUI(TempHome):
             self.assertEqual(stop(["unity", "spotlight", "../x"]), [{"id": "unity"}])  # system items never stop
             self.assertEqual(stop([]), [])  # no ids means nothing, not "the safe ones"
             self.assertEqual(self.req("/api/perf/stop", body={"ids": ["docker"]}, token=None)[0], 403)
+            self.assertIn("focus", json.loads(self.req("/api/perf")[1]))
+
+    def test_focus_endpoints(self):
+        group = dict(name="Slack", cpu=1.0, mem=5, count=1, procs=[dict(pid=200, exe="/x")])
+        plan = dict(pause=[group], kept=[dict(name="Xcode", reason="development tool")])
+        with mock.patch.object(mg, "focus_snapshot", return_value=([], plan)), \
+                mock.patch.object(mg, "focus_pause", return_value=([dict(pid=200, exe="/x", name="Slack")], 123.0)) as fp, \
+                mock.patch.object(mg, "focus_resume", return_value=[1, 2]):
+            view = json.loads(self.req("/api/perf/focus/plan", body={})[1])
+            self.assertEqual((view["pause"][0]["name"], view["kept"][0]["name"]), ("Slack", "Xcode"))
+            self.assertNotIn("procs", view["pause"][0])  # the page never sees pids
+            fp.assert_not_called()
+            r = json.loads(self.req("/api/perf/focus", body={"pids": [1]})[1])  # anything the page sends is ignored
+            self.assertEqual((r["paused"], r["until"]), (1, 123.0))
+            self.assertEqual(fp.call_args.kwargs["source"], "ui")
+            self.assertEqual(json.loads(self.req("/api/perf/resume", body={})[1])["resumed"], 2)
+            self.assertEqual(self.req("/api/perf/focus", body={}, token=None)[0], 403)
 
 
 # ---------------------------------------------------------------- doctor / report

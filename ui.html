@@ -222,6 +222,9 @@ footer code{font-family:var(--mono)}
 .item.sys{cursor:default}.item.sys:hover{transform:none}
 .item .how{color:var(--fg-3);font:11.5px/1.5 var(--mono);margin-top:6px;word-break:break-word}
 .perfbar{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:2px 16px 14px;color:var(--fg-3);font-size:13px}
+.focusbar{display:flex;align-items:center;gap:12px;margin:2px 10px 8px;padding:12px 14px;border-radius:14px;background:var(--glass);border:1px solid var(--stroke)}
+.focusbar .t{flex:1;font-size:13px;color:var(--fg-2)}.focusbar .t b{color:var(--fg)}.focusbar .t small{display:block;color:var(--fg-3);font-size:12px}
+.focusbar.on{border-color:color-mix(in srgb,var(--med) 55%,transparent)}
 .sugg{margin:0;padding:2px 22px 12px 42px;color:var(--fg-2);font-size:13.5px;line-height:1.7}
 
 @media (max-width:820px){.stats{grid-template-columns:1fr 1fr}.stat.disk{grid-column:1/-1}.netinfo{grid-template-columns:1fr}.netinfo.perfinfo{grid-template-columns:1fr 1fr}}
@@ -605,6 +608,11 @@ function renderPerf(){
       <div><span class="k">Memory pressure</span><span class="lvl ${esc(s.pressure)}">${esc(s.pressure)}</span>${s.mem_free_pct!=null?` · ${s.mem_free_pct}% free`:""}</div>
       <div><span class="k">Swap</span>${human(s.swap_used)} <span style="opacity:.6">of ${human(s.swap_total)}</span></div>
       <div><span class="k">Thermal</span><span class="lvl ${esc(t.state)}">${esc(t.state)}</span>${s.low_power?" · Low Power Mode":""}</div></div>`;
+  const fo = perf.focus;
+  h += `<div class="focusbar ${fo.active?"on":""}"><div class="t">` + (fo.active
+      ? `<b>Dev focus on</b> · ${fo.count} process${fo.count===1?"":"es"} paused: ${esc(fo.names.join(", "))}<small>Resumes by itself at ${new Date(fo.until*1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})}, or when you close Mac Cleanup. Paused apps may show as Not Responding.</small>`
+      : `<b>Dev focus</b> · pause background apps that aren't dev tools, so only development work runs<small>They continue exactly where they were when resumed (automatically after ${fo.hours} h). Paused apps may show as Not Responding.</small>`) +
+    `</div>${fo.active ? '<button class="btn primary sm" id="focusResume">Resume</button>' : '<button class="btn ghost sm" id="focusOn">Focus on</button>'}</div>`;
   h += renderFindings(perf.findings);
   if (perf.items.length){
     h += `<div class="dgroup"><h3>Dev daemons and background jobs</h3></div><div class="items" id="perfItems">` + perf.items.map((it,i) => {
@@ -630,6 +638,8 @@ function renderPerf(){
     ev.preventDefault(); const it = perf.items[+el.dataset.p]; if (it.risk === "system") return;
     perfPick.has(it.id) ? perfPick.delete(it.id) : perfPick.add(it.id); renderPerf();
   });
+  if ($("focusOn")) $("focusOn").onclick = focusOn;
+  if ($("focusResume")) $("focusResume").onclick = focusResume;
   if ($("perfStop")){
     const sel = perf.items.filter(i => perfPick.has(i.id));
     $("perfSel").textContent = `${sel.length} selected` + (sel.some(i => i.risk==="review") ? " · incl. review items" : "");
@@ -645,6 +655,26 @@ async function stopPerf(){
     const r = await api("/api/perf/stop", {ids: sel.map(i => i.id)});
     alert("Stopped\n\n" + r.stopped.map(x => `• ${x.name}${x.ok ? "" : " (partly)"}: ${x.detail}\n   start again: ${x.start}`).join("\n"));
   } catch(e){ toast("Stop failed: " + e.message); }
+  checkPerf(perf.before === "heavy");
+}
+async function focusOn(){
+  const btn = $("focusOn"); busy(btn, true);
+  try {
+    const plan = await api("/api/perf/focus/plan", {});
+    if (!plan.pause.length){ toast("Nothing to pause: only dev tools are busy"); return; }
+    if (!confirm(`Pause ${plan.pause.length} app(s) for up to ${plan.hours} h?\nThey may show as Not Responding until resumed; nothing is closed or lost.\n\n` +
+                 plan.pause.map(g => `• ${g.name}  ${g.cpu.toFixed(1)}% CPU · ${human(g.mem)}`).join("\n") +
+                 (plan.kept.length ? `\n\nKeeps running: ${plan.kept.map(k => k.name).join(", ")}` : ""))) return;
+    const r = await api("/api/perf/focus", {});
+    toast(`Dev focus on: ${r.paused} process(es) paused`);
+  } catch(e){ toast("Focus failed: " + e.message); }
+  finally { busy(btn, false, "Focus on"); }
+  checkPerf(perf.before === "heavy");
+}
+async function focusResume(){
+  busy($("focusResume"), true);
+  try { const r = await api("/api/perf/resume", {}); toast(`Resumed ${r.resumed} process(es)`); }
+  catch(e){ toast("Resume failed: " + e.message); }
   checkPerf(perf.before === "heavy");
 }
 $("perfBtn").onclick = () => checkPerf(false); $("perfHeavyBtn").onclick = () => checkPerf(true);

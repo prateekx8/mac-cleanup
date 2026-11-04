@@ -13,7 +13,8 @@ Commands:
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   kill APP             Quit an app and every process under it (helpers, children, launch agents)
   perf                 What's hogging CPU, memory and heat: dev daemons, orphans, thermal/swap state
-                       (--apply stops the safe ones, --before heavy checks readiness for a big build)
+                       (--apply stops the safe ones, --before heavy checks readiness for a big build,
+                       --focus pauses apps that aren't dev tools, --resume continues them)
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
   ui                   Small local web UI: scan, pick categories, clean, run checks
@@ -35,6 +36,7 @@ import os
 import plistlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1759,7 +1761,7 @@ def cmd_deepscan(args):
 # ---------------------------------------------------------------- performance (CPU, memory, heat)
 
 # never signalled: macOS itself, and simulator runtimes (those are shut down with simctl instead)
-PERF_SYSTEM_DIRS = ("/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/", "/private/var/", "/Library/Developer/CoreSimulator/")
+PERF_SYSTEM_DIRS = ("/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/", "/private/var/db/", "/Library/Developer/CoreSimulator/")
 IDLE_CPU = 5.0                      # % of one core: below this a daemon counts as idle
 HEAVY_FREE_BYTES = 30 * 1024 ** 3   # free space a Unity or Xcode build wants (Library/, DerivedData, simulators)
 RENDER_NAMES = ("chrome-headless-shell", "ffmpeg", "ffprobe")
@@ -2178,6 +2180,8 @@ def perf_json(r):
 
 
 def cmd_perf(args):
+    if args.focus or args.resume:
+        return cmd_focus(args)
     r = perf_report(args.before)
     s, t = r["state"], r["state"]["thermal"]
     tcol = C["r"] if t["state"] == "throttled" else (C["y"] if t["state"] == "warning" else C["g"])
@@ -2186,6 +2190,10 @@ def cmd_perf(args):
           + (f" ({s['mem_free_pct']}% free)" if s["mem_free_pct"] is not None else "")
           + f"  ·  swap {human(s['swap_used'])} of {human(s['swap_total'])}  ·  thermal {tcol}{t['state']}{C['x']}"
           + (f"  ·  {C['y']}Low Power Mode{C['x']}" if s["low_power"] else ""))
+    fs = focus_status()
+    if fs["active"]:
+        print(f"{C['y']}Dev focus on:{C['x']} {fs['count']} process(es) paused ({', '.join(fs['names'])}) until "
+              f"{dt.datetime.fromtimestamp(fs['until']):%H:%M}.  Resume: macguard perf --resume")
     print(f"\n{C['B']}Findings{C['x']}")
     print_findings(r["findings"])
     col = {"safe": C["g"], "review": C["y"], "system": C["d"]}
@@ -2225,6 +2233,209 @@ def cmd_perf(args):
     for res in apply_perf(plan):
         mark = f"{C['g']}stopped{C['x']}" if res["ok"] else f"{C['y']}partly{C['x']}"
         print(f"  {mark} {res['name']}: {res['detail']}\n          {C['d']}start again: {res['start']}{C['x']}")
+
+
+# ---------------------------------------------------------------- dev focus (pause apps that aren't dev tools)
+
+FOCUS_MIN_CPU, FOCUS_MIN_MEM = 0.5, 256 << 20  # an app below both isn't worth pausing
+# matched (lowercase) against the owning app's name: development tools are never paused
+DEV_APPS = ("unity", "xcode", "simulator", "android studio", "visual studio", "code", "cursor", "zed", "intellij", "pycharm",
+            "webstorm", "goland", "clion", "rider", "rubymine", "phpstorm", "datagrip", "fleet", "jetbrains", "terminal",
+            "iterm", "warp", "ghostty", "alacritty", "kitty", "wezterm", "hyper", "claude", "docker", "postman", "insomnia",
+            "github desktop", "sourcetree", "fork", "instruments", "blender", "mac cleanup")
+# programs that are development work wherever they run from (and keep whatever started them running too)
+DEV_BINS = {"zsh", "bash", "fish", "sh", "tmux", "ssh", "node", "npm", "npx", "bun", "deno", "python", "python3", "java", "dotnet",
+            "git", "ffmpeg", "esbuild", "gradle", "make", "cargo", "rustc", "go", "ruby", "postgres", "redis-server", "mongod",
+            "mysqld", "claude", "chrome-headless-shell"}
+DEV_PATHS = ("/Workspace/", "/node_modules/", "/.gradle/", "/Android/sdk/", "CoreSimulator", "/.dotnet/", "creator-studio", "cbse")
+# pausing these breaks input, security, networking or a call - never paused even though they aren't dev tools
+NEVER_PAUSE = ("1password", "bitwarden", "lastpass", "dashlane", "keepass", "tailscale", "wireguard", "vpn", "globalprotect",
+               "anyconnect", "zscaler", "lulu", "little snitch", "karabiner", "rectangle", "magnet", "raycast", "alfred",
+               "bettertouchtool", "bartender", "logi", "steelseries", "razer", "displaylink", "elgato", "stream deck",
+               "loopback", "soundsource", "zoom", "webex", "facetime", "macguard")
+
+
+def focus_file():
+    return os.path.join(STATE_DIR, "focus.json")
+
+
+def load_focus():
+    try:
+        return json.loads(read_text(focus_file()))
+    except (OSError, ValueError):
+        return None
+
+
+def frontmost_pid():
+    """The app in front right now (it is never paused). lsappinfo needs no permissions."""
+    _, asn, _ = run(["lsappinfo", "front"], timeout=10)
+    if not asn.strip():
+        return None
+    m = re.search(r"pid\s*=\s*(\d+)", run(["lsappinfo", "info", "-only", "pid", asn.strip()], timeout=10)[1])
+    return int(m.group(1)) if m else None
+
+
+def dev_process(p, allow=()):
+    low = p["exe"].lower()
+    return (os.path.basename(low) in DEV_BINS or any(w in p["exe"] for w in DEV_PATHS)
+            or any(w in owner_name(p).lower() for w in DEV_APPS) or any(w in low for w in allow))
+
+
+def focus_plan(table, front=None, allow=(), ollama_idle=False):
+    """Apps (whole bundles: main process and helpers) that may be paused, and why the others stay running.
+    Only your own processes inside an .app bundle are candidates; macOS, root, this session, the frontmost app,
+    dev tools, anything that starts a dev process and the NEVER_PAUSE list always keep running."""
+    allow = tuple(a.lower() for a in allow if a)
+    protected = session_pids(table)
+    by_pid = {p["pid"]: p for p in table}
+    already = {e["pid"] for e in (load_focus() or {}).get("paused", [])}
+    keep = {}
+    for p in table:
+        if dev_process(p, allow):  # the dev process's own app, and every app above it (Terminal -> zsh -> node)
+            q, hops = by_pid.get(p["ppid"]), 0
+            keep.setdefault(owner_name(p), "in your focus_allow setting" if dev_process(p, allow) and not dev_process(p)
+                            else "development tool")
+            while q and q["pid"] > 1 and hops < 50:
+                keep.setdefault(owner_name(q), f"runs {owner_name(p)}")
+                q, hops = by_pid.get(q["ppid"]), hops + 1
+        if p["pid"] in protected:
+            keep.setdefault(owner_name(p), "runs this tool")
+    if front in by_pid:
+        keep[owner_name(by_pid[front])] = "the app in front"
+    groups = {}
+    for p in table:
+        if ".app/" in p["exe"] and stoppable(p, protected) and p["pid"] not in already:
+            groups.setdefault(owner_name(p), []).append(p)
+    pause, kept = [], []
+    for name, procs in sorted(groups.items()):
+        low = name.lower()
+        why = keep.get(name) or ("needed for input, security, network or calls" if any(w in low for w in NEVER_PAUSE) else None) \
+            or ("in your focus_allow setting" if any(w in low for w in allow) else None) \
+            or ("serving a model" if low == "ollama" and not ollama_idle else None)
+        cpu, mem = sum(p["cpu"] for p in procs), sum(p["mem"] for p in procs)
+        if why:
+            kept.append(dict(name=name, reason=why))
+        elif cpu >= FOCUS_MIN_CPU or mem >= FOCUS_MIN_MEM:
+            pause.append(dict(name=name, cpu=cpu, mem=mem, count=len(procs), procs=procs))
+    return dict(pause=sorted(pause, key=lambda g: (-g["cpu"], -g["mem"])), kept=kept)
+
+
+def focus_snapshot():
+    table = perf_table()
+    ollama = next((it for it in dev_items(table) if it["id"] == "ollama"), None)
+    return table, focus_plan(table, frontmost_pid(), load_settings()["focus_allow"], bool(ollama and ollama["risk"] == "safe"))
+
+
+def start_focus_timer():
+    """A detached `macguard focus-timer` resumes everything when the time is up, even after this terminal closes."""
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "focus-timer"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def focus_pause(groups, hours, source="cli"):
+    """SIGSTOP every process of the given app groups (re-checked first) and record them in focus.json."""
+    now = {p["pid"]: p for p in perf_table()}
+    protected = session_pids(list(now.values()))
+    state = load_focus() or {"paused": [], "since": time.time()}
+    paused = []
+    for g in groups:
+        for p in g["procs"]:
+            q = now.get(p["pid"])
+            if not q or q["exe"] != p["exe"] or not stoppable(q, protected):
+                continue
+            try:
+                os.kill(p["pid"], signal.SIGSTOP)
+            except (ProcessLookupError, PermissionError):
+                continue
+            paused.append(dict(pid=p["pid"], exe=p["exe"], name=g["name"]))
+    state["paused"] += paused
+    state.update(until=time.time() + hours * 3600, source=source)
+    ensure_state()
+    write_json(focus_file(), state)
+    if paused:
+        log_event("focus", f"paused {len(paused)} process(es): {', '.join(sorted({e['name'] for e in paused}))}")
+        start_focus_timer()
+    return paused, state["until"]
+
+
+def focus_resume(reason="resume"):
+    """SIGCONT everything focus paused (only pids that still run the same program), then forget the state."""
+    state = load_focus()
+    if not state:
+        return []
+    now = {p["pid"]: p for p in perf_table()}
+    resumed = []
+    for e in state["paused"]:
+        p = now.get(e["pid"])
+        if p and p["exe"] == e["exe"]:
+            try:
+                os.kill(e["pid"], signal.SIGCONT)
+                resumed.append(e)
+            except (ProcessLookupError, PermissionError):
+                pass
+    try:
+        os.remove(focus_file())
+    except OSError:
+        pass
+    log_event("focus", f"resumed {len(resumed)} process(es) ({reason})")
+    return resumed
+
+
+def focus_check_expired():
+    """Nothing stays paused forever: called by every command, the watcher and the focus timer."""
+    state = load_focus()
+    if state and time.time() >= state.get("until", 0):
+        return focus_resume("timeout")
+    return None
+
+
+def focus_status():
+    state = load_focus() or {}
+    return dict(active=bool(state.get("paused")), count=len(state.get("paused", [])), until=state.get("until"),
+                names=sorted({e["name"] for e in state.get("paused", [])}), hours=load_settings()["focus_hours"])
+
+
+def cmd_focus_timer(args):
+    while True:
+        state = load_focus()
+        if not state:
+            return
+        if time.time() >= state.get("until", 0):
+            focus_resume("timeout")
+            return
+        time.sleep(max(1, min(60, state["until"] - time.time())))
+
+
+def cmd_focus(args):
+    if args.resume:
+        res = focus_resume("macguard perf --resume")
+        print(f"{C['g']}Resumed {len(res)} process(es){C['x']}" + (f": {', '.join(sorted({e['name'] for e in res}))}" if res else
+                                                                   " (nothing was paused)"))
+        return
+    _, plan = focus_snapshot()
+    hours = load_settings()["focus_hours"]
+    print(f"{C['B']}Dev focus{C['x']}  {C['d']}pauses background apps that aren't dev tools (SIGSTOP); they continue exactly "
+          f"where they were on resume{C['x']}")
+    for g in plan["pause"]:
+        print(f"  {g['cpu']:>6.1f}% {human(g['mem']):>7}  {C['y']}pause{C['x']}  {g['name']}  {C['d']}({g['count']} process"
+              f"{'es' if g['count'] != 1 else ''}){C['x']}")
+    if not plan["pause"]:
+        print(f"  {C['g']}Nothing to pause: only dev tools are busy.{C['x']}")
+    if plan["kept"]:
+        print(f"  {C['d']}keeps running: " + ", ".join(f"{k['name']} ({k['reason']})" for k in plan["kept"][:20]) + C["x"])
+    if not args.apply or not plan["pause"]:
+        if plan["pause"]:
+            print(f"\nDry run. Pause them: {C['B']}macguard perf --focus --apply{C['x']}   "
+                  f"(add apps to keep: macguard settings focus_allow 'Spotify,Figma')")
+        return
+    if not args.yes and input(f"\nPause these apps for up to {hours}h? They may show as 'Not Responding' until resumed. "
+                              "Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    paused, until = focus_pause(plan["pause"], hours)
+    print(f"{C['g']}Paused {len(paused)} process(es) in {len({e['name'] for e in paused})} app(s).{C['x']}  "
+          f"They may look 'Not Responding' - that's expected.")
+    print(f"Resume: {C['B']}macguard perf --resume{C['x']}  (automatic at {dt.datetime.fromtimestamp(until):%H:%M})")
 
 
 # ---------------------------------------------------------------- watch mode
@@ -2315,6 +2526,7 @@ def cmd_watch(args):
                     notify(title, detail)
             if events or disk_changed:  # also remember recovery, so the alert re-arms
                 write_json(BASELINE, base)
+            focus_check_expired()
             if args.once:
                 return
             time.sleep(args.interval)
@@ -2324,7 +2536,7 @@ def cmd_watch(args):
 
 # ---------------------------------------------------------------- settings
 
-DEFAULT_SETTINGS = {"background_watcher": False, "watch_interval": 60}
+DEFAULT_SETTINGS = {"background_watcher": False, "watch_interval": 60, "focus_allow": [], "focus_hours": 4}
 
 
 def load_settings():
@@ -2380,7 +2592,9 @@ def cmd_settings(args):
         for k, v in s.items():
             print(f"  {k:<20} {v}")
         print(f"\n  background watcher is {'RUNNING' if running else 'not running'}")
-        print("\n  macguard settings background_watcher on|off\n  macguard settings watch_interval <seconds>")
+        print("\n  macguard settings background_watcher on|off\n  macguard settings watch_interval <seconds>"
+              "\n  macguard settings focus_allow 'Spotify,Figma'   (apps dev focus never pauses; '' clears)"
+              "\n  macguard settings focus_hours <hours>           (dev focus resumes by itself after this)")
         return
     if args.key not in DEFAULT_SETTINGS:
         sys.exit(f"Unknown setting '{args.key}'. Known: {', '.join(DEFAULT_SETTINGS)}")
@@ -2391,9 +2605,14 @@ def cmd_settings(args):
         if args.value.lower() not in ("on", "off", "true", "false", "1", "0"):
             sys.exit("Use on or off.")
         s[args.key] = args.value.lower() in ("on", "true", "1")
+    elif isinstance(DEFAULT_SETTINGS[args.key], list):
+        s[args.key] = [x.strip().lower() for x in args.value.split(",") if x.strip()]
     else:
         s[args.key] = int(args.value)
     save_settings(s)
+    if args.key.startswith("focus_"):
+        print(f"{args.key} = {s[args.key]}")
+        return
     # apply: the background agent exists only while the setting is on
     if s["background_watcher"]:
         ok, err = install_agent(s["watch_interval"])
@@ -2549,7 +2768,8 @@ def cmd_ui(args):
                                             protected=protected_app(a), kill_protected=kill_protected(a),
                                             processes=len(app_process_tree(a, table))) for a in app_inventory()])
             if self.path.split("?")[0] == "/api/perf":
-                return self.send(200, perf_json(perf_report("heavy" if self.path.endswith("?before=heavy") else None)))
+                return self.send(200, dict(perf_json(perf_report("heavy" if self.path.endswith("?before=heavy") else None)),
+                                           focus=focus_status()))
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -2614,6 +2834,19 @@ def cmd_ui(args):
                     return self.send(409, {"error": str(e)})
                 return self.send(200, dict(view, moved=len(moved), freed=sum(n for _, n in moved),
                                            failed=[{"path": p.replace(HOME, "~"), "error": e} for p, e in failed]))
+            if self.path in ("/api/perf/focus/plan", "/api/perf/focus"):
+                # re-planned on the server every time: the page never names pids
+                with lock:
+                    _, plan = focus_snapshot()
+                    view = dict(pause=[{k: g[k] for k in ("name", "cpu", "mem", "count")} for g in plan["pause"]],
+                                kept=plan["kept"], hours=load_settings()["focus_hours"])
+                    if self.path == "/api/perf/focus/plan":
+                        return self.send(200, view)
+                    paused, until = focus_pause(plan["pause"], view["hours"], source="ui")
+                return self.send(200, dict(view, paused=len(paused), until=until))
+            if self.path == "/api/perf/resume":
+                with lock:
+                    return self.send(200, {"resumed": len(focus_resume("Mac Cleanup UI"))})
             if self.path == "/api/perf/stop":
                 # re-plan from a fresh snapshot: the page only names item ids, never pids or commands
                 ids = {str(i) for i in body.get("ids") or []}
@@ -2633,6 +2866,13 @@ def cmd_ui(args):
                 return self.send(200, s)
             self.send(404, {"error": "not found"})
 
+    def end_ui_session(*_):
+        # the app (or Ctrl-C) ends the session: what the UI paused must not stay paused
+        if (load_focus() or {}).get("source") == "ui":
+            focus_resume("Mac Cleanup closed")
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *a: (end_ui_session(), os._exit(0)))  # the app quits with launchctl bootout
     if args.parent_pid:
         # launched by the app: exit when the app goes away
         def watchdog():
@@ -2641,6 +2881,7 @@ def cmd_ui(args):
                 try:
                     os.kill(args.parent_pid, 0)
                 except OSError:
+                    end_ui_session()
                     os._exit(0)
         threading.Thread(target=watchdog, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
@@ -2653,7 +2894,7 @@ def cmd_ui(args):
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
+        end_ui_session()
 
 
 # ---------------------------------------------------------------- HTML report
@@ -2780,7 +3021,10 @@ def main():
     p.add_argument("--apply", action="store_true", help="stop the safe items (or the --only ones)")
     p.add_argument("--only", help="comma-separated item ids (needed for review items)")
     p.add_argument("--before", choices=["heavy"], help="also check readiness for a Unity/Xcode/Android build or render")
+    p.add_argument("--focus", action="store_true", help="pause background apps that aren't dev tools (dry run without --apply)")
+    p.add_argument("--resume", action="store_true", help="resume everything --focus paused")
     p.add_argument("--yes", action="store_true"); p.set_defaults(fn=cmd_perf)
+    sub.add_parser("focus-timer", help=argparse.SUPPRESS).set_defaults(fn=cmd_focus_timer)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=30); p.add_argument("--once", action="store_true")
     p.add_argument("--reset", action="store_true", help="re-learn the baseline")
@@ -2794,6 +3038,8 @@ def main():
     p.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_ui)
     args = ap.parse_args()
+    if args.fn is not cmd_focus_timer:
+        focus_check_expired()  # nothing stays paused past its time, whichever command runs next
     args.fn(args)
 
 
