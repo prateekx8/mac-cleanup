@@ -146,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         a.informativeText = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         // the button says what happens: "Stop 2 item(s)?" -> Stop, "Pause …" -> Pause, "Quit Docker…" -> Quit, cleanup -> Delete
         let verb = String(lines.first?.split(separator: " ").first ?? "")
-        a.addButton(withTitle: ["Stop", "Pause", "Quit", "Uninstall", "Reset"].contains(verb) ? verb
+        a.addButton(withTitle: ["Start", "Stop", "Pause", "Quit", "Uninstall", "Reset"].contains(verb) ? verb
                     : (message.hasPrefix("Permanently delete") ? "Delete" : "Continue"))
         a.addButton(withTitle: "Cancel")
         a.buttons.first?.hasDestructiveAction = true

@@ -16,7 +16,7 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 153 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 162 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -102,6 +102,12 @@ flowchart LR
 - `focus_plan()` groups your own processes inside `.app` bundles by owning app and keeps every app that is a dev tool (`DEV_APPS`), that starts a dev process (`DEV_BINS`/`DEV_PATHS`, for example Terminal → zsh → node), that runs macguard, that is in front (`lsappinfo front`), that is listed in `NEVER_PAUSE` (password managers, VPNs, input tools, call apps) or in the `focus_allow` setting, and Ollama while it has a model loaded. What's left, if it uses at least 0.5% CPU or 256 MB, is paused.
 - `focus_pause()` re-checks each pid like `stop_pids()`, sends SIGSTOP, and appends `{pid, exe, name}` to `~/.macguard/focus.json` with an `until` time. `focus_resume()` sends SIGCONT only to pids that still run the same program, then deletes the file.
 - Auto-resume has three triggers: a detached `macguard focus-timer` process (survives the terminal), `focus_check_expired()` at the start of every command and in each watcher loop, and the UI server's exit (app quit, SIGTERM from `launchctl bootout`, or Ctrl-C) for focus turned on from the UI.
+
+### Developer mode (`devmode`)
+
+- `devmode_plan()` combines `perf_plan()` (safe items to stop) and `focus_plan()` (apps to pause, minus anything being stopped), plus the motion and keep-awake parts. It also lists advice for things that need admin rights or a UI toggle (Low Power Mode, Do Not Disturb, Spotlight).
+- `devmode_on()` records how to undo every step in `~/.macguard/devmode.json`. That covers each stopped item with its restart command (`open -a Docker`, `open -a Ollama`, or `launchctl bootstrap` for a brew-services Ollama), the focus pause (source `devmode`), the previous type and value of each `MOTION_DEFAULTS` key (or "unset"), and the `caffeinate` pid. Dict, array and date values are left alone.
+- `devmode_off()` restores each key exactly (`defaults write` with the old type and value, or `defaults delete` if it was unset), restarts the Dock if it changed Dock keys, resumes the paused apps, restarts the services it stopped, and stops `caffeinate` only if that pid still runs `caffeinate`. The `focus-timer` and `focus_check_expired()` also call it when `until` passes.
 
 ### Deep scan
 

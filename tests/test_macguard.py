@@ -1259,6 +1259,181 @@ class TestFocus(TempHome):
             proc.wait()
 
 
+def defaults_run(store, calls, deny=()):
+    """A tiny in-memory `defaults` so motion settings can be applied and restored without touching the real Mac."""
+    def _run(cmd, timeout=60):
+        calls.append(cmd)
+        if cmd[0] != "defaults":
+            return 0, "", ""
+        op, dom, key = cmd[1], cmd[2], cmd[3]
+        if op in ("read-type", "read"):
+            if (dom, key) not in store:
+                return 1, "", f"Could not find key '{key}'"
+            t, v = store[(dom, key)]
+            return 0, (f"Type is {t}\n" if op == "read-type" else v + "\n"), ""
+        if op == "write":
+            if dom in deny:
+                return 1, "", "Could not write domain"
+            t = {"-bool": "boolean", "-float": "float", "-string": "string", "-int": "integer"}[cmd[4]]
+            store[(dom, key)] = (t, ("1" if cmd[5] in ("true", "1") else "0") if t == "boolean" else cmd[5])
+        elif op == "delete":
+            store.pop((dom, key), None)
+        return 0, "", ""
+    return _run
+
+
+class TestDevmode(TempHome):
+    def item(self, iid, name, stop, pids=(), risk="safe", start="x"):
+        return dict(id=iid, name=name, risk=risk, stop=stop, start=start, why="w", cpu=0.0, mem=0, count=len(pids), orphan=False,
+                    procs=[P(pid, f"/Applications/{name}.app/Contents/MacOS/{name}") for pid in pids])
+
+    def test_read_default(self):
+        store = {("com.apple.dock", "autohide"): ("boolean", "0"), ("com.apple.finder", "X"): ("dictionary", "{}")}
+        with mock.patch.object(mg, "run", defaults_run(store, [])):
+            self.assertEqual(mg.read_default("com.apple.dock", "autohide"), ("bool", "0"))
+            self.assertEqual(mg.read_default("com.apple.dock", "nope"), (None, None))
+            self.assertEqual(mg.read_default("com.apple.finder", "X"), ("unsupported", None))
+
+    def test_motion_apply_and_restore_exactly(self):
+        store = {("com.apple.dock", "autohide-delay"): ("float", "0.5"), ("com.apple.dock", "mineffect"): ("string", "genie"),
+                 ("NSGlobalDomain", "NSScrollAnimationEnabled"): ("boolean", "1"),
+                 ("com.apple.finder", "DisableAllAnimations"): ("dictionary", "{}")}  # odd type: left alone
+        before, calls = dict(store), []
+        with mock.patch.object(mg, "run", defaults_run(store, calls, deny={"com.apple.universalaccess"})):
+            records, failed = mg.apply_motion()
+            self.assertEqual(len(failed), 2)  # Reduce Motion / Transparency may be refused: reported, not recorded
+            self.assertEqual(len(records), len(mg.MOTION_DEFAULTS) - 3)
+            self.assertEqual(store[("com.apple.dock", "launchanim")], ("boolean", "0"))
+            self.assertEqual(store[("com.apple.dock", "mineffect")], ("string", "scale"))
+            self.assertIn(["killall", "Dock"], calls)
+            mg.restore_motion(json.loads(json.dumps(records)))  # survives the trip through devmode.json
+        self.assertEqual(store, before)
+        self.assertFalse(any("sudo" in c for c in calls))
+
+    def test_restart_cmd(self):
+        self.assertEqual(mg.restart_cmd(self.item("docker", "Docker Desktop", [("quit", "Docker")])), ["open", "-a", "Docker"])
+        self.assertEqual(mg.restart_cmd(self.item("ollama", "Ollama", [("quit", "Ollama")])), ["open", "-a", "Ollama"])
+        boot = self.item("ollama", "Ollama", [("cmd", ["launchctl", "bootout", f"gui/{os.getuid()}/homebrew.mxcl.ollama"])])
+        self.assertEqual(mg.restart_cmd(boot), ["launchctl", "bootstrap", f"gui/{os.getuid()}",
+                                                os.path.join(mg.HOME, "Library/LaunchAgents/homebrew.mxcl.ollama.plist")])
+        self.assertIsNone(mg.restart_cmd(self.item("gradle", "Gradle daemons", [("term", [1])])))
+
+    def report(self, low_power=True):
+        items = [self.item("docker", "Docker Desktop", [("quit", "Docker")], [100]),
+                 self.item("simulators", "iOS simulators", [("cmd", ["xcrun", "simctl", "shutdown", "all"])], [400]),
+                 self.item("unity", "Unity", [("quit", "Unity")], [500], risk="review")]
+        return dict(items=items, state=dict(low_power=low_power), disk=dict(low=False))
+
+    def test_plan(self):
+        groups = [dict(name="Google Chrome", procs=[P(950, "/x")]), dict(name="Docker", procs=[P(100, "/y")])]
+        with mock.patch.object(mg, "perf_report", return_value=self.report()), \
+                mock.patch.object(mg, "focus_snapshot", return_value=([], dict(pause=groups, kept=[]))):
+            plan = mg.devmode_plan()
+            self.assertEqual([it["id"] for it in plan["stop"]], ["docker", "simulators"])  # review items are not stopped
+            self.assertEqual([g["name"] for g in plan["pause"]], ["Google Chrome"])  # Docker is stopped, not paused
+            self.assertTrue(plan["motion"] and plan["awake"])
+            self.assertIn("Low Power Mode", " ".join(plan["advice"]))
+            plan = mg.devmode_plan(("stop", "motion", "bogus"))
+        self.assertEqual((plan["stop"], plan["motion"], plan["skip"]), ([], False, ["stop", "motion"]))
+        self.assertEqual(len(plan["pause"]), 2)
+
+    def test_on_then_off_puts_everything_back(self):
+        plan = dict(stop=self.report()["items"][:2], pause=[dict(name="Google Chrome", procs=[])], motion=True, awake=True, advice=[])
+
+        def fake_pause(groups, hours, source):
+            mg.ensure_state()
+            mg.write_json(mg.focus_file(), dict(paused=[dict(pid=950, exe="/x", name="Google Chrome")], until=0, source=source))
+            return [1, 2], 0
+        popen = mock.MagicMock(pid=4242)
+        with mock.patch.object(mg, "apply_perf", return_value=[dict(detail="ok")] * 2), \
+                mock.patch.object(mg, "focus_pause", side_effect=fake_pause), \
+                mock.patch.object(mg, "apply_motion", return_value=([dict(domain="com.apple.dock", key="k", prev_kind=None, prev=None)], ["reduceMotion (no)"])), \
+                mock.patch.object(mg.subprocess, "Popen", return_value=popen) as po, \
+                mock.patch.object(mg.shutil, "which", return_value="/usr/bin/caffeinate"), \
+                mock.patch.object(mg, "start_focus_timer") as timer:
+            st = mg.devmode_on(plan, 4)
+            with self.assertRaises(ValueError):
+                mg.devmode_on(plan, 4)
+        self.assertEqual(po.call_args.args[0], ["caffeinate", "-i", "-s", "-t", "14400"])
+        timer.assert_called_once()
+        self.assertEqual((st["paused"], st["caffeinate"], st["failed"]), (2, 4242, ["reduceMotion (no)"]))
+        self.assertEqual(st["stopped"][0]["restart"], ["open", "-a", "Docker"])
+        status = mg.devmode_status()
+        self.assertTrue(status["active"])
+        self.assertEqual((status["stopped"], status["motion"], status["awake"]), (["Docker Desktop", "iOS simulators"], 1, True))
+
+        calls, killed = [], []
+        with mock.patch.object(mg, "focus_resume", return_value=[1, 2]) as fr, \
+                mock.patch.object(mg, "restore_motion") as rm, \
+                mock.patch.object(mg, "run", side_effect=lambda cmd, timeout=60: calls.append(cmd) or (0, "", "")), \
+                mock.patch.object(mg, "perf_table", return_value=[P(4242, "/usr/bin/caffeinate")]), \
+                mock.patch.object(mg.os, "kill", lambda pid, sig: killed.append((pid, sig))):
+            r = mg.devmode_off()
+        fr.assert_called_once()
+        rm.assert_called_once_with(st["motion"])
+        self.assertEqual(calls, [["open", "-a", "Docker"]])
+        self.assertEqual(killed, [(4242, mg.signal.SIGTERM)])
+        self.assertEqual((r["resumed"], r["restored"], r["restarted"]), (2, 1, ["Docker Desktop"]))
+        self.assertEqual(r["not_restarted"], ["iOS simulators: x"])
+        self.assertIsNone(mg.load_devmode())
+        self.assertIsNone(mg.devmode_off())
+        self.assertIn("[devmode] off", mg.read_text(mg.EVENTS_LOG))
+
+    def test_caffeinate_pid_reused_is_not_killed(self):
+        mg.ensure_state()
+        mg.write_json(mg.devmode_file(), dict(since=0, until=1e12, stopped=[], motion=[], caffeinate=4242, paused=0))
+        killed = []
+        with mock.patch.object(mg, "perf_table", return_value=[P(4242, "/Applications/Other.app/Contents/MacOS/Other")]), \
+                mock.patch.object(mg, "run", return_value=(0, "", "")), mock.patch.object(mg.os, "kill", lambda *a: killed.append(a)):
+            mg.devmode_off()
+        self.assertEqual(killed, [])
+
+    def test_turns_off_by_itself(self):
+        mg.ensure_state()
+        mg.write_json(mg.devmode_file(), dict(since=0, until=time.time() + 3600, stopped=[], motion=[], caffeinate=None, paused=0))
+        with mock.patch.object(mg, "devmode_off", side_effect=lambda reason: os.remove(mg.devmode_file())) as off:
+            mg.focus_check_expired()
+            off.assert_not_called()
+            mg.write_json(mg.devmode_file(), dict(mg.load_devmode(), until=time.time() - 1))
+            mg.cmd_focus_timer(None)  # the detached timer: ends it, then exits because nothing is left
+        off.assert_called_once_with("timeout")
+
+    def test_cmd_devmode(self):
+        args = lambda action, **kw: argparse.Namespace(**dict(dict(action=action, skip=None, yes=False), **kw))  # noqa: E731
+        plan = dict(stop=[], pause=[], motion=True, awake=True, advice=["Silence notifications"], skip=[])
+        with mock.patch.object(mg, "devmode_plan", return_value=plan) as dp, \
+                mock.patch.object(mg, "devmode_on", return_value=dict(stopped=[], paused=0, motion=[1], failed=["reduceMotion"],
+                                                                     caffeinate=1, until=time.time())) as on:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_devmode(args("status", skip="pause, awake"))
+            self.assertEqual(dp.call_args.args[0], ("pause", "awake"))
+            self.assertIn("macguard devmode on", out.getvalue())
+            with mock.patch("builtins.input", return_value="no"):
+                quiet(mg.cmd_devmode, args("on"))
+            on.assert_not_called()
+            out = io.StringIO()
+            with mock.patch("builtins.input", return_value="yes"), redirect_stdout(out):
+                mg.cmd_devmode(args("on"))
+            on.assert_called_once()
+            self.assertIn("couldn't change", out.getvalue())
+            self.assertIn("macguard devmode off", out.getvalue())
+        with mock.patch.object(mg, "devmode_off", return_value=None):
+            self.assertIn("not on", io_of(mg.cmd_devmode, args("off")))
+        with mock.patch.object(mg, "devmode_off", return_value=dict(resumed=3, restored=8, restarted=["Docker Desktop"],
+                                                                    not_restarted=["iOS simulators: open -a Simulator"])):
+            out = io_of(mg.cmd_devmode, args("off"))
+        self.assertIn("started Docker Desktop again", out)
+        self.assertIn("open -a Simulator", out)
+
+
+def io_of(fn, *a):
+    out = io.StringIO()
+    with redirect_stdout(out):
+        fn(*a)
+    return out.getvalue()
+
+
 # ---------------------------------------------------------------- traffic
 
 def SOCK(pid, proc, rhost, rport, rx, tx, state="ESTABLISHED", lport=50000):
@@ -1839,6 +2014,25 @@ class TestWebUI(TempHome):
             self.assertEqual(stop([]), [])  # no ids means nothing, not "the safe ones"
             self.assertEqual(self.req("/api/perf/stop", body={"ids": ["docker"]}, token=None)[0], 403)
             self.assertIn("focus", json.loads(self.req("/api/perf")[1]))
+            self.assertIn("devmode", json.loads(self.req("/api/perf")[1]))
+
+    def test_devmode_endpoints(self):
+        plan = dict(stop=[dict(name="Docker Desktop")], pause=[dict(name="Slack", procs=[dict(pid=200)])], motion=True, awake=True,
+                    advice=["tip"], skip=[])
+        with mock.patch.object(mg, "devmode_plan", return_value=plan) as dp, \
+                mock.patch.object(mg, "devmode_on", side_effect=[{}, ValueError("developer mode is already on")]) as on, \
+                mock.patch.object(mg, "devmode_off", return_value=dict(resumed=1, restored=2, restarted=[], not_restarted=[])):
+            view = json.loads(self.req("/api/devmode/plan", body={"skip": ["awake", "../x"]})[1])
+            self.assertEqual(dp.call_args.args[0], ("awake",))  # only known parts can be skipped
+            self.assertEqual((view["stop"], view["pause"]), (["Docker Desktop"], ["Slack"]))  # names only, no pids
+            on.assert_not_called()
+            code, body = self.req("/api/devmode/on", body={})
+            self.assertEqual(code, 200)
+            self.assertEqual(on.call_args.kwargs["source"], "ui")
+            self.assertIn("status", json.loads(body))
+            self.assertEqual(self.req("/api/devmode/on", body={})[0], 409)
+            self.assertEqual(json.loads(self.req("/api/devmode/off", body={})[1])["restored"], 2)
+            self.assertEqual(self.req("/api/devmode/on", body={}, token=None)[0], 403)
 
     def test_focus_endpoints(self):
         group = dict(name="Slack", cpu=1.0, mem=5, count=1, procs=[dict(pid=200, exe="/x")])
@@ -1938,7 +2132,7 @@ class LiveSystem(unittest.TestCase):
         import subprocess
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
         out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
-        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "perf", "deepscan", "watch", "report", "settings", "ui", "doctor"):
+        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "perf", "devmode", "deepscan", "watch", "report", "settings", "ui", "doctor"):
             self.assertIn(cmd, out)
 
 

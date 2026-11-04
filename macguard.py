@@ -12,6 +12,8 @@ Commands:
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   kill APP             Quit an app and every process under it (helpers, children, launch agents)
+  devmode [on|off]     Developer mode: stop idle services, pause non-dev apps, turn off animations,
+                       keep the Mac awake - one switch, and `off` puts everything back
   perf                 What's hogging CPU, memory and heat: dev daemons, orphans, thermal/swap state
                        (--apply stops the safe ones, --before heavy checks readiness for a big build,
                        --focus pauses apps that aren't dev tools, --resume continues them)
@@ -2190,6 +2192,9 @@ def cmd_perf(args):
           + (f" ({s['mem_free_pct']}% free)" if s["mem_free_pct"] is not None else "")
           + f"  ·  swap {human(s['swap_used'])} of {human(s['swap_total'])}  ·  thermal {tcol}{t['state']}{C['x']}"
           + (f"  ·  {C['y']}Low Power Mode{C['x']}" if s["low_power"] else ""))
+    ds = devmode_status()
+    if ds["active"]:
+        print(f"{C['y']}Developer mode on{C['x']} until {dt.datetime.fromtimestamp(ds['until']):%H:%M}.  Turn off: macguard devmode off")
     fs = focus_status()
     if fs["active"]:
         print(f"{C['y']}Dev focus on:{C['x']} {fs['count']} process(es) paused ({', '.join(fs['names'])}) until "
@@ -2382,7 +2387,10 @@ def focus_resume(reason="resume"):
 
 
 def focus_check_expired():
-    """Nothing stays paused forever: called by every command, the watcher and the focus timer."""
+    """Nothing stays paused (or in developer mode) forever: called by every command, the watcher and the focus timer."""
+    dev = load_devmode()
+    if dev and time.time() >= dev.get("until", 0):
+        devmode_off("timeout")
     state = load_focus()
     if state and time.time() >= state.get("until", 0):
         return focus_resume("timeout")
@@ -2396,14 +2404,13 @@ def focus_status():
 
 
 def cmd_focus_timer(args):
+    """Detached: ends dev focus and developer mode when their time is up, then exits."""
     while True:
-        state = load_focus()
-        if not state:
+        focus_check_expired()
+        states = [s for s in (load_focus(), load_devmode()) if s]
+        if not states:
             return
-        if time.time() >= state.get("until", 0):
-            focus_resume("timeout")
-            return
-        time.sleep(max(1, min(60, state["until"] - time.time())))
+        time.sleep(max(1, min(60, min(s.get("until", 0) for s in states) - time.time())))
 
 
 def cmd_focus(args):
@@ -2436,6 +2443,213 @@ def cmd_focus(args):
     print(f"{C['g']}Paused {len(paused)} process(es) in {len({e['name'] for e in paused})} app(s).{C['x']}  "
           f"They may look 'Not Responding' - that's expected.")
     print(f"Resume: {C['B']}macguard perf --resume{C['x']}  (automatic at {dt.datetime.fromtimestamp(until):%H:%M})")
+
+
+# ---------------------------------------------------------------- developer mode (one switch for dev work)
+
+# (domain, key, type, value): user-level settings that turn off motion. The old value is saved and put back on `off`.
+MOTION_DEFAULTS = [
+    ("com.apple.universalaccess", "reduceMotion", "bool", "true"),         # system-wide Reduce Motion
+    ("com.apple.universalaccess", "reduceTransparency", "bool", "true"),   # no blur behind menus and the Dock
+    ("NSGlobalDomain", "NSAutomaticWindowAnimationsEnabled", "bool", "false"),  # window open/close zoom
+    ("NSGlobalDomain", "NSWindowResizeTime", "float", "0.001"),            # sheets and resizes
+    ("NSGlobalDomain", "NSScrollAnimationEnabled", "bool", "false"),       # smooth-scroll animation
+    ("com.apple.dock", "launchanim", "bool", "false"),                     # bouncing app launch
+    ("com.apple.dock", "mineffect", "string", "scale"),                    # minimize: scale, not genie
+    ("com.apple.dock", "expose-animation-duration", "float", "0.1"),       # Mission Control
+    ("com.apple.dock", "autohide-delay", "float", "0"),
+    ("com.apple.dock", "autohide-time-modifier", "float", "0.15"),
+    ("com.apple.finder", "DisableAllAnimations", "bool", "true"),          # Finder windows (from its next launch)
+]
+DEFAULTS_TYPES = {"boolean": "bool", "float": "float", "integer": "int", "string": "string"}
+DEVMODE_PARTS = ("stop", "pause", "motion", "awake")
+
+
+def devmode_file():
+    return os.path.join(STATE_DIR, "devmode.json")
+
+
+def load_devmode():
+    try:
+        return json.loads(read_text(devmode_file()))
+    except (OSError, ValueError):
+        return None
+
+
+def read_default(domain, key):
+    """(type, value) of a user default; (None, None) if it isn't set; ('unsupported', None) for dicts/arrays/dates."""
+    rc, out, _ = run(["defaults", "read-type", domain, key], timeout=10)
+    if rc:
+        return None, None
+    kind = DEFAULTS_TYPES.get(out.strip().removeprefix("Type is ").strip(), "unsupported")
+    if kind == "unsupported":
+        return kind, None
+    rc, out, _ = run(["defaults", "read", domain, key], timeout=10)
+    return (kind, out.strip()) if rc == 0 else (None, None)
+
+
+def apply_motion():
+    """Write MOTION_DEFAULTS, remembering each previous value. Returns (records, failed keys)."""
+    records, failed = [], []
+    for domain, key, kind, value in MOTION_DEFAULTS:
+        prev_kind, prev = read_default(domain, key)
+        if prev_kind == "unsupported":
+            continue
+        rc, _, err = run(["defaults", "write", domain, key, f"-{kind}", value], timeout=10)
+        if rc:
+            failed.append(f"{key} ({err.strip()[:60] or 'not allowed'})")
+            continue
+        records.append(dict(domain=domain, key=key, prev_kind=prev_kind, prev=prev))
+    if any(r["domain"] == "com.apple.dock" for r in records):
+        run(["killall", "Dock"], timeout=10)  # the Dock re-reads its settings when it restarts (a second, no windows lost)
+    return records, failed
+
+
+def restore_motion(records):
+    for r in records:
+        if r["prev_kind"] is None:
+            run(["defaults", "delete", r["domain"], r["key"]], timeout=10)
+        else:
+            value = {"1": "true", "0": "false"}.get(r["prev"], r["prev"]) if r["prev_kind"] == "bool" else r["prev"]
+            run(["defaults", "write", r["domain"], r["key"], f"-{r['prev_kind']}", value], timeout=10)
+    if any(r["domain"] == "com.apple.dock" for r in records):
+        run(["killall", "Dock"], timeout=10)
+
+
+def restart_cmd(item):
+    """How `devmode off` brings back a service it stopped (only apps people expect to find running again)."""
+    if item["id"] == "docker":
+        return ["open", "-a", "Docker"]
+    if item["id"] == "ollama":
+        if item["stop"] and item["stop"][0][0] == "quit":
+            return ["open", "-a", "Ollama"]
+        if item["stop"] and item["stop"][0][0] == "cmd" and item["stop"][0][1][:2] == ["launchctl", "bootout"]:
+            label = item["stop"][0][1][2].rsplit("/", 1)[-1]
+            return ["launchctl", "bootstrap", f"gui/{os.getuid()}", os.path.join(HOME, "Library/LaunchAgents", label + ".plist")]
+    return None
+
+
+def devmode_plan(skip=()):
+    """Everything `devmode on` would do, computed fresh: what it stops, pauses and changes, plus advice it can't apply."""
+    r = perf_report()
+    stop = perf_plan(r["items"]) if "stop" not in skip else []
+    stopping = {p["pid"] for it in stop for p in it["procs"]}
+    pause = [g for g in focus_snapshot()[1]["pause"] if not stopping & {p["pid"] for p in g["procs"]}] \
+        if "pause" not in skip else []  # no point pausing what is about to be stopped
+    advice = []
+    if r["state"]["low_power"]:
+        advice.append("Turn off Low Power Mode: System Settings > Battery (it slows the CPU)")
+    advice.append("Silence notifications: Control Center > Focus > Do Not Disturb")
+    if any(it["id"] == "spotlight" for it in r["items"]):
+        advice.append("Keep Spotlight out of build output: System Settings > Spotlight > Search Privacy")
+    if r["disk"].get("low"):
+        advice.append("Free disk space first: macguard clean --apply")
+    return dict(stop=stop, pause=pause, motion="motion" not in skip, awake="awake" not in skip, advice=advice,
+                skip=[s for s in skip if s in DEVMODE_PARTS])
+
+
+def devmode_on(plan, hours, source="cli"):
+    """Apply a devmode_plan and record how to undo every part in ~/.macguard/devmode.json."""
+    if load_devmode():
+        raise ValueError("developer mode is already on")
+    state = dict(since=time.time(), until=time.time() + hours * 3600, source=source, stopped=[], motion=[], failed=[],
+                 caffeinate=None, paused=0)
+    for res, it in zip(apply_perf(plan["stop"]), plan["stop"]):
+        state["stopped"].append(dict(id=it["id"], name=it["name"], start=it["start"], restart=restart_cmd(it), detail=res["detail"]))
+    if plan["pause"]:
+        paused, _ = focus_pause(plan["pause"], hours, source="devmode")
+        state["paused"] = len(paused)
+    if plan["motion"]:
+        state["motion"], state["failed"] = apply_motion()
+    if plan["awake"] and shutil.which("caffeinate"):
+        # -i: no idle sleep, -s: no system sleep on power, -t: ends by itself when the time is up anyway
+        p = subprocess.Popen(["caffeinate", "-i", "-s", "-t", str(int(hours * 3600))], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        state["caffeinate"] = p.pid
+    ensure_state()
+    write_json(devmode_file(), state)
+    start_focus_timer()  # also turns developer mode off when the time is up
+    log_event("devmode", f"on: stopped {len(state['stopped'])}, paused {state['paused']}, {len(state['motion'])} motion setting(s)"
+                         + (", keeping awake" if state["caffeinate"] else ""))
+    return state
+
+
+def devmode_off(reason="devmode off"):
+    """Undo everything devmode_on did: resume paused apps, restore settings, restart stopped services, let the Mac sleep."""
+    state = load_devmode()
+    if not state:
+        return None
+    resumed = focus_resume(reason) if (load_focus() or {}).get("source") == "devmode" else []
+    restore_motion(state.get("motion", []))
+    restarted = []
+    for s in state.get("stopped", []):
+        if s.get("restart") and run(s["restart"], timeout=60)[0] == 0:
+            restarted.append(s["name"])
+    pid = state.get("caffeinate")
+    if pid and any(p["pid"] == pid and _base(p) == "caffeinate" for p in perf_table()):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        os.remove(devmode_file())
+    except OSError:
+        pass
+    log_event("devmode", f"off ({reason}): resumed {len(resumed)}, restored {len(state.get('motion', []))} setting(s), "
+                         f"restarted {', '.join(restarted) or 'nothing'}")
+    return dict(resumed=len(resumed), restored=len(state.get("motion", [])), restarted=restarted,
+                not_restarted=[f"{s['name']}: {s['start']}" for s in state.get("stopped", []) if s["name"] not in restarted])
+
+
+def devmode_status():
+    s = load_devmode() or {}
+    return dict(active=bool(s), since=s.get("since"), until=s.get("until"), stopped=[x["name"] for x in s.get("stopped", [])],
+                paused=s.get("paused", 0), motion=len(s.get("motion", [])), failed=s.get("failed", []),
+                awake=bool(s.get("caffeinate")), hours=load_settings()["focus_hours"])
+
+
+def cmd_devmode(args):
+    st = load_devmode()
+    if args.action == "off":
+        r = devmode_off("macguard devmode off")
+        if r is None:
+            print("Developer mode is not on.")
+            return
+        print(f"{C['g']}Developer mode off.{C['x']} Resumed {r['resumed']} process(es), restored {r['restored']} setting(s)"
+              + (f", started {', '.join(r['restarted'])} again" if r["restarted"] else "") + ".")
+        for x in r["not_restarted"]:
+            print(f"  {C['d']}not restarted (start it when you need it): {x}{C['x']}")
+        return
+    if st:
+        print(f"{C['y']}Developer mode is on{C['x']} since {dt.datetime.fromtimestamp(st['since']):%H:%M}, until "
+              f"{dt.datetime.fromtimestamp(st['until']):%H:%M}: stopped {', '.join(x['name'] for x in st['stopped']) or 'nothing'}; "
+              f"paused {st['paused']} process(es); animations {'off' if st['motion'] else 'unchanged'}; "
+              f"{'keeping the Mac awake' if st['caffeinate'] else 'normal sleep'}.\nTurn it off: {C['B']}macguard devmode off{C['x']}")
+        return
+    skip = tuple(x.strip() for x in (args.skip or "").split(",") if x.strip())
+    plan = devmode_plan(skip)
+    hours = load_settings()["focus_hours"]
+    print(f"{C['B']}Developer mode{C['x']}  {C['d']}one switch: only development work runs, no animations; "
+          f"`macguard devmode off` puts everything back{C['x']}")
+    print(f"  stop      {', '.join(it['name'] for it in plan['stop']) or '-'}")
+    print(f"  pause     {', '.join(g['name'] for g in plan['pause']) or '-'}  {C['d']}(SIGSTOP, may look 'Not Responding'){C['x']}")
+    print(f"  motion    {'Reduce Motion & Transparency, window/Dock/Finder animations off' if plan['motion'] else '-'}")
+    print(f"  awake     {'keep the Mac from sleeping during long builds (caffeinate)' if plan['awake'] else '-'}")
+    print(f"  ends      by `macguard devmode off`, or by itself after {hours} h")
+    for a in plan["advice"]:
+        print(f"  {C['d']}tip: {a}{C['x']}")
+    if args.action != "on":
+        print(f"\nTurn it on: {C['B']}macguard devmode on{C['x']}   (leave parts out: --skip stop,pause,motion,awake)")
+        return
+    if not args.yes and input("\nTurn on developer mode? Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    st = devmode_on(plan, hours)
+    print(f"{C['g']}Developer mode on.{C['x']} Stopped {len(st['stopped'])}, paused {st['paused']} process(es), "
+          f"{len(st['motion'])} motion setting(s) changed" + (", keeping the Mac awake." if st["caffeinate"] else "."))
+    for f in st["failed"]:
+        print(f"  {C['y']}couldn't change{C['x']} {f} - System Settings > Accessibility > Display has the same switches")
+    print(f"Turn it off: {C['B']}macguard devmode off{C['x']}  (automatic at {dt.datetime.fromtimestamp(st['until']):%H:%M})")
 
 
 # ---------------------------------------------------------------- watch mode
@@ -2769,7 +2983,7 @@ def cmd_ui(args):
                                             processes=len(app_process_tree(a, table))) for a in app_inventory()])
             if self.path.split("?")[0] == "/api/perf":
                 return self.send(200, dict(perf_json(perf_report("heavy" if self.path.endswith("?before=heavy") else None)),
-                                           focus=focus_status()))
+                                           focus=focus_status(), devmode=devmode_status()))
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -2844,6 +3058,24 @@ def cmd_ui(args):
                         return self.send(200, view)
                     paused, until = focus_pause(plan["pause"], view["hours"], source="ui")
                 return self.send(200, dict(view, paused=len(paused), until=until))
+            if self.path in ("/api/devmode/plan", "/api/devmode/on"):
+                # planned on the server every time; the page only chooses which parts to leave out
+                skip = tuple(s for s in body.get("skip") or [] if s in DEVMODE_PARTS)
+                with lock:
+                    plan = devmode_plan(skip)
+                    view = dict(stop=[it["name"] for it in plan["stop"]], pause=[g["name"] for g in plan["pause"]],
+                                motion=plan["motion"], awake=plan["awake"], advice=plan["advice"],
+                                hours=load_settings()["focus_hours"])
+                    if self.path == "/api/devmode/plan":
+                        return self.send(200, view)
+                    try:
+                        devmode_on(plan, view["hours"], source="ui")
+                    except ValueError as e:
+                        return self.send(409, {"error": str(e)})
+                return self.send(200, dict(view, status=devmode_status()))
+            if self.path == "/api/devmode/off":
+                with lock:
+                    return self.send(200, devmode_off("Mac Cleanup UI") or {"error": "not on"})
             if self.path == "/api/perf/resume":
                 with lock:
                     return self.send(200, {"resumed": len(focus_resume("Mac Cleanup UI"))})
@@ -3025,6 +3257,10 @@ def main():
     p.add_argument("--resume", action="store_true", help="resume everything --focus paused")
     p.add_argument("--yes", action="store_true"); p.set_defaults(fn=cmd_perf)
     sub.add_parser("focus-timer", help=argparse.SUPPRESS).set_defaults(fn=cmd_focus_timer)
+    p = sub.add_parser("devmode", help="one switch for dev work: stop, pause, no animations, stay awake")
+    p.add_argument("action", nargs="?", choices=["status", "on", "off"], default="status")
+    p.add_argument("--skip", help="leave parts out: stop,pause,motion,awake"); p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_devmode)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=30); p.add_argument("--once", action="store_true")
     p.add_argument("--reset", action="store_true", help="re-learn the baseline")

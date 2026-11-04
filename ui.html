@@ -225,6 +225,8 @@ footer code{font-family:var(--mono)}
 .focusbar{display:flex;align-items:center;gap:12px;margin:2px 10px 8px;padding:12px 14px;border-radius:14px;background:var(--glass);border:1px solid var(--stroke)}
 .focusbar .t{flex:1;font-size:13px;color:var(--fg-2)}.focusbar .t b{color:var(--fg)}.focusbar .t small{display:block;color:var(--fg-3);font-size:12px}
 .focusbar.on{border-color:color-mix(in srgb,var(--med) 55%,transparent)}
+.focusbar.dev{background:linear-gradient(color-mix(in srgb,var(--bg) 82%,#7c5cff),color-mix(in srgb,var(--bg) 88%,#2ee6c5))}
+.focusbar.dev.on{border-color:color-mix(in srgb,var(--ok) 60%,transparent)}
 .sugg{margin:0;padding:2px 22px 12px 42px;color:var(--fg-2);font-size:13.5px;line-height:1.7}
 
 @media (max-width:820px){.stats{grid-template-columns:1fr 1fr}.stat.disk{grid-column:1/-1}.netinfo{grid-template-columns:1fr}.netinfo.perfinfo{grid-template-columns:1fr 1fr}}
@@ -249,6 +251,7 @@ footer code{font-family:var(--mono)}
     <div class="actions">
       <button class="btn primary" id="scanBtn">✦ Scan this Mac</button>
       <button class="btn ghost" id="deepBtn">◎ Deep scan</button>
+      <button class="btn ghost" id="devTop">⚡ Developer mode</button>
       <button class="btn ghost" id="checkAll">Run all checks</button>
     </div>
   </header>
@@ -608,6 +611,11 @@ function renderPerf(){
       <div><span class="k">Memory pressure</span><span class="lvl ${esc(s.pressure)}">${esc(s.pressure)}</span>${s.mem_free_pct!=null?` · ${s.mem_free_pct}% free`:""}</div>
       <div><span class="k">Swap</span>${human(s.swap_used)} <span style="opacity:.6">of ${human(s.swap_total)}</span></div>
       <div><span class="k">Thermal</span><span class="lvl ${esc(t.state)}">${esc(t.state)}</span>${s.low_power?" · Low Power Mode":""}</div></div>`;
+  const dm = perf.devmode, hm = ts => new Date(ts*1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+  h += `<div class="focusbar dev ${dm.active?"on":""}"><div class="t">` + (dm.active
+      ? `<b>Developer mode on</b> · ${dm.stopped.length ? "stopped " + esc(dm.stopped.join(", ")) + " · " : ""}${dm.paused} paused · ${dm.motion ? "animations off" : "animations unchanged"}${dm.awake ? " · staying awake" : ""}<small>Since ${hm(dm.since)}. Turns off by itself at ${hm(dm.until)}; Turn off puts every setting back and restarts what it stopped.</small>`
+      : `<b>Developer mode</b> · one switch: stop idle services, pause apps that aren't dev tools, turn off animations, keep the Mac awake<small>Turn off puts everything back (automatically after ${dm.hours} h). Paused apps may show as Not Responding.</small>`) +
+    `</div>${dm.active ? '<button class="btn primary sm" id="devOff">Turn off</button>' : '<button class="btn primary sm" id="devOn">Turn on</button>'}</div>`;
   const fo = perf.focus;
   h += `<div class="focusbar ${fo.active?"on":""}"><div class="t">` + (fo.active
       ? `<b>Dev focus on</b> · ${fo.count} process${fo.count===1?"":"es"} paused: ${esc(fo.names.join(", "))}<small>Resumes by itself at ${new Date(fo.until*1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"})}, or when you close Mac Cleanup. Paused apps may show as Not Responding.</small>`
@@ -638,6 +646,8 @@ function renderPerf(){
     ev.preventDefault(); const it = perf.items[+el.dataset.p]; if (it.risk === "system") return;
     perfPick.has(it.id) ? perfPick.delete(it.id) : perfPick.add(it.id); renderPerf();
   });
+  if ($("devOn")) $("devOn").onclick = devOn;
+  if ($("devOff")) $("devOff").onclick = devOff;
   if ($("focusOn")) $("focusOn").onclick = focusOn;
   if ($("focusResume")) $("focusResume").onclick = focusResume;
   if ($("perfStop")){
@@ -677,6 +687,33 @@ async function focusResume(){
   catch(e){ toast("Resume failed: " + e.message); }
   checkPerf(perf.before === "heavy");
 }
+async function devOn(){
+  const btn = $("devOn") || $("devTop"); busy(btn, true);
+  try {
+    const p = await api("/api/devmode/plan", {});
+    if (!confirm(`Start Developer mode?\n\n` +
+                 `Stops: ${p.stop.join(", ") || "nothing"}\nPauses: ${p.pause.join(", ") || "nothing"}\n` +
+                 (p.motion ? "Turns off animations: Reduce Motion & Transparency, window, Dock and Finder animations\n" : "") +
+                 (p.awake ? "Keeps the Mac awake for long builds\n" : "") +
+                 `\nTurn off puts everything back (automatically after ${p.hours} h). Paused apps may show as Not Responding.` +
+                 (p.advice.length ? "\n\nAlso worth doing yourself:\n" + p.advice.map(a => "• " + a).join("\n") : ""))) return;
+    const r = await api("/api/devmode/on", {});
+    toast("Developer mode on");
+    if (r.status.failed.length) alert("Some settings couldn't be changed (use System Settings > Accessibility > Display):\n\n" + r.status.failed.join("\n"));
+  } catch(e){ toast("Developer mode failed: " + e.message); }
+  finally { busy(btn, false); }
+  checkPerf(false);
+}
+async function devOff(){
+  busy($("devOff"), true);
+  try {
+    const r = await api("/api/devmode/off", {});
+    toast(`Developer mode off · resumed ${r.resumed} · restored ${r.restored} setting(s)`);
+    if (r.not_restarted && r.not_restarted.length) alert("Not restarted automatically (start when you need them):\n\n" + r.not_restarted.join("\n"));
+  } catch(e){ toast("Failed: " + e.message); }
+  checkPerf(false);
+}
+$("devTop").onclick = () => { $("perf").scrollIntoView({behavior:"smooth", block:"start"}); devOn(); };
 $("perfBtn").onclick = () => checkPerf(false); $("perfHeavyBtn").onclick = () => checkPerf(true);
 
 $("secBtn").onclick = checkSec; $("netBtn").onclick = checkNet;
