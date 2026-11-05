@@ -151,6 +151,44 @@ def t_kill_process(a):
     return mg.kill_process(a["pid"], a["exe"], a.get("force", False))
 
 
+def t_network_monitor_status(a):
+    return mg.netlog_status()
+
+
+def _history(a):
+    rows = mg.netlog_rows(a.get("days", 7), a.get("process"))
+    names = mg.resolve_names({r["rhost"] for r in rows}) if a.get("resolve", True) else {}
+    return rows, names
+
+
+def t_network_history(a):
+    rows, names = _history(a)
+    out = mg.netlog_summary(rows, names, a.get("limit", 20))
+    out["recorder"] = mg.netlog_status()
+    if not rows:
+        out["hint"] = "No history yet: the user can run `macguard netmon`, or `macguard settings background_watcher on` to record all the time."
+    return out
+
+
+def t_network_alerts(a):
+    rows, names = _history(a)
+    return {"days": a.get("days", 7), "findings": mg.findings_json(mg.analyze_netlog(rows, names)),
+            "note": "Built from sampled socket tables: very short connections between samples are not seen."}
+
+
+def t_network_record(a):
+    seconds, interval = a.get("seconds", 10), a.get("interval", 2)
+    rec = mg.NetRecorder()
+    end, samples = time.time() + seconds, 0
+    while True:
+        rec.sample()
+        samples += 1
+        if time.time() + interval > end:
+            break
+        time.sleep(interval)
+    return {"samples": samples, "status": mg.netlog_status()}
+
+
 def t_doctor(a):
     return {"checks": [{"ok": ok, "name": n, "detail": d} for ok, n, d in mg.doctor_checks()]}
 
@@ -200,6 +238,26 @@ TOOLS = [
            "force": {"type": "boolean", "default": False}, "confirm": {"type": "boolean", "description": "Must be true"}},
           ("pid", "exe", "confirm")),
      {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False}, t_kill_process),
+    ("network_monitor_status", "Is the connection recorder running, and how many days of network history exist.",
+     _obj(), READ_ONLY, t_network_monitor_status),
+    ("network_history", "Recorded network connections over the last N days: connections per day, top programs and "
+     "top destination IPs (with reverse-DNS names, ports, which programs, days seen, first/last seen, bytes up/down). "
+     "Read-only.",
+     _obj({"days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 7},
+           "process": {"type": "string", "description": "Only programs whose name or path contains this"},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+           "resolve": {"type": "boolean", "default": True, "description": "Reverse-DNS the IPs (local resolver)"}}),
+     READ_ONLY, t_network_history),
+    ("network_alerts", "Risky traffic in the recorded history: suspicious ports, programs in temp/download folders, "
+     "unsigned or deleted programs online, inbound connections from the internet, unencrypted protocols, uncommon "
+     "ports, and destinations first seen in the last 24h. Read-only.",
+     _obj({"days": {"type": "integer", "minimum": 1, "maximum": 90, "default": 7},
+           "process": {"type": "string"}, "resolve": {"type": "boolean", "default": True}}), READ_ONLY, t_network_alerts),
+    ("network_record", "Sample the connection table now for a few seconds and add it to the history (useful when the "
+     "background recorder is off). Only writes macguard's own history file.",
+     _obj({"seconds": {"type": "integer", "minimum": 1, "maximum": 120, "default": 10},
+           "interval": {"type": "integer", "minimum": 1, "maximum": 30, "default": 2}}),
+     {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_network_record),
     ("doctor", "Check prerequisites (system Python, socket visibility, required and optional tools).", _obj(), READ_ONLY, t_doctor),
     ("recent_events", "Recent macguard events (cleanups, watcher alerts) and current settings.",
      _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 30}}), READ_ONLY, t_recent_events),
@@ -233,7 +291,7 @@ def handle(msg):
         result = {"protocolVersion": want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                   "capabilities": {"tools": {"listChanged": False}},
                   "serverInfo": {"name": "mac-cleanup", "version": mg.__version__},
-                  "instructions": "Disk cleanup, heavy processes, security, apps and network checks for this Mac. Everything "
+                  "instructions": "Disk cleanup, heavy processes, network history (network_history / network_alerts), security, apps and network checks for this Mac. Everything "
                                   "is read-only except apply_cleanup and kill_process: show the user the plan or process "
                                   "first and act only after they agree."}
     elif method == "ping":

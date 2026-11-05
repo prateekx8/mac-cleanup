@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import macguard_mcp as mcp  # noqa: E402
-from test_macguard import TempHome, PROC  # noqa: E402
+from test_macguard import TempHome, PROC, SK  # noqa: E402
 
 mg = mcp.mg
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,7 +41,8 @@ class TestProtocol(unittest.TestCase):
         odd = mcp.handle(rpc("initialize", {"protocolVersion": "1999-01-01"}))
         self.assertEqual(odd["result"]["protocolVersion"], mcp.PROTOCOL_VERSIONS[0])
         tools = {t["name"]: t for t in mcp.handle(rpc("tools/list"))["result"]["tools"]}
-        self.assertTrue({"scan_junk", "plan_cleanup", "apply_cleanup", "process_check", "kill_process",
+        self.assertTrue({"scan_junk", "plan_cleanup", "apply_cleanup", "process_check", "kill_process", "network_history",
+                         "network_alerts", "network_record", "network_monitor_status",
                          "security_audit", "network_snapshot", "apps_audit", "traffic_sample"} <= set(tools))
         destructive = {n for n, t in tools.items() if t["annotations"].get("destructiveHint")}
         self.assertEqual(destructive, {"apply_cleanup", "kill_process"})
@@ -139,6 +140,27 @@ class TestProcessTools(Quiet):
             r = call("kill_process", {"pid": 456, "exe": "/usr/sbin/coreaudiod", "confirm": True})["structuredContent"]
             self.assertFalse(r["ok"])
             k.assert_not_called()
+
+
+class TestNetworkTools(Quiet):
+    def test_history_alerts_and_record(self):
+        empty = call("network_history", {"resolve": False})["structuredContent"]
+        self.assertIn("hint", empty)
+        socks = [SK("5.5.5.5", 4444, pid=10, tx=100)]
+        with mock.patch.object(mg, "sockets", return_value=socks), \
+                mock.patch.object(mg, "process_table", return_value=[PROC(10, "/opt/tool")]):
+            rec = call("network_record", {"seconds": 1, "interval": 1})["structuredContent"]
+        self.assertEqual(rec["samples"], 1)
+        self.assertEqual(rec["status"]["days_with_data"], 1)
+        hist = call("network_history", {"resolve": False})["structuredContent"]
+        self.assertEqual(hist["destinations"][0]["ip"], "5.5.5.5")
+        self.assertEqual(hist["totals"]["connections"], 1)
+        with mock.patch.object(mg, "signature", return_value="developer:Acme"):
+            alerts = call("network_alerts", {"resolve": False})["structuredContent"]["findings"]
+        self.assertEqual(alerts[0]["sev"], "high")
+        self.assertIn("4444", alerts[0]["title"])
+        self.assertEqual(call("network_history", {"process": "nothing-like-this", "resolve": False})
+                         ["structuredContent"]["totals"]["connections"], 0)
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS only")
