@@ -48,6 +48,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 HOME = os.path.expanduser("~")
@@ -3388,6 +3389,42 @@ def cmd_ui(args):
             if self.path.split("?")[0] == "/api/perf":
                 return self.send(200, dict(perf_json(perf_report("heavy" if self.path.endswith("?before=heavy") else None)),
                                            focus=focus_status(), devmode=devmode_status()))
+            if self.path.split("?")[0] == "/api/netlog":
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                d = (q.get("days") or ["7"])[0]
+                days = max(1, min(NETLOG_KEEP_DAYS, int(d) if d.isdigit() else 7))
+                rows = netlog_rows(days)
+                names = resolve_names({r["rhost"] for r in rows})
+                return self.send(200, dict(netlog_summary(rows, names, 15), days=days, status=netlog_status(),
+                                           findings=findings_json(analyze_netlog(rows, names))))
+            if self.path.split("?")[0] in ("/api/captures", "/api/capture", "/api/capture/file"):
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).items()}
+                cap = capture_mod()
+                try:
+                    if self.path.startswith("/api/captures"):
+                        return self.send(200, {"captures": cap.list_captures(), "keylog": cap.keylog_status(),
+                                               "ifaces": cap.interfaces(), "iface": cap.default_iface()})
+                    if self.path.startswith("/api/capture?"):
+                        return self.send(200, cap.analyze(cid=q.get("id")))
+                    if "flow" in q:
+                        data, name = cap.flow_bytes(q.get("id"), int(q["flow"]), q.get("dir", "out")), \
+                            f"{q.get('id')}-flow{int(q['flow'])}-{q.get('dir', 'out')}.bin"
+                    else:
+                        path = cap.capture_path(q.get("id"))
+                        with open(path, "rb") as fh:
+                            data, name = fh.read(), os.path.basename(path)
+                except (ValueError, FileNotFoundError) as e:
+                    return self.send(404, {"error": str(e)})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.tcpdump.pcap" if name.endswith(".pcap") else "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                return self.wfile.write(data)
+            if self.path == "/api/procs":
+                procs = heavy_processes()
+                return self.send(200, [{k: p[k] for k in ("pid", "name", "exe", "cpu", "mem", "elapsed", "kind",
+                                                          "advice", "killable")} for p in procs])
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -3452,6 +3489,50 @@ def cmd_ui(args):
                     return self.send(409, {"error": str(e)})
                 return self.send(200, dict(view, moved=len(moved), freed=sum(n for _, n in moved),
                                            failed=[{"path": p.replace(HOME, "~"), "error": e} for p, e in failed]))
+            if self.path == "/api/netlog/record":
+                rec, end = NetRecorder(), time.time() + max(2, min(60, int(body.get("seconds") or 10)))
+                while True:
+                    rec.sample()
+                    if time.time() + 2 > end:
+                        break
+                    time.sleep(2)
+                return self.send(200, netlog_status())
+            if self.path == "/api/capture/start":
+                cap = capture_mod()
+                try:
+                    meta = cap.capture(body.get("seconds") or 30, body.get("iface") or None, body.get("preset") or "all",
+                                       (body.get("host") or "").strip() or None, body.get("port") or None,
+                                       (body.get("filter") or "").strip() or None)
+                except (ValueError, RuntimeError) as e:
+                    return self.send(409, {"error": str(e)})
+                return self.send(200, {"id": meta["id"], "size": meta["size"]})
+            if self.path == "/api/capture/save":
+                # copy a capture (or one flow's payload) to ~/Downloads and show it in Finder
+                cap = capture_mod()
+                try:
+                    cid = cap.capture_path(body.get("id")) and body["id"]
+                    if body.get("flow") is not None:
+                        data = cap.flow_bytes(cid, int(body["flow"]), body.get("dir", "out"))
+                        name = f"{cid}-flow{int(body['flow'])}-{body.get('dir', 'out')}.bin"
+                    else:
+                        with open(cap.capture_path(cid), "rb") as fh:
+                            data, name = fh.read(), f"macguard-{cid}.pcap"
+                except (ValueError, FileNotFoundError, KeyError, TypeError) as e:
+                    return self.send(404, {"error": str(e)})
+                dest = os.path.join(HOME, "Downloads", name)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as fh:
+                    fh.write(data)
+                os.chmod(dest, 0o600)
+                run(["open", "-R", dest])
+                return self.send(200, {"path": dest, "size": len(data)})
+            if self.path == "/api/procs/kill":
+                # SIGTERM only, and kill_process re-checks the pid/exe pair and refuses system processes
+                try:
+                    pid, exe = int(body["pid"]), str(body["exe"])
+                except (KeyError, TypeError, ValueError):
+                    return self.send(400, {"error": "pid and exe required"})
+                return self.send(200, kill_process(pid, exe))
             if self.path in ("/api/perf/focus/plan", "/api/perf/focus"):
                 # re-planned on the server every time: the page never names pids
                 with lock:
@@ -3537,6 +3618,16 @@ def cmd_mcp(args):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import macguard_mcp
     macguard_mcp.serve()
+
+
+def capture_mod():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import macguard_capture
+    return macguard_capture
+
+
+def cmd_capture(args):
+    capture_mod().cmd_capture(args)
 
 
 # ---------------------------------------------------------------- HTML report
@@ -3674,6 +3765,16 @@ def main():
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("netmon"); p.add_argument("--interval", type=int, default=5); p.add_argument("--seconds", type=int)
     p.set_defaults(fn=cmd_netmon)
+    p = sub.add_parser("capture", help="record packets (asks for admin) and show what was sent")
+    p.add_argument("--seconds", type=int, default=30); p.add_argument("--iface")
+    p.add_argument("--preset", choices=["all", "local", "plaintext"], default="all",
+                   help="local = only your LAN (IoT devices); plaintext = HTTP/MQTT/CoAP/DNS/... ports")
+    p.add_argument("--host", help="only traffic to/from this IP or name"); p.add_argument("--port", type=int)
+    p.add_argument("--filter", help="extra tcpdump filter expression")
+    p.add_argument("--list", action="store_true", help="list saved captures")
+    p.add_argument("--show", metavar="ID", help="analyze a saved capture"); p.add_argument("--file", help="analyze any classic .pcap")
+    p.add_argument("--payload", action="store_true", help="also print what was sent")
+    p.add_argument("--limit", type=int, default=25); p.set_defaults(fn=cmd_capture)
     p = sub.add_parser("netlog"); p.add_argument("--days", type=int, default=7); p.add_argument("--proc")
     p.add_argument("--limit", type=int, default=15); p.set_defaults(fn=cmd_netlog)
     p = sub.add_parser("procs"); p.add_argument("--cpu", type=float, default=HEAVY_CPU, help="CPU %% threshold")
