@@ -8,6 +8,8 @@ Commands:
   security             Security posture audit (firewall, SIP, launch agents, ...)
   apps                 Installed apps: broken/missing signatures, outdated, risky, EOL
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
+  netmon               Record every connection (program -> IP:port, bytes) into a day-by-day history
+  netlog               Report that history: requests per day, top programs/destinations, risky traffic
   procs                Heavy CPU/memory processes, which are safe to stop; --kill PID
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
@@ -32,6 +34,8 @@ import plistlib
 import re
 import shutil
 import signal
+import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -42,6 +46,7 @@ STATE_DIR = os.path.join(HOME, ".macguard")
 BASELINE = os.path.join(STATE_DIR, "baseline.json")
 EVENTS_LOG = os.path.join(STATE_DIR, "events.log")
 SETTINGS = os.path.join(STATE_DIR, "settings.json")
+NETLOG_DB = os.path.join(STATE_DIR, "netlog.db")
 AGENT_LABEL = "ai.macguard.watch"
 AGENT_PLIST = os.path.join(HOME, "Library/LaunchAgents", AGENT_LABEL + ".plist")
 
@@ -420,7 +425,7 @@ def sockets():
     """All TCP/UDP sockets system-wide (netstat -anv shows every process, no sudo needed)."""
     rows = []
     for proto in ("tcp", "udp"):
-        _, out, _ = run(["netstat", "-anv", "-p", proto])
+        _, out, _ = run(["netstat", "-anvW", "-p", proto])  # -W: no truncated IPv6
         for line in out.splitlines():
             parts = line.split()
             if not parts or not parts[0].startswith(proto):
@@ -930,6 +935,280 @@ def cmd_traffic(args):
     print_findings(analyze_traffic(procs, args.seconds))
 
 
+# ---------------------------------------------------------------- network monitor (history)
+
+# Samples the kernel socket table (no packet capture, no root). Closed TCP connections linger in TIME_WAIT
+# for about 30s, so sampling every 10s also catches most short requests; only UDP blips can slip through.
+NETLOG_INTERVAL = 10       # seconds between samples while the watcher runs
+NETLOG_KEEP_DAYS = 90
+LIVE_STATES = ("ESTABLISHED", "SYN_SENT", "SYN_RCVD", "CLOSE_WAIT", "FIN_WAIT_1", "FIN_WAIT_2", "LAST_ACK", "CLOSING",
+               "TIME_WAIT", "UDP")
+PLAINTEXT_PORTS = {21: "FTP", 23: "Telnet", 25: "SMTP", 80: "HTTP", 110: "POP3", 143: "IMAP", 389: "LDAP",
+                   1883: "MQTT", 5900: "VNC", 8080: "HTTP", 8000: "HTTP"}
+
+
+def netlog_db(path=None):
+    ensure_state()
+    db = sqlite3.connect(path or NETLOG_DB, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS conns (
+            day TEXT, exe TEXT, proc TEXT, rhost TEXT, rport INTEGER, direction TEXT, proto TEXT,
+            conns INTEGER DEFAULT 0, samples INTEGER DEFAULT 0, rx INTEGER DEFAULT 0, tx INTEGER DEFAULT 0,
+            first_seen REAL, last_seen REAL,
+            PRIMARY KEY (day, exe, rhost, rport, direction, proto));
+        CREATE INDEX IF NOT EXISTS conns_rhost ON conns (rhost);
+        CREATE TABLE IF NOT EXISTS hosts (ip TEXT PRIMARY KEY, name TEXT, resolved_at REAL);
+        CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+    """)
+    return db
+
+
+def ipv6_full_addrs():
+    """(pid, local port) -> full remote IPv6, from lsof. netstat cuts long IPv6 addresses to 16 characters;
+    lsof (no sudo) only sees the user's own processes, so others keep the short form."""
+    _, out, _ = run(["lsof", "-nP", "-i6", "-a", "-iTCP", "-iUDP"], timeout=20)
+    full = {}
+    for line in out.splitlines():
+        m = re.search(r"\]:(\d+)->\[([0-9a-fA-F:.%a-z0-9]+)\]:\d+", line)
+        f = line.split(None, 2)
+        if m and len(f) > 1 and f[1].isdigit():
+            full[(int(f[1]), int(m.group(1)))] = m.group(2)
+    return full
+
+
+class NetRecorder:
+    """Turns repeated socket-table samples into per-day counts: new connections, bytes, first/last seen."""
+
+    def __init__(self, db=None):
+        self.db = db or netlog_db()
+        # socket key -> (rx, tx) from the last sample, kept in the db so a restart does not count open sockets again
+        row = self.db.execute("SELECT v FROM meta WHERE k = 'prev'").fetchone()
+        try:
+            self.prev = {tuple(k): tuple(v) for k, v in json.loads(row["v"])} if row else {}
+        except (ValueError, TypeError):
+            self.prev = {}
+
+    def sample(self, now=None):
+        now = now or time.time()
+        socks = sockets()
+        exes = {p["pid"]: p["exe"] for p in process_table()}
+        listen = {s["lport"] for s in socks if s["state"] == "LISTEN"}
+        if any(":" in s["rhost"] and len(s["rhost"]) >= 16 for s in socks):
+            full = ipv6_full_addrs()
+            for s in socks:
+                f = full.get((s["pid"], s["lport"]))
+                if f and ":" in s["rhost"] and f.startswith(s["rhost"].rstrip(":")):
+                    s["rhost"] = f
+        agg, seen = {}, {}
+        for s in socks:
+            if s["state"] not in LIVE_STATES or s["rhost"] in ("*", "") or s["rhost"].startswith("127.") or s["rhost"] == "::1":
+                continue
+            key = (s["proto"], s["lhost"], s["lport"], s["rhost"], s["rport"], s["pid"])
+            old = self.prev.get(key)
+            seen[key] = (s["rx"], s["tx"])
+            rx, tx = (s["rx"], s["tx"]) if old is None else (max(0, s["rx"] - old[0]), max(0, s["tx"] - old[1]))
+            exe = exes.get(s["pid"]) or s["proc"] or "?"
+            direction = "in" if s["lport"] in listen else "out"
+            a = agg.setdefault((exe, s["rhost"], s["rport"] or 0, direction, s["proto"].rstrip("46")),
+                               {"proc": os.path.basename(exe), "conns": 0, "rx": 0, "tx": 0})
+            a["conns"] += old is None
+            a["rx"] += rx
+            a["tx"] += tx
+        self.prev = seen
+        day = dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO meta (k, v) VALUES ('prev', ?)", (json.dumps([[list(k), list(v)] for k, v in seen.items()]),))
+            self.db.executemany("""
+                INSERT INTO conns (day, exe, proc, rhost, rport, direction, proto, conns, samples, rx, tx, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT (day, exe, rhost, rport, direction, proto) DO UPDATE SET
+                    conns = conns + excluded.conns, samples = samples + 1, rx = rx + excluded.rx, tx = tx + excluded.tx,
+                    last_seen = excluded.last_seen""",
+                [(day, exe, a["proc"], rhost, rport, d, proto, a["conns"], a["rx"], a["tx"], now, now)
+                 for (exe, rhost, rport, d, proto), a in agg.items()])
+        return len(agg)
+
+    def prune(self, keep_days=NETLOG_KEEP_DAYS):
+        cutoff = (dt.date.today() - dt.timedelta(days=keep_days)).isoformat()
+        with self.db:
+            self.db.execute("DELETE FROM conns WHERE day < ?", (cutoff,))
+
+
+def netlog_rows(days=7, proc=None, db=None):
+    db = db or netlog_db()
+    cutoff = (dt.date.today() - dt.timedelta(days=days - 1)).isoformat()
+    q, params = "SELECT * FROM conns WHERE day >= ?", [cutoff]
+    if proc:
+        q += " AND (proc LIKE ? OR exe LIKE ?)"
+        params += [f"%{proc}%", f"%{proc}%"]
+    return [dict(r) for r in db.execute(q, params)]
+
+
+def resolve_names(ips, db=None, budget=4.0):
+    """Reverse DNS (PTR) for IPs, cached in the db. Local resolver only; unresolved IPs stay bare."""
+    db = db or netlog_db()
+    names = {r["ip"]: r["name"] for r in db.execute("SELECT ip, name FROM hosts")}
+    todo = [ip for ip in ips if ip not in names and not is_private(ip)][:60]
+    if todo:
+        def ptr(ip):
+            try:
+                return ip, socket.gethostbyaddr(ip)[0]
+            except (OSError, UnicodeError):
+                return ip, ""
+        ex = ThreadPoolExecutor(max_workers=16)
+        futs = [ex.submit(ptr, ip) for ip in todo]
+        deadline = time.time() + budget
+        done = []
+        for f in futs:
+            try:
+                done.append(f.result(timeout=max(0.01, deadline - time.time())))
+            except Exception:
+                pass
+        ex.shutdown(wait=False)
+        with db:
+            db.executemany("INSERT OR REPLACE INTO hosts (ip, name, resolved_at) VALUES (?, ?, ?)",
+                           [(ip, n, time.time()) for ip, n in done])
+        names.update(dict(done))
+    return names
+
+
+def netlog_summary(rows, names=None, limit=15):
+    names = names or {}
+    days, procs, dests = {}, {}, {}
+    for r in rows:
+        d = days.setdefault(r["day"], {"day": r["day"], "conns": 0, "rx": 0, "tx": 0, "dests": set(), "procs": set()})
+        d["conns"] += r["conns"]; d["rx"] += r["rx"]; d["tx"] += r["tx"]
+        d["dests"].add(r["rhost"]); d["procs"].add(r["exe"])
+        p = procs.setdefault(r["exe"], {"exe": r["exe"], "name": app_bundle(r["exe"]) or r["proc"], "conns": 0, "rx": 0, "tx": 0,
+                                        "dests": set(), "days": set(), "first_seen": r["first_seen"], "last_seen": r["last_seen"]})
+        h = dests.setdefault(r["rhost"], {"ip": r["rhost"], "name": names.get(r["rhost"], ""), "private": is_private(r["rhost"]),
+                                          "conns": 0, "rx": 0, "tx": 0, "ports": set(), "procs": set(), "days": set(),
+                                          "inbound": False, "first_seen": r["first_seen"], "last_seen": r["last_seen"]})
+        for x in (p, h):
+            x["conns"] += r["conns"]; x["rx"] += r["rx"]; x["tx"] += r["tx"]; x["days"].add(r["day"])
+            x["first_seen"] = min(x["first_seen"], r["first_seen"]); x["last_seen"] = max(x["last_seen"], r["last_seen"])
+        p["dests"].add(r["rhost"])
+        h["ports"].add(r["rport"]); h["procs"].add(p["name"]); h["inbound"] |= r["direction"] == "in"
+
+    def ts(t):
+        return dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+
+    def top(d, key):
+        return sorted(d.values(), key=lambda x: (-x[key], -(x["rx"] + x["tx"])))[:limit]
+    return {
+        "period": {"first_day": min(days) if days else None, "last_day": max(days) if days else None, "days_with_data": len(days)},
+        "totals": {"connections": sum(d["conns"] for d in days.values()), "destinations": len(dests), "programs": len(procs),
+                   "rx": sum(d["rx"] for d in days.values()), "tx": sum(d["tx"] for d in days.values())},
+        "per_day": [{**d, "dests": len(d["dests"]), "procs": len(d["procs"])} for _, d in sorted(days.items())],
+        "programs": [{**p, "dests": len(p["dests"]), "days": len(p["days"]), "first_seen": ts(p["first_seen"]),
+                      "last_seen": ts(p["last_seen"])} for p in top(procs, "conns")],
+        "destinations": [{**h, "ports": sorted(h["ports"])[:10], "procs": sorted(h["procs"])[:6], "days": len(h["days"]),
+                          "first_seen": ts(h["first_seen"]), "last_seen": ts(h["last_seen"])} for h in top(dests, "conns")],
+    }
+
+
+def analyze_netlog(rows, names=None, now=None):
+    """Findings over recorded history: (severity, title, detail), one per program+issue."""
+    names, now = names or {}, now or time.time()
+    first_day = min((r["day"] for r in rows), default=None)
+    first_seen_host = {}
+    for r in rows:
+        first_seen_host[r["rhost"]] = min(first_seen_host.get(r["rhost"], r["first_seen"]), r["first_seen"])
+    found = {}
+
+    def add(sev, title, exe, what):
+        found.setdefault((sev, title, exe), set()).add(what)
+    for r in rows:
+        if is_private(r["rhost"]):
+            continue
+        exe, port = r["exe"], r["rport"]
+        dest = f"{names.get(r['rhost']) or r['rhost']}:{port}"
+        browser = any(b.lower() in exe.lower() for b in BROWSERS)
+        sig = signature(exe) if exe.startswith("/") else ("missing" if exe != "?" else "unknown")
+        if port in SUSPICIOUS_PORTS or (r["direction"] == "in" and r["rport"] in SUSPICIOUS_PORTS):
+            add("high", f"Traffic on suspicious port {port} ({SUSPICIOUS_PORTS.get(port, '?')})", exe, dest)
+        if exe.startswith(SUSPICIOUS_EXE_DIRS):
+            add("high", "Program in a temp/download folder used the internet", exe, dest)
+        elif sig == "adhoc" and (exe.startswith(("/opt/homebrew/", "/usr/local/")) or "/.venv/" in exe or "/venv/" in exe):
+            add("low", "Ad-hoc signed Homebrew/venv program used the internet", exe, dest)  # normal for local builds
+        elif sig in ("unsigned", "adhoc"):
+            add("medium", f"{'Unsigned' if sig == 'unsigned' else 'Ad-hoc signed'} program used the internet", exe, dest)
+        elif sig == "missing":
+            add("medium", "Program that no longer exists on disk used the internet", exe, dest)
+        if r["direction"] == "in":
+            add("medium", "Inbound connection from the internet", exe, dest)
+        if port in PLAINTEXT_PORTS and sig != "apple" and r["direction"] == "out":
+            add("low", f"Unencrypted {PLAINTEXT_PORTS[port]} to the internet", exe, dest)
+        elif port and port not in COMMON_PORTS and port not in SUSPICIOUS_PORTS and port < 49152 and not browser \
+                and r["direction"] == "out":
+            add("low", "Traffic on an uncommon port", exe, dest)
+        if first_day and r["day"] > first_day and now - first_seen_host[r["rhost"]] < 86400 and sig not in ("apple",):
+            add("info", "New destination in the last 24h", exe, dest)
+    out = []
+    for (sev, title, exe), whats in found.items():
+        name = app_bundle(exe) or os.path.basename(exe)
+        w = sorted(whats)
+        out.append((sev, title, f"{name} -> {', '.join(w[:5])}" + (f" (+{len(w) - 5} more)" if len(w) > 5 else "") + f" [{exe}]"))
+    return out
+
+
+def netlog_status(db=None):
+    db = db or netlog_db()
+    r = db.execute("SELECT MIN(day) a, MAX(day) b, COUNT(DISTINCT day) n, COUNT(*) rows, MAX(last_seen) t FROM conns").fetchone()
+    s = load_settings()
+    running = run(["launchctl", "print", f"gui/{os.getuid()}/{AGENT_LABEL}"])[0] == 0
+    return {"recording": running, "background_watcher": s["background_watcher"], "sample_every_seconds": NETLOG_INTERVAL,
+            "first_day": r["a"], "last_day": r["b"], "days_with_data": r["n"], "rows": r["rows"],
+            "last_sample": dt.datetime.fromtimestamp(r["t"]).strftime("%Y-%m-%d %H:%M:%S") if r["t"] else None,
+            "keeps_days": NETLOG_KEEP_DAYS, "db": NETLOG_DB}
+
+
+def cmd_netmon(args):
+    rec = NetRecorder()
+    rec.prune()
+    print(f"Recording connections every {args.interval}s into {NETLOG_DB}" + ("" if args.seconds else "  (Ctrl-C to stop)"), flush=True)
+    end = time.time() + args.seconds if args.seconds else None
+    try:
+        while True:
+            n = rec.sample()
+            print(f"{dt.datetime.now():%H:%M:%S}  {n} active destinations", flush=True)
+            if end and time.time() + args.interval > end:
+                return
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_netlog(args):
+    rows = netlog_rows(args.days, args.proc)
+    st = netlog_status()
+    if not rows:
+        print(f"No network history yet. Record with {C['B']}macguard netmon{C['x']}, or keep it running in the background:\n"
+              f"  {C['B']}macguard settings background_watcher on{C['x']}")
+        return
+    names = resolve_names({r["rhost"] for r in rows})
+    sm = netlog_summary(rows, names, args.limit)
+    t = sm["totals"]
+    print(f"{C['B']}Network history{C['x']}  {sm['period']['first_day']} .. {sm['period']['last_day']} "
+          f"({sm['period']['days_with_data']} days with data; recorder {'on' if st['recording'] else 'off'})")
+    print(f"  {t['connections']} connections by {t['programs']} programs to {t['destinations']} addresses, "
+          f"{human(t['tx'])} up / {human(t['rx'])} down\n")
+    print(f"  {'day':<11} {'conns':>7} {'dests':>6} {'up':>8} {'down':>8}")
+    for d in sm["per_day"]:
+        print(f"  {d['day']:<11} {d['conns']:>7} {d['dests']:>6} {human(d['tx']):>8} {human(d['rx']):>8}")
+    print(f"\n{C['B']}Top programs{C['x']}")
+    for p in sm["programs"]:
+        print(f"  {p['conns']:>6} conns {p['dests']:>4} dests {p['days']:>3}d  {p['name'][:34]:<34} "
+              f"{C['d']}{human(p['tx'])} up, last {p['last_seen']}{C['x']}")
+    print(f"\n{C['B']}Top destinations{C['x']}")
+    for h in sm["destinations"]:
+        label = h["name"] or ("(local network)" if h["private"] else "")
+        print(f"  {h['conns']:>6} conns {h['days']:>3}d  {h['ip'][:39]:<39} {label[:40]:<40} "
+              f"{C['d']}ports {','.join(map(str, h['ports'][:4]))} by {', '.join(h['procs'][:3])}{C['x']}")
+    print(f"\n{C['B']}Findings{C['x']}")
+    print_findings(analyze_netlog(rows, names))
+
 # ---------------------------------------------------------------- processes
 
 SYSTEM_DIRS = ("/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/", "/private/var/db/", "/Library/Developer/CoreSimulator/")
@@ -1101,6 +1380,8 @@ def cmd_watch(args):
         write_json(BASELINE, base)
         print(f"Baseline learned: {len(base['listeners'])} listeners, {len(base['talkers'])} programs using the internet.")
     reported = set()
+    recorder = NetRecorder()
+    recorder.prune()
     print(f"Watching every {args.interval}s. Events -> {EVENTS_LOG}  (Ctrl-C to stop)")
     while True:
         try:
@@ -1139,9 +1420,15 @@ def cmd_watch(args):
                     notify(title, detail)
             if events:
                 write_json(BASELINE, base)
+            recorder.sample()
             if args.once:
                 return
-            time.sleep(args.interval)
+            # keep the connection history fine-grained between the (slower) full checks
+            end = time.time() + args.interval
+            while time.time() + NETLOG_INTERVAL < end:
+                time.sleep(NETLOG_INTERVAL)
+                recorder.sample()
+            time.sleep(max(0, end - time.time()))
         except KeyboardInterrupt:
             return
 
@@ -1530,6 +1817,10 @@ def main():
     p = sub.add_parser("apps"); p.add_argument("--online", action="store_true", help="also check Apple for macOS updates")
     p.add_argument("--list", action="store_true", help="print every app"); p.set_defaults(fn=cmd_apps)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
+    p = sub.add_parser("netmon"); p.add_argument("--interval", type=int, default=5); p.add_argument("--seconds", type=int)
+    p.set_defaults(fn=cmd_netmon)
+    p = sub.add_parser("netlog"); p.add_argument("--days", type=int, default=7); p.add_argument("--proc")
+    p.add_argument("--limit", type=int, default=15); p.set_defaults(fn=cmd_netlog)
     p = sub.add_parser("procs"); p.add_argument("--cpu", type=float, default=HEAVY_CPU, help="CPU %% threshold")
     p.add_argument("--mem-mb", type=int, default=HEAVY_MEM >> 20, help="memory threshold in MB")
     p.add_argument("--kill", type=int, metavar="PID"); p.add_argument("--force", action="store_true")

@@ -46,6 +46,7 @@ class TempHome(unittest.TestCase):
             mock.patch.object(mg, "BASELINE", os.path.join(state, "baseline.json")),
             mock.patch.object(mg, "EVENTS_LOG", os.path.join(state, "events.log")),
             mock.patch.object(mg, "SETTINGS", os.path.join(state, "settings.json")),
+            mock.patch.object(mg, "NETLOG_DB", os.path.join(state, "netlog.db")),
             mock.patch.object(mg, "AGENT_PLIST", os.path.join(self.home, "agent.plist")),
             mock.patch.object(mg, "notify", lambda *a: None),
         ]
@@ -269,7 +270,7 @@ def SNAP(listeners=(), conns=(), arp=(), gateway="192.168.1.1", gw_mac="aa:aa:aa
 
 class TestNetworkParsing(unittest.TestCase):
     def test_sockets_parses_netstat(self):
-        with mock.patch.object(mg, "run", fake_run({"netstat -anv -p tcp": NETSTAT_TCP})):
+        with mock.patch.object(mg, "run", fake_run({"netstat -anvW -p tcp": NETSTAT_TCP})):
             rows = mg.sockets()
         self.assertEqual(len(rows), 4)
         redis = rows[0]
@@ -776,6 +777,142 @@ class TestDoctorAndReport(TempHome):
         page = mg.read_text(out)
         self.assertIn("Firewall &lt;off&gt;", page)  # escaped
         self.assertIn("Screen Sharing (VNC) exposed", page)
+
+
+# ---------------------------------------------------------------- network monitor (history)
+
+def SK(rhost, rport, lport=50000, pid=10, rx=0, tx=0, state="ESTABLISHED", proto="tcp4", proc="x"):
+    return dict(proto=proto, lhost="192.168.1.4", lport=lport, rhost=rhost, rport=rport, state=state, proc=proc, pid=pid, rx=rx, tx=tx)
+
+
+def ROW(rhost, rport, exe="/Applications/A.app/Contents/MacOS/A", day=None, direction="out", conns=1, first=None, rx=0, tx=0):
+    t = first or time.time() - 3600
+    return dict(day=day or time.strftime("%Y-%m-%d"), exe=exe, proc=os.path.basename(exe), rhost=rhost, rport=rport,
+                direction=direction, proto="tcp", conns=conns, samples=1, rx=rx, tx=tx, first_seen=t, last_seen=t)
+
+
+class TestNetMonitor(TempHome):
+    def record(self, rec, socks, now=None):
+        table = [PROC(10, "/Applications/A.app/Contents/MacOS/A"), PROC(11, "/opt/tool")]
+        with mock.patch.object(mg, "sockets", return_value=socks), mock.patch.object(mg, "process_table", return_value=table):
+            return rec.sample(now)
+
+    def test_recorder_counts_new_connections_and_byte_deltas(self):
+        rec = mg.NetRecorder()
+        listen = SK("*", None, lport=8080, pid=11, state="LISTEN")
+        self.record(rec, [listen, SK("1.1.1.1", 443, rx=100, tx=10), SK("127.0.0.1", 5432), SK("::1", 80),
+                          SK("203.0.113.9", 51000, lport=8080, pid=11, rx=5)])
+        # same socket again (more bytes) + a second new connection to the same place
+        self.record(rec, [listen, SK("1.1.1.1", 443, rx=300, tx=10), SK("1.1.1.1", 443, lport=50001, rx=50)])
+        rows = {(r["rhost"], r["direction"]): r for r in mg.netlog_rows(1)}
+        self.assertEqual(set(rows), {("1.1.1.1", "out"), ("203.0.113.9", "in")})  # loopback skipped
+        out = rows[("1.1.1.1", "out")]
+        self.assertEqual((out["conns"], out["samples"], out["rx"], out["tx"]), (2, 2, 350, 10))
+        # a restarted recorder (new process) must not count still-open sockets again
+        self.record(mg.NetRecorder(), [listen, SK("1.1.1.1", 443, rx=300, tx=10), SK("1.1.1.1", 443, lport=50001, rx=50,
+                                                                                      state="TIME_WAIT")])
+        out = {(r["rhost"], r["direction"]): r for r in mg.netlog_rows(1)}[("1.1.1.1", "out")]
+        self.assertEqual((out["conns"], out["rx"]), (2, 350))
+        self.assertEqual(out["proc"], "A")
+        self.assertEqual(rows[("203.0.113.9", "in")]["exe"], "/opt/tool")
+
+    def test_truncated_ipv6_is_completed_from_lsof(self):
+        with mock.patch.object(mg, "ipv6_full_addrs", return_value={(10, 50000): "2001:4860:4860::8888"}):
+            self.record(mg.NetRecorder(), [SK("2001:4860:4860::", 443, proto="tcp6"), SK("2600:1901:0:9e23", 443, lport=1, proto="tcp6")])
+        self.assertEqual(sorted(r["rhost"] for r in mg.netlog_rows(1)), ["2001:4860:4860::8888", "2600:1901:0:9e23"])
+
+    def test_lsof_parsing(self):
+        out = ("COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n"
+               "claude 581 me 10u IPv6 0x1 0t0 TCP [2401:4900::966a]:57684->[2600:1901:0:9e23::]:443 (ESTABLISHED)\n"
+               "rapportd 700 me 4u IPv6 0x2 0t0 TCP *:49152 (LISTEN)\n")
+        with mock.patch.object(mg, "run", return_value=(0, out, "")):
+            self.assertEqual(mg.ipv6_full_addrs(), {(581, 57684): "2600:1901:0:9e23::"})
+
+    def test_days_are_kept_apart_and_pruned(self):
+        rec = mg.NetRecorder()
+        old = time.time() - 100 * 86400
+        self.record(rec, [SK("1.1.1.1", 443)], now=old)
+        self.record(rec, [SK("1.1.1.1", 443, lport=50002)])
+        self.assertEqual(len(mg.netlog_rows(365)), 2)
+        rec.prune(90)
+        self.assertEqual(len(mg.netlog_rows(365)), 1)
+        self.assertEqual(mg.netlog_status()["days_with_data"], 1)
+
+    def test_summary_per_day_programs_destinations(self):
+        y = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+        rows = [ROW("1.1.1.1", 443, conns=5, tx=100, day=y), ROW("1.1.1.1", 443, conns=3), ROW("8.8.8.8", 53, exe="/opt/tool"),
+                ROW("192.168.1.9", 445, direction="in")]
+        sm = mg.netlog_summary(rows, {"1.1.1.1": "one.one.one.one"})
+        self.assertEqual(sm["period"]["days_with_data"], 2)
+        self.assertEqual(sm["totals"]["connections"], 10)
+        self.assertEqual([d["conns"] for d in sm["per_day"]], [5, 5])
+        top = sm["destinations"][0]
+        self.assertEqual((top["ip"], top["name"], top["conns"], top["days"], top["procs"]), ("1.1.1.1", "one.one.one.one", 8, 2, ["A"]))
+        self.assertTrue(next(d for d in sm["destinations"] if d["ip"] == "192.168.1.9")["inbound"])
+        self.assertEqual(sm["programs"][0]["name"], "A")
+
+    def test_analyze_flags_risky_traffic(self):
+        y = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+        rows = [ROW("9.9.9.9", 443, day=y, first=time.time() - 2 * 86400),           # old, fine
+                ROW("5.5.5.5", 4444),                                                # suspicious port
+                ROW("6.6.6.6", 443, exe=mg.HOME + "/Downloads/evil"),               # temp/download folder
+                ROW("7.7.7.7", 80, exe="/opt/unsigned"),                             # unsigned + plaintext
+                ROW("8.8.4.4", 22, exe="/Applications/A.app/Contents/MacOS/A", direction="in"),  # inbound
+                ROW("4.4.4.4", 7777),                                                # uncommon port (+ new)
+                ROW("192.168.1.5", 4444)]                                            # private: ignored
+        rows.append(ROW("3.3.3.3", 443, exe="/opt/homebrew/bin/node"))
+        sig = {"/opt/unsigned": "unsigned", "/opt/homebrew/bin/node": "adhoc"}
+        with mock.patch.object(mg, "signature", side_effect=lambda e: sig.get(e, "developer:Acme")), \
+                mock.patch.object(mg.os.path, "exists", return_value=True):
+            f = {}
+            for s, t, d in mg.analyze_netlog(rows):
+                f[(s, t)] = f.get((s, t), "") + d + "\n"
+        titles = {t: s for s, t in f}
+        self.assertEqual(titles["Traffic on suspicious port 4444 (metasploit default)"], "high")
+        self.assertEqual(titles["Program in a temp/download folder used the internet"], "high")
+        self.assertEqual(titles["Unsigned program used the internet"], "medium")
+        self.assertEqual(titles["Inbound connection from the internet"], "medium")
+        self.assertEqual(titles["Unencrypted HTTP to the internet"], "low")
+        self.assertEqual(titles["Ad-hoc signed Homebrew/venv program used the internet"], "low")
+        self.assertEqual(titles["Traffic on an uncommon port"], "low")
+        self.assertIn("4.4.4.4:7777", f[("info", "New destination in the last 24h")])
+        self.assertFalse(any("192.168.1.5" in d for d in f.values()))
+        self.assertFalse(any("9.9.9.9" in d for d in f.values()))
+
+    def test_resolve_names_caches_and_skips_private(self):
+        calls = []
+
+        def ptr(ip):
+            calls.append(ip)
+            if ip == "1.1.1.1":
+                return ("one.one.one.one", [], [ip])
+            raise OSError("no PTR")
+        with mock.patch.object(mg.socket, "gethostbyaddr", side_effect=ptr):
+            n = mg.resolve_names({"1.1.1.1", "2.2.2.2", "192.168.1.1"})
+            mg.resolve_names({"1.1.1.1", "2.2.2.2"})
+        self.assertEqual(n["1.1.1.1"], "one.one.one.one")
+        self.assertEqual(n["2.2.2.2"], "")
+        self.assertEqual(sorted(calls), ["1.1.1.1", "2.2.2.2"])  # second call served from the cache
+
+    def test_watch_once_records_history(self):
+        snap = SNAP(conns=[CONN("1.1.1.1", 443)])
+        with mock.patch.object(mg, "net_snapshot", return_value=snap), \
+                mock.patch.object(mg, "sockets", return_value=[SK("1.1.1.1", 443)]), \
+                mock.patch.object(mg, "process_table", return_value=[PROC(10, "/opt/tool")]), \
+                mock.patch.object(mg, "signature", return_value="apple"):
+            quiet(mg.cmd_watch, argparse.Namespace(agent=False, reset=False, once=True, interval=1))
+        self.assertEqual([r["rhost"] for r in mg.netlog_rows(1)], ["1.1.1.1"])
+
+    def test_netlog_cli(self):
+        rec = mg.NetRecorder()
+        self.record(rec, [SK("1.1.1.1", 443, tx=2048)])
+        with mock.patch.object(mg, "resolve_names", return_value={"1.1.1.1": "one.one.one.one"}), \
+                mock.patch.object(mg, "signature", return_value="developer:Acme"):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                mg.cmd_netlog(argparse.Namespace(days=7, proc=None, limit=10))
+        self.assertIn("one.one.one.one", out.getvalue())
+        self.assertIn("1 connections by 1 programs", out.getvalue())
 
 
 # ---------------------------------------------------------------- processes
