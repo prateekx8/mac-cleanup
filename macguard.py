@@ -6,11 +6,15 @@ Commands:
   clean                Clean junk (dry-run unless --apply)
   net                  Network snapshot: listeners, connections, ARP/DNS, threats
   security             Security posture audit (firewall, SIP, launch agents, ...)
+  deepscan             Everything at once: health score, prioritised findings with fixes, new since last time
+                       (--clean also cleans the safe items, --traffic adds a live traffic sample)
   apps                 Installed apps: broken/missing signatures, outdated, risky, EOL
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
   netmon               Record every connection (program -> IP:port, bytes) into a day-by-day history
   netlog               Report that history: requests per day, top programs/destinations, risky traffic
   procs                Heavy CPU/memory processes, which are safe to stop; --kill PID
+  uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
+  kill APP             Quit an app and every process under it (helpers, children, launch agents)
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
   ui                   Small local web UI: scan, pick categories, clean, run checks
@@ -105,22 +109,38 @@ JUNK = [
     dict(id="maven", name="Maven repository", risk="review", paths=[f"{H}/.m2/repository"]),
     dict(id="cargo", name="Cargo registry cache", risk="safe", paths=[f"{H}/.cargo/registry/cache", f"{H}/.cargo/registry/src"]),
     dict(id="brew", name="Homebrew cache & old versions", risk="safe", paths=[f"{H}/Library/Caches/Homebrew"], cmd="brew cleanup -s --prune=all"),
-    dict(id="docker", name="Docker unused images/build cache", risk="safe", special="docker",
-         note="containers and volumes are kept; images re-download when needed"),
+    dict(id="docker-build-cache", name="Docker build cache", risk="safe", special="docker-build-cache",
+         note="next build is slower once"),
+    dict(id="docker-dangling", name="Docker dangling images (untagged)", risk="safe", special="docker-dangling"),
+    dict(id="docker-stopped", name="Docker stopped containers", risk="review", special="docker-stopped",
+         note="compose recreates one-shot jobs; check none hold data you need"),
+    dict(id="docker-unused-images", name="Docker images no container uses", risk="review", special="docker-unused-images"),
+    dict(id="docker-unused-volumes", name="Docker volumes no container uses", risk="review", special="docker-unused-volumes",
+         note="volumes hold data - deleting is permanent"),
     dict(id="user-logs", name="User logs", risk="safe", paths=[f"{H}/Library/Logs/*"]),
     dict(id="selenium-prisma", name="Selenium / Prisma / Puppeteer caches", risk="safe",
          paths=[f"{H}/.cache/selenium", f"{H}/.cache/prisma", f"{H}/.cache/puppeteer", f"{H}/.cache/ms-playwright"]),
     dict(id="jetbrains-old", name="Old JetBrains IDE versions", risk="safe", special="jetbrains"),
     dict(id="docker-install-tmp", name="Stuck Docker installer download", risk="review",
          paths=[f"{H}/Library/Application Support/com.docker.install/in_progress"], note="quit Docker Desktop first"),
+    dict(id="hf-models", name="Hugging Face model downloads", risk="review", paths=[f"{H}/.cache/huggingface/hub/models--*"],
+         note="re-downloaded when a model is next used"),
     dict(id="android-avd", name="Android emulator images (AVDs)", risk="review", paths=[f"{H}/.android/avd/*"]),
     dict(id="android-ndk-old", name="Old Android NDK versions", risk="review", special="ndk"),
-    dict(id="project-artifacts", name="Stale project build dirs (node_modules/target/build)", risk="review", special="projects"),
+    dict(id="project-artifacts", name="Stale project folders (node_modules/target/build, untouched 30+ days)", risk="review",
+         special="projects"),
+    dict(id="build-outputs", name="Build output in active projects (target, build, dist, .next, caches)", risk="review",
+         special="builds", note="optional - rebuilt on the next build; stop dev servers first"),
     dict(id="trash", name="Trash", risk="review", paths=[f"{H}/.Trash/*"]),
     dict(id="downloads-old", name="Downloads older than 90 days", risk="review", special="downloads"),
+    dict(id="app-leftovers", name="Leftovers from uninstalled apps", risk="review", special="orphans",
+         note="moved to the Trash, not deleted"),
 ]
 
-ARTIFACT_DIRS = {"node_modules", "target", ".next", ".nuxt", ".turbo", ".parcel-cache", "DerivedData", ".venv", "venv", "__pycache__", ".pytest_cache"}
+DEPENDENCY_DIRS = {"node_modules", ".venv", "venv"}  # slow to reinstall: only ever offered when the project is stale
+BUILD_DIRS = {"target", ".next", ".nuxt", ".turbo", ".parcel-cache", ".svelte-kit", ".angular", "DerivedData", "__pycache__",
+              ".pytest_cache", ".mypy_cache", ".ruff_cache", ".gradle"}
+ARTIFACT_DIRS = DEPENDENCY_DIRS | BUILD_DIRS
 # "build"/"dist" only count when next to a known build file, to avoid deleting real folders named build
 GUARDED_ARTIFACTS = {"build": ("build.gradle", "build.gradle.kts", "package.json", "CMakeLists.txt", "setup.py", "pyproject.toml"),
                      "dist": ("package.json", "setup.py", "pyproject.toml")}
@@ -146,7 +166,50 @@ def newest_mtime(project, skip):
     return newest
 
 
+def is_artifact(d, files):
+    """Is folder `d` (inside a dir containing `files`) a build/dependency output?"""
+    if d == "target":
+        return "Cargo.toml" in files or "pom.xml" in files
+    if d.startswith("cmake-build-"):
+        return "CMakeLists.txt" in files
+    return d in ARTIFACT_DIRS or (d in GUARDED_ARTIFACTS and any(f in files for f in GUARDED_ARTIFACTS[d]))
+
+
+_tracked_cache = {}
+
+
+def git_tracked_dirs(path):
+    """(repo top, set of folders holding git-tracked files) for the repo containing `path`; (None, set()) outside git."""
+    rc, top, _ = run(["git", "-C", path, "rev-parse", "--show-toplevel"], timeout=10)
+    top = top.strip() if rc == 0 else None
+    if not top:
+        return None, set()
+    if top not in _tracked_cache:
+        _, out, _ = run(["git", "-C", top, "ls-files", "-z"], timeout=60)
+        dirs = set()
+        for f in out.split("\0"):
+            parts = f.split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                dirs.add("/".join(parts[:i]))
+        _tracked_cache[top] = dirs
+    return top, _tracked_cache[top]
+
+
+def is_git_tracked(full):
+    """True when any file under `full` is committed - then it's source, not build output (e.g. a committed dist/)."""
+    top, dirs = git_tracked_dirs(os.path.dirname(full))
+    return bool(top) and os.path.relpath(os.path.realpath(full), os.path.realpath(top)) in dirs
+
+
+_artifact_cache = {}
+
+
 def find_project_artifacts(stale_days=30):
+    """Build and dependency folders in project roots; cached for a minute so one scan walks the disk once."""
+    hit = _artifact_cache.get(stale_days)
+    if hit and time.time() - hit[0] < 60:
+        return [dict(a) for a in hit[1]]
+    _tracked_cache.clear()
     found = []
     cutoff = time.time() - stale_days * 86400
     for base in project_roots():
@@ -157,19 +220,21 @@ def find_project_artifacts(stale_days=30):
             keep = []
             for d in dirs:
                 full = os.path.join(root, d)
-                is_art = d in ARTIFACT_DIRS or (d in GUARDED_ARTIFACTS and any(f in files for f in GUARDED_ARTIFACTS[d]))
-                if d == "target" and "Cargo.toml" not in files and "pom.xml" not in files:
-                    is_art = False
-                if is_art and not os.path.islink(full):
+                if is_artifact(d, files) and not os.path.islink(full):
+                    if is_git_tracked(full):
+                        continue  # committed output (e.g. a published dist/) is source - never offered
                     last = newest_mtime(root, d)
                     found.append({"path": full, "project": root, "stale": last < cutoff,
+                                  "kind": "deps" if d in DEPENDENCY_DIRS else "build",
                                   "last_touched": dt.datetime.fromtimestamp(last).strftime("%Y-%m-%d") if last else "?"})
                 elif not d.startswith(".") or d in (".github",):
                     keep.append(d)
             dirs[:] = keep
     for f in found:
         f["size"] = du(f["path"])
-    return sorted(found, key=lambda x: -x["size"])
+    found.sort(key=lambda x: -x["size"])
+    _artifact_cache[stale_days] = (time.time(), found)
+    return [dict(a) for a in found]
 
 
 def simctl_unavailable():
@@ -184,20 +249,83 @@ def simctl_unavailable():
     return items
 
 
-def docker_reclaimable():
-    rc, out, _ = run(["docker", "system", "df", "--format", "{{json .}}"], timeout=20)
-    if rc:
+def docker_size(text):
+    """'1.01GB' / '552MB' / '4.1kB (virtual 3.59GB)' -> bytes (docker reports decimal units)."""
+    m = re.match(r"\s*([\d.]+)\s*([kKMGT]?B)", text or "")
+    if not m:
         return 0
-    total = 0
-    for line in out.splitlines():
-        row = json.loads(line)
-        if row.get("Type") not in ("Images", "Build Cache"):  # containers and volumes hold data: never pruned
-            continue
-        m = re.match(r"([\d.]+)\s*([kKMGT]?B)", row.get("Reclaimable", "0B"))
-        if m:
-            mult = {"B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}.get(m.group(2), 1)
-            total += float(m.group(1)) * mult
-    return int(total)
+    return int(float(m.group(1)) * {"B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}[m.group(2)])
+
+
+def docker_lines(*args, timeout=30):
+    """JSON lines from a docker CLI call, [] when docker is missing or its engine isn't running."""
+    if not shutil.which("docker"):
+        return []
+    rc, out, _ = run(["docker", *args, "--format", "{{json .}}"], timeout=timeout)
+    rows = []
+    for line in out.splitlines() if rc == 0 else []:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows
+
+
+def docker_entries(kind):
+    """(display 'name (id)', bytes, label) per removable docker object of one kind."""
+    if kind == "docker-build-cache":
+        for row in docker_lines("system", "df"):
+            if row.get("Type") == "Build Cache":
+                n = docker_size(row.get("Reclaimable"))
+                return [("build cache", n, f"{row.get('TotalCount', '?')} entries")] if n else []
+        return []
+    if kind == "docker-stopped":
+        return [(f"{c['Names']} ({c['ID'][:12]})", docker_size(c.get("Size")), f"{c['Image']} - {c['Status']}")
+                for c in docker_lines("ps", "-a", "--filter", "status=exited", "--filter", "status=created", "--size")]
+    if kind == "docker-unused-volumes":
+        used = {m for c in docker_lines("ps", "-a") for m in (c.get("Mounts") or "").split(",") if m}
+        sizes = {}
+        for row in docker_lines("system", "df", "-v", timeout=60):
+            for v in row.get("Volumes") or []:
+                sizes[v.get("Name")] = docker_size(v.get("Size"))
+        return [(f"{v['Name']} (volume)", sizes.get(v["Name"], 0), v.get("Driver", ""))
+                for v in docker_lines("volume", "ls", "--filter", "dangling=true") if v["Name"][:20] not in {u[:20] for u in used}]
+    images = docker_lines("images", "--no-trunc")
+    in_use = {c.get("Image") for c in docker_lines("ps", "-a")} | {c.get("ImageID", "")[:19] for c in docker_lines("ps", "-a")}
+    out = []
+    for im in images:
+        iid = im["ID"].replace("sha256:", "")[:12]
+        name = f"{im['Repository']}:{im['Tag']}"
+        dangling = im["Repository"] == "<none>"
+        if kind == "docker-dangling" and dangling:
+            out.append((f"<none> ({iid})", docker_size(im.get("Size")), im.get("CreatedSince", "")))
+        elif kind == "docker-unused-images" and not dangling and name not in in_use and im["Repository"] not in in_use \
+                and not any(iid in (x or "") for x in in_use):
+            out.append((f"{name} ({iid})", docker_size(im.get("Size")), f"created {im.get('CreatedSince', '?')}"))
+    return out
+
+
+def docker_clean(kind, entries):
+    """Remove exactly the listed docker objects; returns bytes freed (as reported at scan time)."""
+    ids = [m.group(1) for d, _, _ in entries for m in [re.search(r"\(([0-9a-f]{12})\)$", d)] if m]
+    freed = 0
+    if kind == "docker-build-cache":
+        rc, _, _ = run(["docker", "builder", "prune", "-a", "-f"], timeout=900)
+        return sum(e[1] for e in entries) if rc == 0 else 0
+    if kind == "docker-unused-volumes":
+        for d, size, _ in entries:
+            name = d.rsplit(" (volume)", 1)[0]
+            if run(["docker", "volume", "rm", name], timeout=120)[0] == 0:
+                freed += size
+        return freed
+    cmd = ["docker", "rm"] if kind == "docker-stopped" else ["docker", "rmi"]
+    for (d, size, _), iid in zip([e for e in entries if re.search(r"\(([0-9a-f]{12})\)$", e[0])], ids):
+        rc, _, err = run(cmd + [iid], timeout=300)  # never --force: in-use objects stay
+        if rc == 0:
+            freed += size
+        else:
+            print(f"   {C['y']}kept{C['x']} {d}: {err.strip()[:120]}")
+    return freed
 
 
 def version_key(name):
@@ -223,9 +351,8 @@ def resolve(item, stale_days=30):
     sp = item.get("special")
     if sp == "simctl":
         paths = simctl_unavailable()
-    elif sp == "docker":
-        n = docker_reclaimable()
-        return [("docker image prune -a + builder prune", n, "unused images and build cache")] if n else []
+    elif sp and sp.startswith("docker-"):
+        return docker_entries(sp)
     elif sp == "jetbrains":
         paths = old_versions(f"{HOME}/Library/Application Support/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
             old_versions(f"{HOME}/Library/Caches/JetBrains/*", r"([A-Za-z]+)\d{4}\.\d+") + \
@@ -235,6 +362,11 @@ def resolve(item, stale_days=30):
     elif sp == "projects":
         return [(a["path"], a["size"], f"last edited {a['last_touched']}")
                 for a in find_project_artifacts(stale_days) if a["stale"] and a["size"] > 1 << 20]
+    elif sp == "orphans":
+        return orphan_leftovers()
+    elif sp == "builds":  # active projects only (stale ones are in "projects"), and never dependencies
+        return [(a["path"], a["size"], f"project edited {a['last_touched']}")
+                for a in find_project_artifacts(stale_days) if not a["stale"] and a["kind"] == "build" and a["size"] > 1 << 20]
     elif sp == "downloads":
         cutoff = time.time() - 90 * 86400
         out = []
@@ -251,50 +383,178 @@ def resolve(item, stale_days=30):
 
 
 def cmd_scan(args):
-    print(f"{C['B']}Disk{C['x']}")
-    _, out, _ = run(["df", "-k", "/System/Volumes/Data"])
-    f = out.splitlines()[-1].split()
-    total, used, avail = int(f[1]) * 1024, int(f[2]) * 1024, int(f[3]) * 1024
-    print(f"  Data volume: {human(used)} used / {human(total)}  ({human(avail)} free)\n")
-    results = scan_junk(args.stale_days, verbose=True)
-    safe = sum(r["size"] for r in results if r["risk"] == "safe")
-    review = sum(r["size"] for r in results if r["risk"] == "review")
+    print("Scanning (disk, caches, Docker, folder growth)...", flush=True)
+    rep = space_report(args.stale_days)
+    d = rep["disk"]
+    col = C["r"] if d["critical"] else (C["y"] if d["low"] else "")
+    print(f"\n{C['B']}Disk{C['x']}  {human(d['used'])} used / {human(d['total'])}  {col}({human(d['free'])} free){C['x']}")
+    if d["low"]:
+        print(f"  {col}{'CRITICAL' if d['critical'] else 'LOW'}: builds, updates and apps can start failing. Clean below.{C['x']}")
+    print()
+    for r in rep["results"]:
+        print_junk(r)
+    safe = sum(r["size"] for r in rep["results"] if r["risk"] == "safe")
+    review = sum(r["size"] for r in rep["results"] if r["risk"] == "review")
     print(f"\n{C['g']}Safe to clean: {human(safe)}{C['x']}   {C['y']}Needs review: {human(review)}{C['x']}")
-    print(f"\nTop space users not touched by cleanup (for your judgement):")
-    for p in big_dirs():
-        print(f"  {human(p[1]):>7}  {p[0]}")
+    if rep["since"] is not None:
+        print(f"\n{C['B']}Grew since {dt.datetime.fromtimestamp(rep['since']):%b %d %H:%M}{C['x']}")
+        for p, before, now in rep["grew"][:10]:
+            print(f"  {C['y']}+{human(now - before):>7}{C['x']}  {p}  {C['d']}({human(before)} -> {human(now)}){C['x']}")
+        if not rep["grew"]:
+            print(f"  {C['d']}nothing grew by more than 512M{C['x']}")
+    else:
+        print(f"\n{C['d']}Folder sizes saved; the next scan (an hour or more from now) shows what grew.{C['x']}")
+    if rep["managed"]:
+        print(f"\n{C['B']}Managed by apps (remove from the app itself){C['x']}")
+        for m in rep["managed"]:
+            print(f"  {human(m['size']):>7}  {m['name']}  {C['d']}- {m['how']}{C['x']}")
+    print(f"\n{C['B']}Largest folders{C['x']}")
+    for p, n in rep["big"]:
+        print(f"  {human(n):>7}  {p}")
     print(f"\nNext: {C['B']}macguard clean{C['x']} (dry-run)  ->  {C['B']}macguard clean --apply{C['x']}")
 
 
+def print_junk(r):
+    if r["size"] <= 0:
+        return
+    col = C["g"] if r["risk"] == "safe" else C["y"]
+    print(f"  {human(r['size']):>7}  {col}{r['risk']:<6}{C['x']} {r['id']:<22} {r['name']}"
+          + (f" {C['d']}({r['note']}){C['x']}" if r.get("note") else ""))
+    if r["risk"] == "review" or (r.get("special") or "").startswith(("docker-", "jetbrains", "ndk")):
+        for p, size, label in sorted(r["entries"], key=lambda e: -e[1])[:8]:
+            print(f"           {C['d']}{human(size):>7}  {p.replace(HOME, '~')}  {label}{C['x']}")
+
+
+def overlaps(a, b):
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+
+
 def scan_junk(stale_days=30, verbose=False):
-    results = []
-    for item in JUNK:
-        entries = resolve(item, stale_days)
-        size = sum(e[1] for e in entries)
-        results.append({**item, "entries": entries, "size": size})
-        if verbose and size > 0:
-            col = C["g"] if item["risk"] == "safe" else C["y"]
-            print(f"  {human(size):>7}  {col}{item['risk']:<6}{C['x']} {item['id']:<20} {item['name']}"
-                  + (f" {C['d']}({item['note']}){C['x']}" if item.get("note") else ""))
-            if item["risk"] == "review" or item.get("special") in ("jetbrains", "ndk"):
-                for p, s, label in sorted(entries, key=lambda e: -e[1])[:8]:
-                    print(f"           {C['d']}{human(s):>7}  {p.replace(HOME, '~')}  {label}{C['x']}")
+    results = [{**item, "entries": resolve(item, stale_days)} for item in JUNK]
+    # an app leftover that's already a more specific item (e.g. the stuck Docker installer) is listed once
+    claimed = [p for r in results if r["id"] != "app-leftovers" for p, _, _ in r["entries"] if p.startswith("/")]
+    for r in results:
+        if r["id"] == "app-leftovers":
+            r["entries"] = [e for e in r["entries"] if not any(overlaps(e[0], c) for c in claimed)]
+        r["size"] = sum(e[1] for e in r["entries"])
+        if verbose:
+            print_junk(r)
     return results
 
 
-def big_dirs():
-    cands = [f"{HOME}/Library/Application Support/*", f"{HOME}/Library/Containers/*", f"{HOME}/Library/Group Containers/*", f"{HOME}/.[!.]*"]
-    sizes = []
-    for pat in cands:
+LOW_DISK_BYTES = 10 * 1024 ** 3
+
+
+def disk_health(d=None):
+    """Free-space status: low under 10 GB or 10%, critical under 5 GB or 5%."""
+    d = dict(d or disk_info())
+    d["low"] = d["free"] < LOW_DISK_BYTES or d["free"] < d["total"] * 0.10
+    d["critical"] = d["free"] < LOW_DISK_BYTES / 2 or d["free"] < d["total"] * 0.05
+    return d
+
+
+def measure_dirs():
+    """Sizes of the folders that usually hide big growth: app data, containers, dot-dirs, projects."""
+    pats = [f"{HOME}/Library/Application Support/*", f"{HOME}/Library/Containers/*", f"{HOME}/Library/Group Containers/*",
+            f"{HOME}/.[!.]*", f"{HOME}/Downloads", f"{HOME}/Movies", f"{HOME}/Documents", f"{HOME}/Desktop"]
+    pats += [f"{r}/*" for r in project_roots()] + [f"{r}/*/*" for r in project_roots()]
+    sizes = {}
+    for pat in pats:
         for p in glob.glob(pat):
-            if os.path.isdir(p) and not os.path.islink(p):
-                sizes.append((p.replace(HOME, "~"), du(p)))
-    return sorted(sizes, key=lambda x: -x[1])[:10]
+            if os.path.isdir(p) and not os.path.islink(p) and p.replace(HOME, "~") not in sizes:
+                n = du(p)
+                if n >= 50 * 1024 ** 2:
+                    sizes[p.replace(HOME, "~")] = n
+    return sizes
+
+
+def big_dirs(sizes=None, n=10):
+    sizes = sizes if sizes is not None else measure_dirs()
+    # parents and children both appear for project roots; keep the list readable
+    return sorted(sizes.items(), key=lambda x: -x[1])[:n]
+
+
+def sizes_file():
+    return os.path.join(STATE_DIR, "sizes.json")
+
+
+def record_sizes(sizes, keep=30):
+    ensure_state()
+    try:
+        hist = json.loads(read_text(sizes_file()))
+    except (OSError, ValueError):
+        hist = []
+    hist.append({"t": time.time(), "sizes": sizes})
+    write_json(sizes_file(), hist[-keep:])
+    return hist[:-1]
+
+
+def growth(sizes, history, min_delta=512 * 1024 ** 2, min_age=3600):
+    """Folders that grew by min_delta+ since the newest snapshot at least min_age old."""
+    older = [h for h in history if time.time() - h["t"] >= min_age]
+    if not older:
+        return None, []
+    base = older[-1]
+    rows = [(p, base["sizes"].get(p, 0), now) for p, now in sizes.items() if now - base["sizes"].get(p, 0) >= min_delta]
+    # drop a parent when one of its children explains the growth (DEV vs DEV/project)
+    rows = [r for r in rows if not any(o[0].startswith(r[0] + "/") for o in rows)]
+    return base["t"], sorted(rows, key=lambda r: -(r[2] - r[1]))
+
+
+def simulator_runtimes():
+    """Installed simulator runtimes as macOS counts them (`simctl runtime list`), not the raw Volumes folder."""
+    if not shutil.which("xcrun"):
+        return dict(size=0, runtimes=[])
+    _, out, _ = run(["xcrun", "simctl", "runtime", "list"], timeout=60)
+    runtimes = [dict(name=m.group(1).strip(), id=m.group(2))
+                for m in re.finditer(r"^(\S.*?\(\S+\)) - ([0-9A-F-]{36})", out, re.M)]
+    m = re.search(r"Total Disk Images: \d+ \(([\d.]+)\s*([KMGT])B?\)", out)
+    size = int(float(m.group(1)) * 1024 ** "KMGT".index(m.group(2)) * 1024) if m else 0
+    return dict(size=size, runtimes=runtimes)
+
+
+def managed_storage():
+    """Big data that its own app must remove - reported, never deleted by macguard."""
+    items = [
+        ("Claude Cowork workspace image", f"{HOME}/Library/Application Support/Claude/vm_bundles",
+         "Claude app > Settings > Storage > Remove (downloads again when Cowork is next used)"),
+        ("Docker Desktop virtual disk", f"{HOME}/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+         "Clean the Docker items above; space returns to macOS gradually. Cap it in Docker Desktop > Settings > Resources"),
+        ("Ollama models", f"{HOME}/.ollama/models", "ollama list, then ollama rm <model>"),
+        ("iPhone / iPad backups", f"{HOME}/Library/Application Support/MobileSync/Backup", "Finder > your device > Manage Backups"),
+        ("Xcode archives", f"{HOME}/Library/Developer/Xcode/Archives", "Xcode > Window > Organizer > Archives"),
+    ]
+    out = []
+    rt = simulator_runtimes()
+    if rt["size"] >= 100 * 1024 ** 2:
+        ids = "; ".join(f"{r['name']}: xcrun simctl runtime delete {r['id']}" for r in rt["runtimes"][:4])
+        out.append(dict(name=f"Simulator runtimes ({len(rt['runtimes'])})", path="xcrun simctl runtime list", size=rt["size"],
+                        how=ids or "xcrun simctl runtime list, then xcrun simctl runtime delete <id>"))
+    for name, path, how in items:
+        n = du(path) if os.path.exists(path) else 0
+        if n >= 100 * 1024 ** 2:
+            out.append(dict(name=name, path=path.replace(HOME, "~"), size=n, how=how))
+    _, snaps, _ = run(["tmutil", "listlocalsnapshots", "/"], timeout=20)
+    count = sum(1 for l in snaps.splitlines() if "com.apple" in l)
+    if count:
+        out.append(dict(name=f"{count} Time Machine local snapshot{'s' if count > 1 else ''}", path="/", size=0,
+                        how="macOS frees these when space runs low; tmutil thinlocalsnapshots / forces it"))
+    return sorted(out, key=lambda x: -x["size"])
+
+
+def space_report(stale_days=30):
+    """Everything a cleanup decision needs, in one pass."""
+    results = scan_junk(stale_days)
+    sizes = measure_dirs()
+    since, grew = growth(sizes, record_sizes(sizes))
+    return dict(disk=disk_health(), results=results, big=big_dirs(sizes), since=since, grew=grew, managed=managed_storage())
 
 
 def cmd_clean(args):
     results = scan_junk(args.stale_days)
     wanted = set(args.only.split(",")) if args.only else None
+    if getattr(args, "builds", False):
+        wanted = (wanted or set()) | {"build-outputs"}
     plan = [r for r in results if r["size"] > 0 and ((wanted and r["id"] in wanted) or (not wanted and r["risk"] == "safe"))]
     if not plan:
         print("Nothing to clean." + ("" if wanted else " (review-level items need --only <id>)"))
@@ -328,11 +588,15 @@ def clean_item(r):
     if sp == "simctl":
         run(["xcrun", "simctl", "delete", "unavailable"], timeout=600)
         return r["size"]
-    if sp == "docker":
-        # not `docker system prune`: that also deletes stopped containers (and the data in them)
-        run(["docker", "image", "prune", "-a", "-f"], timeout=600)
-        run(["docker", "builder", "prune", "-f"], timeout=600)
-        return r["size"]
+    if sp and sp.startswith("docker-"):
+        return docker_clean(sp, r["entries"])
+    if sp == "orphans":  # app data is recoverable from the Trash, unlike caches
+        entries = [(p, size) for p, size, _ in r["entries"] if p.startswith(HOME + "/Library/")]
+        result = trash_paths([p for p, _ in entries])
+        for p, err in result.items():
+            if err:
+                print(f"   {C['r']}failed{C['x']} {p}: {err}")
+        return sum(size for p, size in entries if p in result and not result[p])
     if r.get("cmd") and shutil.which(r["cmd"].split()[0]):
         run(r["cmd"], timeout=900)
     freed = 0
@@ -408,11 +672,26 @@ def split_addr(a):
     return host, (int(port) if port.isdigit() else None)
 
 
+_local_v6 = None
+
+
+def local_v6_prefixes():
+    """/48 prefixes of this Mac's global IPv6 addresses: peers inside them are on your own network."""
+    global _local_v6
+    if _local_v6 is None:
+        _, out, _ = run(["ifconfig"], timeout=10)
+        _local_v6 = {":".join(a.split(":")[:3]).lower() + ":" for a in re.findall(r"inet6 ([0-9a-fA-F:]+)", out)
+                     if not a.lower().startswith(("fe80", "fd", "fc", "::1")) and a.count(":") >= 3}
+    return _local_v6
+
+
 def is_private(host):
     if host in ("*", "127.0.0.1", "::1", "localhost"):
         return True
     # netstat truncates long IPv6 addresses, so classify link-local/ULA/multicast by prefix
     if host.lower().startswith(("fe80:", "fc", "fd", "ff0")) and ":" in host:
+        return True
+    if ":" in host and any(host.lower().startswith(p) for p in local_v6_prefixes()):
         return True
     try:
         ip = ipaddress.ip_address(host.split("%")[0])
@@ -640,10 +919,13 @@ def cmd_security(args, quiet=False):
             sig = signature(prog)
             if sig == "missing":
                 f.append(("low", "Orphaned launch item (program no longer exists)", f"{p} -> {prog}"))
-            elif sig in ("unsigned", "adhoc") and not prog.startswith("/opt/homebrew/"):
-                f.append(("medium", "Unsigned program starts automatically", f"{p} -> {prog}"))
-            elif prog.startswith(SUSPICIOUS_EXE_DIRS):
+            elif prog.startswith(SUSPICIOUS_EXE_DIRS):  # checked first: unsigned AND in a temp folder is the worst case
                 f.append(("high", "Auto-start program in temp/download folder", f"{p} -> {prog}"))
+            elif sig in ("unsigned", "adhoc") and not prog.startswith("/opt/homebrew/"):
+                if prog.startswith(HOME + "/") and p.startswith(HOME + "/"):  # user's own automation, most likely
+                    f.append(("low", "Your own unsigned script starts automatically (confirm it's yours)", f"{p} -> {prog}"))
+                else:
+                    f.append(("medium", "Unsigned program starts automatically", f"{p} -> {prog}"))
             if "ccleaner" in name.lower() or "mackeeper" in name.lower():
                 f.append(("info", "Third-party 'cleaner' with background daemons", f"{name} - consider uninstalling; macguard replaces it"))
     # secrets left in easily-synced/shared folders
@@ -659,11 +941,11 @@ def cmd_security(args, quiet=False):
                 continue
             if b"PRIVATE KEY" in head or name.endswith((".p12", ".pfx", ".ppk")) or name == ".env":
                 f.append(("medium", f"Private key / secret file in ~/{d}", f"{p.replace(HOME, '~')} - move to ~/.ssh or a password manager"))
-    # dedupe
+    # dedupe exact repeats only - two different keys (or launch items) are two findings
     seen, uniq = set(), []
     for x in f:
-        if x[:2] not in seen:
-            seen.add(x[:2])
+        if x not in seen:
+            seen.add(x)
             uniq.append(x)
     if not quiet:
         print(f"{C['B']}Security posture{C['x']}")
@@ -839,6 +1121,352 @@ def cmd_apps(args):
     print_findings(findings)
     if not args.online:
         print(f"\n{C['d']}Tip: --online also asks Apple for pending macOS security updates.{C['x']}")
+
+
+# ---------------------------------------------------------------- uninstall / app leftovers
+
+# ~/Library folders where apps keep per-app data, and how entries there are named
+LEFTOVER_PLACES = [
+    ("Application Support", "{id}"), ("Application Support", "{name}"),
+    ("Caches", "{id}"), ("Caches", "{name}"),
+    ("Preferences", "{id}.plist"), ("Preferences", "{id}.*.plist"), ("Preferences/ByHost", "{id}.*.plist"),
+    ("Containers", "{id}"), ("Application Scripts", "{id}"),
+    ("Saved Application State", "{id}.savedState"),
+    ("HTTPStorages", "{id}"), ("HTTPStorages", "{id}.binarycookies"), ("Cookies", "{id}.binarycookies"),
+    ("WebKit", "{id}"), ("Logs", "{id}"), ("Logs", "{name}"),
+    ("LaunchAgents", "{id}*.plist"),
+]
+LEFTOVER_ROOTS = ["Application Support", "Caches", "Containers", "Preferences", "Saved Application State", "HTTPStorages",
+                  "WebKit", "Logs", "Application Scripts", "Cookies"]
+GENERIC_NAMES = {"app", "data", "cache", "caches", "logs", "helper", "update", "updater", "google", "microsoft", "adobe",
+                 "apple", "mozilla", "chrome", "electron", "node", "python", "java", "default"}
+
+
+TRASH_BIN = "/usr/bin/trash"  # macOS 15+: FileManager.trashItem, works without Full Disk Access
+
+
+def finder_trash(paths):
+    """Trash root-owned items through Finder in ONE request, so macOS asks for the password once."""
+    files = ", ".join(f'(POSIX file "{p}" as alias)' for p in paths)
+    run(["osascript", "-e", f'tell application "Finder" to delete {{{files}}}'], timeout=300)
+
+
+def _rename_to_trash(path):
+    os.makedirs(os.path.join(HOME, ".Trash"), exist_ok=True)
+    base = os.path.basename(path.rstrip("/"))
+    stem, ext = os.path.splitext(base)
+    dest, n = os.path.join(HOME, ".Trash", base), 1
+    while os.path.lexists(dest):
+        n += 1
+        dest = os.path.join(HOME, ".Trash", f"{stem} {n}{ext}")
+    try:
+        os.rename(path, dest)
+    except OSError:
+        pass  # verified below
+
+
+def trash_paths(paths):
+    """Move paths to the Trash (recoverable). Returns {path: ''} on success or {path: reason}.
+    Success is only ever reported for paths that are actually gone afterwards."""
+    paths = [p for p in paths if os.path.lexists(p)]
+    if not paths:
+        return {}
+    if TRASH_BIN and os.path.exists(TRASH_BIN):
+        run([TRASH_BIN, *paths], timeout=600)
+    else:
+        for p in paths:
+            _rename_to_trash(p)
+    left = [p for p in paths if os.path.lexists(p)]
+    if left:  # root-owned or protected: one Finder request, one password prompt
+        finder_trash(left)
+    return {p: ("still there - macOS refused (password cancelled, or this app may not control Finder; "
+                "drag it to the Trash in Finder)" if os.path.lexists(p) else "")
+            for p in paths}
+
+
+def trash(path):
+    err = trash_paths([path]).get(path, "")
+    return not err, err
+
+
+def unload_launch_items(paths):
+    """Stop an app's launch agents before trashing them, so the app can't relaunch mid-uninstall."""
+    for p in paths:
+        if "/LaunchAgents/" in p and p.endswith(".plist"):
+            run(["launchctl", "bootout", f"gui/{os.getuid()}", p], timeout=30)
+
+
+def protected_app(app):
+    """Apps macguard refuses to uninstall."""
+    bid = app.get("bundle_id", "")
+    if not bid or bid.startswith("com.apple.") or app["path"].startswith(("/System/", "/Applications/Utilities/")):
+        return "Apple/system app"
+    if not app["path"].startswith(("/Applications/", f"{HOME}/Applications/")):
+        return "not in an Applications folder"
+    return None
+
+
+# processes that keep macOS itself working - never killed
+PROTECTED_PROCESS_IDS = {"com.apple.finder", "com.apple.dock", "com.apple.loginwindow", "com.apple.WindowServer",
+                         "com.apple.systemuiserver", "com.apple.controlcenter", "com.apple.notificationcenterui",
+                         "com.apple.Spotlight", "com.apple.coreservices.uiagent"}
+
+
+def app_process_tree(app, table=None):
+    """Every process belonging to an app: anything run from inside its bundle (main app, helpers, XPC services,
+    login items), its root helpers in /Library/PrivilegedHelperTools, and all of their descendants."""
+    table = table if table is not None else process_table()
+    bundle = app["path"].rstrip("/") + "/"
+    helpers = f"/Library/PrivilegedHelperTools/{app.get('bundle_id') or '//none//'}"
+    roots = {p["pid"] for p in table if p["exe"].startswith(bundle) or (app.get("bundle_id") and p["exe"].startswith(helpers))}
+    children = {}
+    for p in table:
+        children.setdefault(p["ppid"], []).append(p["pid"])
+    tree, todo = set(), list(roots)
+    while todo:
+        pid = todo.pop()
+        if pid not in tree:
+            tree.add(pid)
+            todo += children.get(pid, [])
+    me = {os.getpid()}  # never kill ourselves or whatever launched us (e.g. the Mac Cleanup app, a terminal)
+    by_pid = {p["pid"]: p for p in table}
+    pid = os.getpid()
+    while pid in by_pid and pid > 1:
+        pid = by_pid[pid]["ppid"]
+        me.add(pid)
+    return [by_pid[p] for p in sorted(tree - me) if p in by_pid]
+
+
+def app_running(app):
+    return bool(app_process_tree(app))
+
+
+def app_launch_labels(app):
+    """Loaded launch-agent labels in the user's session that belong to the app (they would respawn it)."""
+    bid = app.get("bundle_id", "")
+    if not bid:
+        return []
+    _, out, _ = run(["launchctl", "list"], timeout=15)
+    labels = []
+    for line in out.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) == 3 and (parts[2] == bid or parts[2].startswith(bid + ".")):
+            labels.append(parts[2])
+    return labels
+
+
+def kill_protected(app):
+    if app.get("bundle_id") in PROTECTED_PROCESS_IDS or app["path"].startswith("/System/Library/CoreServices/"):
+        return "macOS needs this to run"
+    return None
+
+
+def kill_app(app, grace=5.0, keep_agents=False):
+    """Stop an app and everything under it: unload its launch agents (no respawn), TERM the whole tree,
+    wait `grace` seconds, then KILL what's left. Returns dict(stopped, unloaded, needs_admin, survivors)."""
+    if kill_protected(app):
+        raise ValueError(f"refusing: {kill_protected(app)}")
+    unloaded = []
+    if not keep_agents:
+        for label in app_launch_labels(app):
+            if run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=30)[0] == 0:
+                unloaded.append(label)
+    procs = app_process_tree(app)
+    needs_admin = []
+    for p in procs:
+        try:
+            os.kill(p["pid"], 15)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            needs_admin.append(p)
+    deadline = time.time() + grace
+    alive = lambda: {q["pid"] for q in app_process_tree(app)} - {q["pid"] for q in needs_admin}  # noqa: E731
+    while alive() and time.time() < deadline:
+        time.sleep(0.25)
+    for pid in alive():
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+    time.sleep(0.3)
+    survivors = [q for q in app_process_tree(app) if q["pid"] not in {n["pid"] for n in needs_admin}]
+    stopped = [p for p in procs if p not in needs_admin and p["pid"] not in {s["pid"] for s in survivors}]
+    log_event("kill", f"{app['name']}: stopped {len(stopped)} process(es), unloaded {len(unloaded)} agent(s), "
+                      f"{len(needs_admin)} need admin")
+    return dict(stopped=stopped, unloaded=unloaded, needs_admin=needs_admin, survivors=survivors)
+
+
+def cmd_kill(args):
+    matches = find_app(args.app)
+    if len(matches) != 1:
+        print("No single app matches - be more specific:" if matches else f"No installed app matches '{args.app}'.")
+        for a in matches:
+            print(f"  {a['name']}  ({a['bundle_id']})")
+        sys.exit(1)
+    app = matches[0]
+    procs, labels = app_process_tree(app), app_launch_labels(app)
+    print(f"{C['B']}{app['name']}{C['x']}  {C['d']}{app['bundle_id']}{C['x']}")
+    if not procs and not labels:
+        print("  not running")
+        return
+    for p in procs:
+        who = "" if p["uid"] == os.getuid() else f"  {C['y']}(root - needs sudo){C['x']}"
+        print(f"  {p['pid']:>7}  {p['exe'].replace(app['path'], '<app>')}{who}")
+    for label in labels:
+        print(f"  {'agent':>7}  {label}  {C['d']}(would relaunch it){C['x']}")
+    if kill_protected(app):
+        sys.exit(f"{C['r']}Refusing: {kill_protected(app)}.{C['x']}")
+    if not args.yes and input(f"\nQuit {app['name']} and {len(procs)} process(es)? Unsaved work is lost. Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    r = kill_app(app, keep_agents=args.keep_agents)
+    print(f"{C['g']}Stopped {len(r['stopped'])} process(es){C['x']}" + (f", unloaded {len(r['unloaded'])} agent(s)" if r["unloaded"] else ""))
+    if r["needs_admin"]:
+        pids = " ".join(str(p["pid"]) for p in r["needs_admin"])
+        print(f"{C['y']}{len(r['needs_admin'])} root process(es) left:{C['x']} sudo kill {pids}")
+    if r["survivors"]:
+        print(f"{C['r']}Still running:{C['x']} " + ", ".join(str(p["pid"]) for p in r["survivors"]))
+
+
+def app_leftovers(app):
+    """(path, bytes) of this app's data in ~/Library, matched by exact bundle id or exact app name."""
+    bid, name = app.get("bundle_id", ""), app.get("name", "")
+    use_name = len(name) >= 4 and name.lower() not in GENERIC_NAMES
+    lib = os.path.join(HOME, "Library")
+    found = {}
+    for folder, pat in LEFTOVER_PLACES:
+        if "{name}" in pat and not use_name:
+            continue
+        if "{id}" in pat and not bid:
+            continue
+        for p in glob.glob(os.path.join(lib, folder, pat.format(id=glob.escape(bid), name=glob.escape(name)))):
+            found[p] = du(p)
+    if bid:  # system-wide pieces (launch daemons, root helpers): Finder asks for a password to trash these
+        for folder in ("/Library/LaunchDaemons", "/Library/LaunchAgents", "/Library/PrivilegedHelperTools"):
+            for p in glob.glob(os.path.join(folder, glob.escape(bid) + "*")):
+                found[p] = du(p)
+        if use_name:
+            for p in glob.glob(os.path.join("/Library/Application Support", glob.escape(name))):
+                found[p] = du(p)
+    if bid:  # group containers are named <TEAMID>.<group id>; match the app's id inside
+        for p in glob.glob(os.path.join(lib, "Group Containers", "*")):
+            if os.path.basename(p).endswith("." + bid) or os.path.basename(p) == f"group.{bid}":
+                found[p] = du(p)
+    return sorted(found.items(), key=lambda x: -x[1])
+
+
+def find_app(query):
+    q = query.lower().removesuffix(".app")
+    apps = app_inventory()
+    exact = [a for a in apps if a["name"].lower() == q or a["bundle_id"].lower() == q or os.path.basename(a["path"]).lower() == q + ".app"]
+    return exact or [a for a in apps if q in a["name"].lower()]
+
+
+def uninstall_plan(app, leftovers_only=False):
+    items = ([] if leftovers_only else [(app["path"], du(app["path"]))]) + app_leftovers(app)
+    return dict(app=app, items=items, size=sum(n for _, n in items), blocked=protected_app(app),
+                running=app_running(app))
+
+
+def do_uninstall(plan):
+    """Move every planned item to the Trash; returns (moved, failed)."""
+    if plan["blocked"]:
+        raise ValueError(f"refusing: {plan['blocked']}")
+    if plan["running"]:
+        raise ValueError(f"quit {plan['app']['name']} first")
+    ok_paths, failed = [], []
+    for path, size in plan["items"]:
+        system = path.startswith(("/Library/LaunchDaemons/", "/Library/LaunchAgents/", "/Library/PrivilegedHelperTools/",
+                                  "/Library/Application Support/"))
+        app_bundle = re.fullmatch(r"/Applications/[^/]+\.app", path) is not None
+        home_data = path.startswith(HOME + "/") and path.count("/") >= 4
+        (ok_paths if system or app_bundle or home_data else failed).append(path if (system or app_bundle or home_data)
+                                                                           else (path, "unsafe path"))
+    unload_launch_items(ok_paths)
+    result = trash_paths(ok_paths)
+    sizes = dict(plan["items"])
+    moved = [(p, sizes[p]) for p in ok_paths if result.get(p, "") == "" and not os.path.lexists(p)]
+    failed += [(p, result[p]) for p in ok_paths if result.get(p)]
+    log_event("uninstall", f"{plan['app']['name']}: moved {len(moved)} item(s) to Trash, {len(failed)} failed")
+    return moved, failed
+
+
+def cmd_uninstall(args):
+    matches = find_app(args.app)
+    if not matches:
+        sys.exit(f"No installed app matches '{args.app}'.")
+    if len(matches) > 1:
+        print("Several apps match - be more specific:")
+        for a in matches:
+            print(f"  {a['name']}  ({a['bundle_id']})  {a['path']}")
+        sys.exit(1)
+    plan = uninstall_plan(matches[0], args.leftovers_only)
+    a = plan["app"]
+    print(f"{C['B']}{a['name']} {a['version']}{C['x']}  {C['d']}{a['bundle_id']}{C['x']}")
+    for path, size in plan["items"]:
+        print(f"  {human(size):>7}  {path.replace(HOME, '~')}")
+    print(f"  {C['B']}{human(plan['size']):>7}  total -> Trash{C['x']}")
+    if any(p.startswith("/Library/") for p, _ in plan["items"]):
+        print(f"  {C['d']}/Library items are system-wide: Finder will ask for your password. Restart afterwards to stop their daemons.{C['x']}")
+    if plan["blocked"]:
+        sys.exit(f"{C['r']}Refusing: {plan['blocked']}.{C['x']}")
+    if plan["running"] and args.apply and getattr(args, "quit", False):
+        r = kill_app(a)
+        print(f"  stopped {len(r['stopped'])} process(es) first")
+        plan["running"] = app_running(a)
+    if plan["running"]:
+        sys.exit(f"{C['y']}{a['name']} is running - quit it first (or add --quit).{C['x']}")
+    if not args.apply:
+        print(f"\n{C['y']}Dry run.{C['x']} Re-run with --apply to move these to the Trash (recoverable until you empty it).")
+        return
+    if not args.yes and input(f"\nMove {len(plan['items'])} item(s) ({human(plan['size'])}) to the Trash? Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    moved, failed = do_uninstall(plan)
+    for path, err in failed:
+        print(f"  {C['r']}failed{C['x']} {path.replace(HOME, '~')}: {err}")
+    print(f"{C['g']}Moved {len(moved)} item(s), {human(sum(n for _, n in moved))}, to the Trash.{C['x']}")
+
+
+def running_commands():
+    _, out, _ = run(["ps", "-axo", "comm="], timeout=10)
+    return out.lower()
+
+
+def orphan_leftovers(min_bytes=1024 ** 2):
+    """Data in ~/Library named after a bundle id that no installed app (or running process / launch item) has."""
+    ids = {a["bundle_id"].lower() for a in app_inventory() if a["bundle_id"]}
+    for d in ("/System/Applications", "/System/Applications/Utilities", "/System/Library/CoreServices"):
+        for p in glob.glob(f"{d}/*.app"):
+            bid = read_plist(os.path.join(p, "Contents", "Info.plist")).get("CFBundleIdentifier")
+            if bid:
+                ids.add(bid.lower())
+    running = running_commands()
+    for pl in glob.glob(f"{HOME}/Library/LaunchAgents/*.plist") + glob.glob("/Library/Launch*/*.plist"):
+        ids.add(os.path.basename(pl)[:-6].lower())
+
+    def owned(bid):
+        b = bid.lower()
+        # an installed app owns its own id and its helpers' ids (com.vendor.app.helper); vendor-wide prefixes too
+        return any(b == i or b.startswith(i + ".") or i.startswith(b + ".") for i in ids) or b in running
+
+    out = []
+    lib = os.path.join(HOME, "Library")
+    for folder in LEFTOVER_ROOTS:
+        for p in glob.glob(os.path.join(lib, folder, "*")):
+            base = os.path.basename(p)
+            bid = re.sub(r"(\.binarycookies|\.savedState|\.plist)$", "", base)
+            if bid.count(".") < 2 or not re.fullmatch(r"[A-Za-z0-9-]+(\.[A-Za-z0-9_-]+){2,}", bid):
+                continue  # only reverse-DNS names can be attributed to an app
+            if bid.lower().startswith(("com.apple.", "group.com.apple.", "systemgroup.")) or owned(bid):
+                continue
+            n = du(p)
+            if n >= min_bytes:
+                vendor = ".".join(bid.lower().split(".")[:2])
+                hint = " (same vendor still installed - check first)" if any(i.startswith(vendor + ".") for i in ids) else ""
+                out.append((p, n, f"{folder} - no installed app '{bid}'{hint}"))
+    return sorted(out, key=lambda x: -x[1])
 
 
 # ---------------------------------------------------------------- traffic
@@ -1334,6 +1962,193 @@ def cmd_procs(args):
         print(f"  {p['pid']:>6} {p['cpu']:>6.1f}% {human(p['mem']):>7}  {col[p['kind']]}{p['kind']:<10}{C['x']} {p['name'][:40]}"
               f"\n         {C['d']}{p['advice']}{C['x']}")
     print(f"\n{C['d']}system = never killed by macguard. Stop one: macguard procs --kill <pid> [--force]{C['x']}")
+# ---------------------------------------------------------------- deep scan
+
+SEV_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3, "ok": 4}
+SHARING = {22: "Remote Login (SSH)", 3283: "Remote Management (Apple Remote Desktop)", 5900: "Screen Sharing",
+           445: "File Sharing", 548: "File Sharing", 5000: "AirPlay Receiver", 7000: "AirPlay Receiver"}
+
+
+def fix_for(area, title, detail):
+    """One concrete next step for a finding: the setting to change or the command to run."""
+    t = title.lower()
+    if area == "network":
+        m = re.search(r":(\d+)$", detail)
+        port = int(m.group(1)) if m else 0
+        if port in (5000, 7000):
+            return "System Settings > General > AirDrop & Handoff > AirPlay Receiver: off (or allow 'Current User' only)"
+        if port in SHARING:
+            return f"System Settings > General > Sharing > {SHARING[port]}: off if unused; keep the firewall on either way"
+        if "scan" in t or "inbound" in t:
+            return "Turn on the firewall (System Settings > Network > Firewall); check who owns the remote address"
+        if "spoof" in t:
+            return "Disconnect from this network; your router may be compromised or someone is intercepting traffic"
+        if port:
+            return f"Bind the service to 127.0.0.1, stop it, or block port {port} with the firewall"
+    if area == "security":
+        if "firewall is off" in t:
+            return "System Settings > Network > Firewall: on"
+        if "stealth" in t:
+            return "System Settings > Network > Firewall > Options: Enable stealth mode"
+        if "private key" in t:
+            f = detail.split(" - ")[0].replace("~/", "$HOME/", 1)
+            return f'mkdir -p ~/.ssh && mv "{f}" ~/.ssh/ && chmod 600 ~/.ssh/"{os.path.basename(f)}"'
+        if "orphaned launch item" in t:
+            return f"sudo rm '{detail.split(' -> ')[0]}'  (its program is already gone)"
+        if "unsigned" in t or "temp/download" in t:
+            return f"Check what it is; if you don't recognise it: launchctl bootout gui/$(id -u) '{detail.split(' -> ')[0]}'"
+        if "cleaner" in t:
+            return "macguard uninstall <app> --apply --quit"
+        if "update" in t:
+            return "System Settings > General > Software Update"
+    if area == "apps":
+        m = re.search(r"\((brew upgrade[^)]*)\)", detail)
+        if m:
+            return m.group(1)
+        if "signature broken" in t:
+            return "Reinstall it from the vendor, or uninstall: macguard uninstall <app> --apply --quit"
+        if "remote-access" in t or "end-of-life" in t or "cleaner" in t:
+            return "Uninstall it if you don't use it: macguard uninstall <app> --apply --quit"
+        if "orphaned root helper" in t:
+            return f"sudo rm '{detail}'"
+        if "intel-only" in t:
+            return "Look for an Apple Silicon version, or replace the app"
+    if area == "traffic":
+        return "macguard kill <app> to stop it now; macguard uninstall <app> if you don't recognise it"
+    if area == "disk":
+        return "macguard clean --apply (safe items), then review the rest below"
+    return ""
+
+
+def finding_key(f):
+    detail = re.sub(r"pid \d+", "pid", f["detail"])  # pids change between scans
+    return f"{f['area']}|{f['title']}|{detail}"
+
+
+def deepscan_file():
+    return os.path.join(STATE_DIR, "deepscan.json")
+
+
+def merge_findings(findings):
+    """One line per issue: same area+title merged (ports, apps), and a sharing service that the network check
+    already reports as exposed isn't repeated by the security check."""
+    exposed = " ".join(f["detail"] for f in findings if f["area"] == "network")
+    same_root = {"Screen Sharing is enabled": ":5900", "Remote Login (SSH) is enabled": ":22"}
+    findings = [f for f in findings if not (f["area"] == "security" and same_root.get(f["title"], "\0") in exposed)]
+    merged = {}
+    for f in findings:
+        k = (f["area"], f["title"])
+        if k not in merged:
+            merged[k] = dict(f)
+            continue
+        m = merged[k]
+        m["detail"] += "; " + f["detail"]
+        if f["fix"] and f["fix"] not in m["fix"]:
+            if m["fix"].startswith("brew upgrade --cask") and f["fix"].startswith("brew upgrade --cask"):
+                m["fix"] += " " + f["fix"].split()[-1]
+            else:
+                m["fix"] = " · ".join(x for x in (m["fix"], f["fix"]) if x)
+        if SEV_ORDER[f["sev"]] < SEV_ORDER[m["sev"]]:
+            m["sev"] = f["sev"]
+    for m in merged.values():
+        n = m["detail"].count("; ") + 1
+        if n > 1 and m["title"].startswith("Outdated app"):
+            m["title"] = f"{n} outdated apps (Homebrew casks)"
+    return list(merged.values())
+
+
+def health_score(findings, disk):
+    """100 = nothing to do. Each severity's penalty is capped, so many small issues can't zero the score."""
+    count = lambda sev: sum(1 for f in findings if f["sev"] == sev)  # noqa: E731
+    score = 100 - min(36, 12 * count("high")) - min(28, 4 * count("medium")) - min(8, count("low"))
+    score -= 20 if disk.get("critical") else (10 if disk.get("low") else 0)
+    return max(0, min(100, score))
+
+
+def deep_scan(traffic=False, stale_days=30):
+    """Every check in one pass, normalised into one prioritised list with fixes and 'new since last time'."""
+    space = space_report(stale_days)
+    findings = []
+
+    def add(area, items):
+        for sev, title, detail in items:
+            if sev != "ok":
+                findings.append(dict(area=area, sev=sev, title=title, detail=detail, fix=fix_for(area, title, detail)))
+    add("security", cmd_security(None, quiet=True))
+    snap = net_snapshot()
+    add("network", analyze_net(snap))
+    apps, app_findings = apps_report(online=False)
+    add("apps", app_findings)
+    if traffic:
+        add("traffic", analyze_traffic(traffic_sample(6), 6))
+    d = space["disk"]
+    if d["low"]:
+        findings.append(dict(area="disk", sev="high" if d["critical"] else "medium",
+                             title="Disk almost full" if d["critical"] else "Disk space low",
+                             detail=f"{human(d['free'])} free of {human(d['total'])}", fix=fix_for("disk", "", "")))
+    for p, before, now in space["grew"][:5]:
+        findings.append(dict(area="disk", sev="info", title="Folder grew since the last scan",
+                             detail=f"{p}: {human(before)} -> {human(now)}", fix="Check what's inside; macguard scan lists cleanable parts"))
+    findings = merge_findings(findings)
+    try:
+        prev = json.loads(read_text(deepscan_file()))
+    except (OSError, ValueError):
+        prev = None
+    known = set(prev["keys"]) if prev else None
+    for f in findings:
+        f["new"] = known is not None and finding_key(f) not in known
+    findings.sort(key=lambda f: (SEV_ORDER[f["sev"]], not f["new"], f["area"]))
+    results = space["results"]
+    report = dict(time=time.time(), since=prev["time"] if prev else None, disk=d, score=health_score(findings, d),
+                  findings=findings, apps=len(apps), listeners=len({(l["proc"], l["lport"]) for l in snap["listeners"]}),
+                  space=dict(safe=sum(r["size"] for r in results if r["risk"] == "safe"),
+                             review=sum(r["size"] for r in results if r["risk"] == "review"),
+                             managed=sum(m["size"] for m in space["managed"]), managed_items=space["managed"],
+                             safe_items=[(r["id"], r["name"], r["size"]) for r in results if r["risk"] == "safe" and r["size"]],
+                             review_items=[(r["id"], r["name"], r["size"]) for r in results if r["risk"] == "review" and r["size"]]),
+                  results=results)
+    ensure_state()
+    write_json(deepscan_file(), dict(time=report["time"], keys=[finding_key(f) for f in findings], score=report["score"]))
+    return report
+
+
+def cmd_deepscan(args):
+    print("Deep scan: disk, security, network, apps" + (", live traffic" if args.traffic else "") + " (about a minute)...",
+          flush=True)
+    r = deep_scan(traffic=args.traffic, stale_days=args.stale_days)
+    d, sp = r["disk"], r["space"]
+    col = C["g"] if r["score"] >= 80 else (C["y"] if r["score"] >= 50 else C["r"])
+    print(f"\n{C['B']}Health {col}{r['score']}/100{C['x']}   {human(d['free'])} free of {human(d['total'])}   "
+          f"{r['apps']} apps   {r['listeners']} listening services")
+    if r["since"]:
+        new = sum(f["new"] for f in r["findings"])
+        print(f"{C['d']}Compared with the deep scan of {dt.datetime.fromtimestamp(r['since']):%b %d %H:%M}: {new} new finding(s){C['x']}")
+    groups = [("Act now", ("high",)), ("Recommended", ("medium",)), ("Good to know", ("low", "info"))]
+    for label, sevs in groups:
+        items = [f for f in r["findings"] if f["sev"] in sevs]
+        if not items:
+            continue
+        print(f"\n{C['B']}{label}{C['x']}")
+        for f in items:
+            tag = f" {C['b']}NEW{C['x']}" if f["new"] else ""
+            print(f"  {C['r'] if f['sev'] == 'high' else (C['y'] if f['sev'] == 'medium' else C['d'])}{f['area']:<8}{C['x']} "
+                  f"{f['title']}{tag}\n           {C['d']}{f['detail']}{C['x']}")
+            if f["fix"]:
+                print(f"           {C['g']}-> {f['fix']}{C['x']}")
+    print(f"\n{C['B']}Space{C['x']}  safe to clean {C['g']}{human(sp['safe'])}{C['x']}  ·  needs review "
+          f"{C['y']}{human(sp['review'])}{C['x']}  ·  managed by apps {human(sp['managed'])}")
+    for m in sp["managed_items"][:4]:
+        print(f"  {human(m['size']):>7}  {m['name']}  {C['d']}- {m['how']}{C['x']}")
+    if args.clean:
+        plan = [x for x in r["results"] if x["risk"] == "safe" and x["size"] > 0]
+        if not plan:
+            print(f"\n{C['g']}Nothing safe left to clean.{C['x']}")
+        elif args.yes or input(f"\nClean the safe items ({human(sp['safe'])})? Type 'yes': ").strip() == "yes":
+            freed = sum(clean_item(x) for x in plan)
+            log_event("clean", f"deepscan freed ~{human(freed)}")
+            print(f"{C['g']}Freed ~{human(freed)}.{C['x']}")
+    elif sp["safe"]:
+        print(f"\nNext: {C['B']}macguard deepscan --clean{C['x']} to clean the safe items too.")
 
 
 # ---------------------------------------------------------------- watch mode
@@ -1409,6 +2224,12 @@ def cmd_watch(args):
             if fp["hosts"] != base["hosts"]:
                 events.append(("high", "/etc/hosts changed", "; ".join(fp["hosts"][:3])))
                 base["hosts"] = fp["hosts"]
+            d = disk_health()
+            disk_changed = bool(base.get("low_disk")) != d["low"]
+            if d["low"] and disk_changed:
+                events.append(("high" if d["critical"] else "medium", "Low disk space",
+                               f"{human(d['free'])} free of {human(d['total'])} - run macguard scan"))
+            base["low_disk"] = d["low"]
             for sev, title, detail in analyze_net(snap):
                 if sev == "high" and (title, detail) not in reported:
                     reported.add((title, detail))
@@ -1418,7 +2239,7 @@ def cmd_watch(args):
                 print(f"{dt.datetime.now():%H:%M:%S} {sev.upper():<6} {title}: {detail}", flush=True)
                 if sev in ("high", "medium"):
                     notify(title, detail)
-            if events:
+            if events or disk_changed:  # also remember recovery, so the alert re-arms
                 write_json(BASELINE, base)
             recorder.sample()
             if args.once:
@@ -1622,11 +2443,14 @@ def cmd_ui(args):
             if not self.allowed():
                 return self.send(403, {"error": "forbidden"})
             if self.path == "/api/disk":
-                return self.send(200, disk_info())
+                return self.send(200, disk_health())
             if self.path == "/api/scan":
                 with lock:
-                    state["scan"] = scan_junk(args.stale_days)
-                return self.send(200, {"disk": disk_info(), "items": junk_json(state["scan"])})
+                    rep = space_report(args.stale_days)
+                    state["scan"] = rep["results"]
+                return self.send(200, {"disk": rep["disk"], "items": junk_json(rep["results"]), "since": rep["since"],
+                                       "grew": [{"path": p, "before": b, "now": n} for p, b, n in rep["grew"][:10]],
+                                       "managed": rep["managed"]})
             if self.path == "/api/security":
                 return self.send(200, findings_json(cmd_security(args, quiet=True)))
             if self.path == "/api/net":
@@ -1642,6 +2466,20 @@ def cmd_ui(args):
             if self.path == "/api/apps":
                 apps, findings = apps_report(online=False)
                 return self.send(200, {"count": len(apps), "findings": findings_json(findings)})
+            if self.path == "/api/deepscan":
+                with lock:
+                    r = deep_scan(traffic=False, stale_days=args.stale_days)
+                    state["scan"] = r["results"]  # so "Clean selected" works straight after a deep scan
+                sp = r["space"]
+                return self.send(200, dict(score=r["score"], since=r["since"], disk=r["disk"], findings=r["findings"],
+                                           apps=r["apps"], listeners=r["listeners"], items=junk_json(r["results"]),
+                                           space=dict(safe=sp["safe"], review=sp["review"], managed=sp["managed"],
+                                                      managed_items=sp["managed_items"])))
+            if self.path == "/api/installed":
+                table = process_table()
+                return self.send(200, [dict(name=a["name"], version=a["version"], bundle_id=a["bundle_id"], path=a["path"],
+                                            protected=protected_app(a), kill_protected=kill_protected(a),
+                                            processes=len(app_process_tree(a, table))) for a in app_inventory()])
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -1670,6 +2508,42 @@ def cmd_ui(args):
                     state["scan"] = None
                 log_event("clean", f"[ui] freed ~{human(freed)} ({', '.join(r['id'] for r in plan)})")
                 return self.send(200, {"freed": freed, "cleaned": [r["id"] for r in plan]})
+            if self.path in ("/api/kill/plan", "/api/kill"):
+                app = next((a for a in app_inventory() if a["path"] == body.get("path")), None)
+                if not app:
+                    return self.send(404, {"error": "app not found"})
+                procs = app_process_tree(app)
+                view = dict(name=app["name"], blocked=kill_protected(app), agents=app_launch_labels(app),
+                            processes=[dict(pid=p["pid"], exe=p["exe"].replace(app["path"], "<app>"),
+                                            root=p["uid"] != os.getuid()) for p in procs])
+                if self.path == "/api/kill/plan":
+                    return self.send(200, view)
+                try:
+                    r = kill_app(app)
+                except ValueError as e:
+                    return self.send(409, {"error": str(e)})
+                return self.send(200, dict(view, stopped=len(r["stopped"]), unloaded=r["unloaded"],
+                                           needs_admin=[p["pid"] for p in r["needs_admin"]],
+                                           survivors=[p["pid"] for p in r["survivors"]]))
+            if self.path in ("/api/uninstall/plan", "/api/uninstall"):
+                # re-plan from the app's path every time: the page never chooses which files go
+                app = next((a for a in app_inventory() if a["path"] == body.get("path")), None)
+                if not app:
+                    return self.send(404, {"error": "app not found"})
+                plan = uninstall_plan(app, bool(body.get("leftovers_only")))
+                view = dict(name=app["name"], blocked=plan["blocked"], running=plan["running"], size=plan["size"],
+                            items=[{"path": p.replace(HOME, "~"), "size": n} for p, n in plan["items"]])
+                if self.path == "/api/uninstall/plan":
+                    return self.send(200, view)
+                if plan["running"] and body.get("quit"):
+                    kill_app(app)
+                    plan["running"] = app_running(app)
+                try:
+                    moved, failed = do_uninstall(plan)
+                except ValueError as e:
+                    return self.send(409, {"error": str(e)})
+                return self.send(200, dict(view, moved=len(moved), freed=sum(n for _, n in moved),
+                                           failed=[{"path": p.replace(HOME, "~"), "error": e} for p, e in failed]))
             if self.path == "/api/settings":
                 s = load_settings()
                 if "background_watcher" in body:
@@ -1811,11 +2685,26 @@ def main():
     p = sub.add_parser("scan"); p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_scan)
     p = sub.add_parser("clean"); p.add_argument("--apply", action="store_true"); p.add_argument("--yes", action="store_true")
     p.add_argument("--only", help="comma-separated category ids (needed for review items)")
+    p.add_argument("--builds", action="store_true", help="also remove build output in active projects (target, build, dist...)")
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_clean)
     sub.add_parser("net").set_defaults(fn=cmd_net)
     sub.add_parser("security").set_defaults(fn=cmd_security)
+    p = sub.add_parser("deepscan", help="every check in one prioritised report with fixes")
+    p.add_argument("--clean", action="store_true", help="then clean the safe items"); p.add_argument("--yes", action="store_true")
+    p.add_argument("--traffic", action="store_true", help="also sample live traffic for 6s")
+    p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_deepscan)
     p = sub.add_parser("apps"); p.add_argument("--online", action="store_true", help="also check Apple for macOS updates")
     p.add_argument("--list", action="store_true", help="print every app"); p.set_defaults(fn=cmd_apps)
+    p = sub.add_parser("uninstall", help="remove an app and its ~/Library data (to the Trash)")
+    p.add_argument("app", help="app name or bundle id"); p.add_argument("--apply", action="store_true")
+    p.add_argument("--yes", action="store_true"); p.add_argument("--leftovers-only", action="store_true",
+                                                                 help="keep the app, clear its data (reset)")
+    p.add_argument("--quit", action="store_true", help="stop the app and everything under it first")
+    p.set_defaults(fn=cmd_uninstall)
+    p = sub.add_parser("kill", help="quit an app and every process under it")
+    p.add_argument("app", help="app name or bundle id"); p.add_argument("--yes", action="store_true")
+    p.add_argument("--keep-agents", action="store_true", help="don't unload its launch agents (it may relaunch)")
+    p.set_defaults(fn=cmd_kill)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("netmon"); p.add_argument("--interval", type=int, default=5); p.add_argument("--seconds", type=int)
     p.set_defaults(fn=cmd_netmon)
