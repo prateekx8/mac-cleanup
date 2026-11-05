@@ -15,6 +15,11 @@ Commands:
   procs                Heavy CPU/memory processes, which are safe to stop; --kill PID
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   kill APP             Quit an app and every process under it (helpers, children, launch agents)
+  devmode [on|off]     Developer mode: stop idle services, pause non-dev apps, turn off animations,
+                       keep the Mac awake - one switch, and `off` puts everything back
+  perf                 What's hogging CPU, memory and heat: dev daemons, orphans, thermal/swap state
+                       (--apply stops the safe ones, --before heavy checks readiness for a big build,
+                       --focus pauses apps that aren't dev tools, --resume continues them)
   watch                Continuously monitor network, alert on anomalies
   report               Full HTML report (scan + net + security), opens in browser
   ui                   Small local web UI: scan, pick categories, clean, run checks
@@ -2151,6 +2156,898 @@ def cmd_deepscan(args):
         print(f"\nNext: {C['B']}macguard deepscan --clean{C['x']} to clean the safe items too.")
 
 
+# ---------------------------------------------------------------- performance (CPU, memory, heat)
+
+# never signalled: macOS itself, and simulator runtimes (those are shut down with simctl instead)
+PERF_SYSTEM_DIRS = ("/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/", "/private/var/db/", "/Library/Developer/CoreSimulator/")
+IDLE_CPU = 5.0                      # % of one core: below this a daemon counts as idle
+HEAVY_FREE_BYTES = 30 * 1024 ** 3   # free space a Unity or Xcode build wants (Library/, DerivedData, simulators)
+RENDER_NAMES = ("chrome-headless-shell", "ffmpeg", "ffprobe")
+DEV_MARKERS = ("vite", "next dev", "next-server", "webpack", "react-scripts start", "nodemon", "ts-node-dev", "tsx watch",
+               "astro dev", "nuxt dev", "npm run dev", "pnpm dev", "yarn dev", "expo start", "metro", "storybook")
+
+
+def _base(p):
+    return os.path.basename(p["exe"])
+
+
+# (id, name, match). First match wins; children of a matched process join its group.
+DEV_RULES = [
+    ("docker", "Docker Desktop", lambda p: "/Docker.app/" in p["exe"] or _base(p).startswith("com.docker.")),
+    ("ollama", "Ollama", lambda p: _base(p).lower() == "ollama" or "/Ollama.app/" in p["exe"]),
+    ("simulators", "iOS simulators",
+     lambda p: "/CoreSimulator/" in p["exe"] or "/CoreSimulator.framework/" in p["exe"] or _base(p) in ("launchd_sim", "Simulator")),
+    ("gradle", "Gradle daemons", lambda p: "GradleDaemon" in p["args"]),
+    ("kotlin", "Kotlin compile daemon", lambda p: "KotlinCompileDaemon" in p["args"]),
+    ("unity", "Unity Hub / Unity Editor", lambda p: "/Unity Hub.app/" in p["exe"] or "/Unity.app/" in p["exe"]),
+    ("android-emulator", "Android emulator", lambda p: _base(p).startswith("qemu-system") or p["exe"].endswith("/emulator/emulator")),
+    ("spotlight", "Spotlight indexing", lambda p: _base(p) in ("mds_stores", "mds", "mdworker", "mdworker_shared")),
+    ("render", "Video renders (Remotion, headless Chrome, ffmpeg)",
+     lambda p: _base(p) in RENDER_NAMES or _base(p) == "remotion" or "Chrome for Testing" in p["exe"]
+     or re.search(r"remotion(-cli\.js)?\s+(render|still|benchmark)\b", p["args"]) is not None),
+    ("node-dev", "Node dev servers and watchers",
+     lambda p: _base(p) in ("node", "bun", "deno") and any(m in p["args"] for m in DEV_MARKERS)),
+]
+
+
+def perf_table():
+    """Every process: pid, ppid, uid, cpu (% of one core), mem (resident bytes), exe, args (full command line)."""
+    _, out, _ = run(["ps", "-axo", "pid=,ppid=,uid=,pcpu=,rss=,comm="], timeout=15)
+    _, argv, _ = run(["ps", "-axww", "-o", "pid=,args="], timeout=15)
+    cmdline = {}
+    for line in argv.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        if pid.isdigit():
+            cmdline[int(pid)] = rest.strip()
+    rows = []
+    for line in out.splitlines():
+        f = line.split(None, 5)
+        if len(f) < 6:
+            continue
+        try:
+            row = dict(pid=int(f[0]), ppid=int(f[1]), uid=int(f[2]), cpu=float(f[3]), mem=int(f[4]) * 1024, exe=f[5].strip())
+        except ValueError:
+            continue
+        row["args"] = cmdline.get(row["pid"], row["exe"])
+        rows.append(row)
+    return rows
+
+
+def session_pids(table):
+    """This process and everything above it (shell, terminal, Claude, the Mac Cleanup app): never stopped."""
+    parent = {p["pid"]: p["ppid"] for p in table}
+    chain, pid = set(), os.getpid()
+    while pid and pid not in chain:
+        chain.add(pid)
+        pid = parent.get(pid)
+    return chain
+
+
+def stoppable(p, protected):
+    """Only your own, non-macOS processes outside this session may be signalled. Nothing here ever needs sudo."""
+    return p["pid"] > 1 and p["pid"] not in protected and p["uid"] == os.getuid() and not p["exe"].startswith(PERF_SYSTEM_DIRS)
+
+
+def owner_name(p):
+    """The app a process belongs to (outermost .app: 'Docker' for its helpers), else its program name."""
+    m = re.search(r"/([^/]+)\.app/", p["exe"])
+    return m.group(1) if m else (_base(p) or "?")
+
+
+def launchd_jobs():
+    """pid -> label of the user's running launchd jobs (a job launchd started on purpose is not an orphan)."""
+    _, out, _ = run(["launchctl", "list"], timeout=15)
+    jobs = {}
+    for line in out.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].isdigit():
+            jobs[int(parts[0])] = parts[2]
+    return jobs
+
+
+def docker_containers():
+    """Running container count, or None when the docker CLI can't tell."""
+    if not shutil.which("docker"):
+        return None
+    rc, out, _ = run(["docker", "ps", "-q"], timeout=15)
+    return None if rc else len(out.split())
+
+
+def ollama_loaded():
+    """Names of models Ollama has in memory, or None when the CLI can't tell."""
+    if not shutil.which("ollama"):
+        return None
+    rc, out, _ = run(["ollama", "ps"], timeout=10)
+    return None if rc else [l.split()[0] for l in out.splitlines()[1:] if l.strip()]
+
+
+def booted_simulators():
+    rc, out, _ = run(["xcrun", "simctl", "list", "devices", "booted", "-j"], timeout=30)
+    if rc:
+        return []
+    try:
+        return [d["name"] for devs in json.loads(out).get("devices", {}).values() for d in devs if d.get("state") == "Booted"]
+    except ValueError:
+        return []
+
+
+def parse_therm(out):
+    """`pmset -g therm` -> dict(state=nominal|warning|throttled, speed_limit, detail)."""
+    m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
+    speed = int(m.group(1)) if m else None
+    levels = [int(x) for line in out.splitlines() if not line.strip().lower().startswith("note")
+              for x in re.findall(r"warning level\D{0,20}(\d+)", line, re.I)]
+    if speed is not None and speed < 100:
+        return dict(state="throttled", speed_limit=speed, detail=f"CPU speed limited to {speed}%")
+    if any(levels):
+        return dict(state="warning", speed_limit=speed, detail=f"thermal/performance warning level {max(levels)}")
+    return dict(state="nominal", speed_limit=speed, detail="no thermal warning recorded")
+
+
+def system_load():
+    """Load average, memory pressure, swap, heat and power state. All readable without root."""
+    s = dict(cores=os.cpu_count() or 1)
+    _, out, _ = run(["sysctl", "-n", "vm.loadavg"])
+    s["load"] = ([float(x) for x in re.findall(r"\d+\.\d+", out)[:3]] + [0.0] * 3)[:3]
+    _, out, _ = run(["sysctl", "-n", "hw.memsize"])
+    s["mem_total"] = int(out.strip()) if out.strip().isdigit() else 0
+    _, out, _ = run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"])
+    s["pressure"] = {1: "normal", 2: "warning", 4: "critical"}.get(int(out.strip()) if out.strip().isdigit() else 0, "unknown")
+    _, out, _ = run(["memory_pressure", "-Q"], timeout=15)
+    m = re.search(r"free percentage:\s*(\d+)%", out)
+    s["mem_free_pct"] = int(m.group(1)) if m else None
+    _, out, _ = run(["sysctl", "-n", "vm.swapusage"])
+    sw = dict(re.findall(r"(total|used) = ([\d.]+)M", out))
+    s["swap_total"], s["swap_used"] = (int(float(sw.get(k, 0)) * 1024 ** 2) for k in ("total", "used"))
+    s["thermal"] = parse_therm(run(["pmset", "-g", "therm"])[1])
+    s["low_power"] = bool(re.search(r"lowpowermode\s+1", run(["pmset", "-g"])[1]))
+    s["on_battery"] = "Battery Power" in run(["pmset", "-g", "batt"])[1]
+    return s
+
+
+def dev_items(table, jobs=None):
+    """Known heavy dev daemons and leftover processes, grouped, each marked safe/review/system with how to stop
+    and how to start it again. Only processes that exist right now show up."""
+    jobs = launchd_jobs() if jobs is None else jobs
+    protected = session_pids(table)
+    by_pid = {p["pid"]: p for p in table}
+    group = {}
+    for p in table:
+        for rid, _, match in DEV_RULES:
+            if match(p):
+                group[p["pid"]] = rid
+                break
+    # children join their parent's group (Chrome helpers of a render, esbuild under vite, a VM under Docker)
+    for p in table:
+        chain, q = [], p
+        while q and q["pid"] not in group and q["ppid"] > 1 and len(chain) < 50:
+            chain.append(q["pid"])
+            q = by_pid.get(q["ppid"])
+        if q and q["pid"] in group and q["pid"] != p["pid"]:
+            for pid in chain:
+                if by_pid[pid]["uid"] == p["uid"]:
+                    group[pid] = group[q["pid"]]
+    if "docker" in group.values():  # Docker Desktop's Linux VM runs as an Apple Virtualization XPC service
+        for p in table:
+            if p["exe"].endswith("com.apple.Virtualization.VirtualMachine") and p["uid"] == os.getuid():
+                group.setdefault(p["pid"], "docker")
+
+    def parent_gone(p):  # re-parented to launchd, and not a job launchd started on purpose
+        return p["ppid"] == 1 and p["uid"] == os.getuid() and p["pid"] not in jobs and p["pid"] not in protected
+
+    def orphan_root(p):
+        return parent_gone(p) and not p["exe"].startswith(PERF_SYSTEM_DIRS) and ".app/" not in p["exe"] and p["exe"].startswith("/")
+
+    # renders whose parent has exited are leftovers (the render that started them is over)
+    for p in [p for p in table if group.get(p["pid"]) == "render"]:
+        q = p
+        while group.get(q["ppid"]) in ("render", "leftover-renders") and q["ppid"] in by_pid:
+            q = by_pid[q["ppid"]]
+        if parent_gone(q):
+            group[p["pid"]] = "leftover-renders"
+    # any other orphan nobody manages: its parent exited and launchd didn't start it
+    for p in table:
+        if p["pid"] not in group and orphan_root(p):
+            group[p["pid"]] = "orphans"
+            for c in table:  # and what it started
+                if c["ppid"] == p["pid"] and c["pid"] not in group:
+                    group[c["pid"]] = "orphans"
+
+    names = dict((rid, name) for rid, name, _ in DEV_RULES)
+    names.update({"leftover-renders": "Leftover render helpers (parent gone)", "orphans": "Orphaned processes (parent gone)"})
+    items = []
+    for rid in [r[0] for r in DEV_RULES] + ["leftover-renders", "orphans"]:
+        procs = [p for p in table if group.get(p["pid"]) == rid]
+        if not procs:
+            continue
+        cpu, mem = sum(p["cpu"] for p in procs), sum(p["mem"] for p in procs)
+        it = dict(id=rid, name=names[rid], procs=procs, cpu=cpu, mem=mem, count=len(procs),
+                  orphan=rid in ("leftover-renders", "orphans") or (rid in ("render", "node-dev") and any(map(orphan_root, procs))))
+        killable = [p["pid"] for p in procs if stoppable(p, protected)]
+        term = [("term", killable)] if killable else []
+        if rid == "docker":
+            n = docker_containers()
+            it.update(risk="safe" if n == 0 else "review", stop=[("quit", "Docker")], stop_text="quit Docker Desktop",
+                      start="open -a Docker",
+                      why="idle: no running containers" if n == 0 else
+                      (f"{n} container(s) running - they stop with it" if n else "couldn't ask docker whether containers run"))
+        elif rid == "ollama":
+            models = ollama_loaded()
+            label = next((jobs[p["pid"]] for p in procs if p["pid"] in jobs), None)
+            if any("/Ollama.app/" in p["exe"] for p in procs):
+                stop, stop_text, start = [("quit", "Ollama")], "quit Ollama", "open -a Ollama"
+            elif label:
+                stop, stop_text = [("cmd", ["launchctl", "bootout", f"gui/{os.getuid()}/{label}"])], f"unload {label} until next login"
+                start = "brew services start ollama" if label.startswith("homebrew.") else \
+                    f"launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{label}.plist"
+            else:
+                stop, stop_text, start = term, "stop ollama serve", "ollama serve"
+            it.update(risk="safe" if models == [] else "review", stop=stop, stop_text=stop_text, start=start,
+                      why="idle: no model loaded" if models == [] else
+                      (f"model loaded: {', '.join(models)}" if models else "couldn't ask ollama whether a model is loaded"))
+        elif rid == "simulators":
+            booted = booted_simulators()
+            it.update(risk="safe", stop=[("cmd", ["xcrun", "simctl", "shutdown", "all"])], stop_text="shut down booted simulators",
+                      start="open -a Simulator, or press Run in Xcode",
+                      why=f"booted: {', '.join(booted)}" if booted else "simulator services, no device booted")
+        elif rid in ("gradle", "kotlin"):
+            idle = cpu < IDLE_CPU
+            stop = ([("cmd", ["gradle", "--stop"])] if rid == "gradle" and shutil.which("gradle") else []) + term
+            it.update(risk="safe" if idle else "review", stop=stop,
+                      stop_text="gradle --stop, then end any daemon left" if rid == "gradle" else "end the daemon",
+                      start="starts again with the next build",
+                      why=f"idle, holding {human(mem)} of memory" if idle else "busy: a build is probably running")
+        elif rid == "unity":
+            stop = ([("quit", "Unity")] if any("/Unity.app/" in p["exe"] for p in procs) else []) + \
+                ([("quit", "Unity Hub")] if any("/Unity Hub.app/" in p["exe"] for p in procs) else [])
+            it.update(risk="review", stop=stop, stop_text="quit Unity (it asks to save)", start="open -a 'Unity Hub'",
+                      why="your project may have unsaved work")
+        elif rid == "android-emulator":
+            it.update(risk="review", stop=term, stop_text="end the emulator (it saves a snapshot when it can)",
+                      start="emulator -avd <name>, or Android Studio > Device Manager", why="an app may be running in it")
+        elif rid == "spotlight":
+            if cpu < IDLE_CPU * 2:
+                continue  # always running; only worth a mention while it is busy indexing
+            it.update(risk="system", stop=[], stop_text="macOS process - never stopped", start="",
+                      why="indexing; exclude build folders (DerivedData, Unity Library, node_modules) in "
+                          "System Settings > Spotlight > Search Privacy")
+        elif rid == "render":
+            it.update(risk="review", stop=term, stop_text="end the render", start="run the render again",
+                      why="a render is running - stopping it cancels it")
+        elif rid == "leftover-renders":
+            it.update(risk="safe", stop=term, stop_text="end the leftover helpers", start="nothing to restart: their render has ended",
+                      why="headless Chrome / ffmpeg left behind after a render; parent is pid 1")
+        elif rid == "node-dev":
+            it.update(risk="review", stop=term, stop_text="end the dev server", start="run its dev command again (npm run dev)",
+                      why="you may be using it")
+        else:  # orphans
+            it.update(risk="review", stop=term, stop_text="end them", start="start it again if you ran it on purpose",
+                      why=", ".join(sorted({_base(p) for p in procs if p["ppid"] == 1}))[:120])
+        items.append(it)
+    return items
+
+
+def top_owners(table, items, n_cpu=10, n_mem=5):
+    """Heaviest owners (app or program): the top by CPU plus the top by memory, each with kind system/app/background."""
+    item_of = {p["pid"]: it["name"] for it in items for p in it["procs"]}
+    protected = session_pids(table)
+    owners = {}
+    for p in table:
+        name = item_of.get(p["pid"]) or owner_name(p)
+        o = owners.setdefault(name, dict(name=name, cpu=0.0, mem=0, count=0, system=True, app=False, session=False))
+        o["session"] |= p["pid"] in protected  # runs this tool (terminal, Claude, ...)
+        o["cpu"] += p["cpu"]
+        o["mem"] += p["mem"]
+        o["count"] += 1
+        o["system"] &= p["uid"] != os.getuid() or p["exe"].startswith(PERF_SYSTEM_DIRS)
+        o["app"] |= ".app/" in p["exe"]
+    for o in owners.values():
+        o["kind"] = "system" if o.pop("system") else ("app" if o.pop("app") else "background")
+        o.pop("app", None)
+    by_cpu = sorted(owners.values(), key=lambda o: -o["cpu"])[:n_cpu]
+    by_mem = [o for o in sorted(owners.values(), key=lambda o: -o["mem"]) if o not in by_cpu][:n_mem]
+    return sorted(by_cpu + by_mem, key=lambda o: (-o["cpu"], -o["mem"]))
+
+
+def perf_findings(state, items, disk, before=None):
+    f = []
+    t = state["thermal"]
+    if t["state"] == "throttled":
+        f.append(("high", "The Mac is hot and throttling the CPU", f"{t['detail']} - close heavy jobs, check vents, use a stand"))
+    elif t["state"] == "warning":
+        f.append(("medium", "Thermal warning recorded", t["detail"]))
+    if state["pressure"] == "critical":
+        f.append(("high", "Memory pressure is critical", "macOS is compressing and swapping hard; quit something big"))
+    elif state["pressure"] == "warning":
+        f.append(("medium", "Memory pressure is high", f"{state['mem_free_pct']}% memory free"))
+    if state["swap_used"] > 2 * 1024 ** 3 and state["swap_used"] > state["swap_total"] / 2:
+        f.append(("medium", "Heavy swap use", f"{human(state['swap_used'])} of {human(state['swap_total'])} swap used - "
+                                               "memory has been short; restarting the heaviest apps gives it back"))
+    if state["load"][0] > state["cores"]:
+        f.append(("medium", "CPU is saturated", f"load {state['load'][0]:.1f} on {state['cores']} cores"))
+    for it in items:
+        if it["id"] == "leftover-renders":
+            f.append(("medium", "Leftover render helpers still running", f"{it['count']} process(es), {it['cpu']:.0f}% CPU, {human(it['mem'])}"))
+        elif it["id"] == "orphans":
+            f.append(("low", "Orphaned processes (their parent has exited)", it["why"]))
+        elif it["id"] == "spotlight":
+            f.append(("info", "Spotlight is indexing", f"{it['cpu']:.0f}% CPU - {it['why']}"))
+        elif it["risk"] == "safe" and it["mem"] >= 1024 ** 3:
+            f.append(("low", f"Stopping {it['name']} frees {human(it['mem'])}", f"{it['why']} - safe to stop while you don't need it"))
+    if state["low_power"]:
+        f.append(("medium" if before else "low", "Low Power Mode is on", "slower CPU; turn it off for builds (System Settings > Battery)"))
+    if before:
+        if disk["free"] < HEAVY_FREE_BYTES:
+            f.append(("high" if disk["free"] < HEAVY_FREE_BYTES / 2 else "medium", "Not much free space for a big build",
+                      f"{human(disk['free'])} free; Unity imports and Xcode builds want ~{human(HEAVY_FREE_BYTES)}. Run: macguard clean --apply"))
+        if state["on_battery"]:
+            f.append(("low", "Running on battery", "plug in: macOS slows the CPU on battery during long builds"))
+    return f
+
+
+def heavy_suggestions(items, owners):
+    """What to close before a Unity / Xcode / Android build or a video render (beyond the safe items)."""
+    out = [f"Stop {it['name']} ({it['why']}): macguard perf --apply" for it in items if it["risk"] == "safe"]
+    out += [f"Close {it['name']} if you don't need it now ({it['why']})" for it in items
+            if it["risk"] == "review" and it["id"] not in ("unity",)]
+    named = {it["name"] for it in items}
+    for o in owners:
+        if o["kind"] == "app" and not o["session"] and o["name"] not in named and o["mem"] >= 1.5 * 1024 ** 3:
+            out.append(f"Quit {o['name']} if you don't need it now ({human(o['mem'])} memory, {o['cpu']:.0f}% CPU)")
+    if any(it["id"] == "spotlight" for it in items):
+        out.append("Keep Spotlight out of build output: System Settings > Spotlight > Search Privacy")
+    return out
+
+
+def perf_report(before=None):
+    table = perf_table()
+    state = system_load()
+    items = dev_items(table)
+    owners = top_owners(table, items)
+    disk = disk_health()
+    return dict(state=state, items=items, owners=owners, disk=disk, before=before,
+                findings=perf_findings(state, items, disk, before),
+                suggestions=heavy_suggestions(items, owners) if before else [])
+
+
+def perf_plan(items, only=None):
+    """Safe items by default; review items only when named. System items (Spotlight) are never stopped."""
+    return [it for it in items if it["stop"] and it["risk"] != "system" and (it["id"] in only if only else it["risk"] == "safe")]
+
+
+def stop_pids(pids, before, grace=4.0):
+    """TERM then (after `grace`) KILL - but only pids that still run the same program and still pass `stoppable`."""
+    exe_then = {p["pid"]: p["exe"] for p in before}
+    now = {p["pid"]: p for p in perf_table()}
+    protected = session_pids(list(now.values()))
+    targets = [pid for pid in pids if pid in now and now[pid]["exe"] == exe_then.get(pid) and stoppable(now[pid], protected)]
+    sent = []
+    for pid in targets:
+        try:
+            os.kill(pid, 15)
+            sent.append(pid)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def alive():
+        left = []
+        for pid in sent:
+            try:
+                os.kill(pid, 0)
+                left.append(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return left
+    deadline = time.time() + grace
+    while alive() and time.time() < deadline:
+        time.sleep(0.2)
+    for pid in alive():
+        try:
+            os.kill(pid, 9)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return len(sent)
+
+
+def apply_perf(plan):
+    """Run each item's stop steps. Returns [dict(id, name, ok, detail, start)]. No sudo anywhere."""
+    results = []
+    for it in plan:
+        notes, ok = [], True
+        for kind, what in it["stop"]:
+            if kind == "quit":
+                rc, _, err = run(["osascript", "-e", f'quit app "{what}"'], timeout=60)
+                ok &= rc == 0
+                notes.append(f"asked {what} to quit" if rc == 0 else f"{what} didn't quit: {err.strip()[:80]}")
+            elif kind == "cmd":
+                rc, _, err = run(what, timeout=120)
+                ok &= rc == 0 or what[:2] == ["gradle", "--stop"]  # the TERM step after it covers other Gradle versions
+                notes.append(" ".join(what) + ("" if rc == 0 else f" failed: {err.strip()[:80]}"))
+            elif kind == "term":
+                n = stop_pids(what, it["procs"])
+                notes.append(f"ended {n} process(es)")
+        log_event("perf", f"stopped {it['id']}: {'; '.join(notes)}")
+        results.append(dict(id=it["id"], name=it["name"], ok=ok, detail="; ".join(notes), start=it["start"]))
+    return results
+
+
+def perf_json(r):
+    item = lambda it: {k: it[k] for k in ("id", "name", "risk", "why", "cpu", "mem", "count", "orphan", "stop_text", "start")}  # noqa: E731
+    return dict(state=r["state"], disk=r["disk"], before=r["before"], items=[item(it) for it in r["items"]],
+                owners=r["owners"], findings=findings_json(r["findings"]), suggestions=r["suggestions"])
+
+
+def cmd_perf(args):
+    if args.focus or args.resume:
+        return cmd_focus(args)
+    r = perf_report(args.before)
+    s, t = r["state"], r["state"]["thermal"]
+    tcol = C["r"] if t["state"] == "throttled" else (C["y"] if t["state"] == "warning" else C["g"])
+    pcol = C["r"] if s["pressure"] == "critical" else (C["y"] if s["pressure"] == "warning" else C["g"])
+    print(f"{C['B']}Performance{C['x']}  load {s['load'][0]:.1f} / {s['cores']} cores  ·  memory {pcol}{s['pressure']}{C['x']}"
+          + (f" ({s['mem_free_pct']}% free)" if s["mem_free_pct"] is not None else "")
+          + f"  ·  swap {human(s['swap_used'])} of {human(s['swap_total'])}  ·  thermal {tcol}{t['state']}{C['x']}"
+          + (f"  ·  {C['y']}Low Power Mode{C['x']}" if s["low_power"] else ""))
+    ds = devmode_status()
+    if ds["active"]:
+        print(f"{C['y']}Developer mode on{C['x']} until {dt.datetime.fromtimestamp(ds['until']):%H:%M}.  Turn off: macguard devmode off")
+    fs = focus_status()
+    if fs["active"]:
+        print(f"{C['y']}Dev focus on:{C['x']} {fs['count']} process(es) paused ({', '.join(fs['names'])}) until "
+              f"{dt.datetime.fromtimestamp(fs['until']):%H:%M}.  Resume: macguard perf --resume")
+    print(f"\n{C['B']}Findings{C['x']}")
+    print_findings(r["findings"])
+    col = {"safe": C["g"], "review": C["y"], "system": C["d"]}
+    print(f"\n{C['B']}Dev daemons and background jobs{C['x']}")
+    if not r["items"]:
+        print(f"  {C['g']}None running.{C['x']}")
+    for it in r["items"]:
+        print(f"  {it['cpu']:>6.1f}% {human(it['mem']):>7}  {col[it['risk']]}{it['risk']:<6}{C['x']} {it['id']:<17} {it['name']}"
+              f"  {C['d']}({it['count']} process{'es' if it['count'] != 1 else ''}){C['x']}\n"
+              f"{'':>26}{C['d']}{it['why']}{C['x']}")
+    print(f"\n{C['B']}Heaviest by app{C['x']}  {C['d']}(CPU % of one core; system = never touched){C['x']}")
+    kcol = {"system": C["d"], "app": C["y"], "background": C["g"]}
+    for o in r["owners"]:
+        print(f"  {o['cpu']:>6.1f}% {human(o['mem']):>7}  {kcol[o['kind']]}{o['kind']:<10}{C['x']} {o['name'][:44]}"
+              f"  {C['d']}{o['count']}{C['x']}")
+    if r["before"]:
+        print(f"\n{C['B']}Before a heavy build{C['x']}  {C['d']}(free {human(r['disk']['free'])}){C['x']}")
+        for x in r["suggestions"] or ["Nothing to close - good to go."]:
+            print(f"  - {x}")
+    wanted = set(args.only.split(",")) if args.only else None
+    plan = perf_plan(r["items"], wanted)
+    if not args.apply:
+        review = [it["id"] for it in r["items"] if it["risk"] == "review"]
+        if plan:
+            print(f"\nNext: {C['B']}macguard perf --apply{C['x']} stops: {', '.join(it['id'] for it in plan)}"
+                  + (f"  ·  review items need --only ({', '.join(review)})" if review else ""))
+        return
+    if not plan:
+        print("\nNothing to stop." + ("" if wanted else " (review items need --only <id>)"))
+        return
+    print(f"\n{C['B']}Will stop{C['x']}")
+    for it in plan:
+        print(f"  {it['name']}: {it['stop_text']}  {C['d']}(start again: {it['start']}){C['x']}")
+    if not args.yes and input("\nStop the above? Unsaved work in them is lost. Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    for res in apply_perf(plan):
+        mark = f"{C['g']}stopped{C['x']}" if res["ok"] else f"{C['y']}partly{C['x']}"
+        print(f"  {mark} {res['name']}: {res['detail']}\n          {C['d']}start again: {res['start']}{C['x']}")
+
+
+# ---------------------------------------------------------------- dev focus (pause apps that aren't dev tools)
+
+FOCUS_MIN_CPU, FOCUS_MIN_MEM = 0.5, 256 << 20  # an app below both isn't worth pausing
+# matched (lowercase) against the owning app's name: development tools are never paused
+DEV_APPS = ("unity", "xcode", "simulator", "android studio", "visual studio", "code", "cursor", "zed", "intellij", "pycharm",
+            "webstorm", "goland", "clion", "rider", "rubymine", "phpstorm", "datagrip", "fleet", "jetbrains", "terminal",
+            "iterm", "warp", "ghostty", "alacritty", "kitty", "wezterm", "hyper", "claude", "docker", "postman", "insomnia",
+            "github desktop", "sourcetree", "fork", "instruments", "blender", "mac cleanup")
+# programs that are development work wherever they run from (and keep whatever started them running too)
+DEV_BINS = {"zsh", "bash", "fish", "sh", "tmux", "ssh", "node", "npm", "npx", "bun", "deno", "python", "python3", "java", "dotnet",
+            "git", "ffmpeg", "esbuild", "gradle", "make", "cargo", "rustc", "go", "ruby", "postgres", "redis-server", "mongod",
+            "mysqld", "claude", "chrome-headless-shell"}
+DEV_PATHS = ("/Workspace/", "/node_modules/", "/.gradle/", "/Android/sdk/", "CoreSimulator", "/.dotnet/", "creator-studio", "cbse")
+# pausing these breaks input, security, networking or a call - never paused even though they aren't dev tools
+NEVER_PAUSE = ("1password", "bitwarden", "lastpass", "dashlane", "keepass", "tailscale", "wireguard", "vpn", "globalprotect",
+               "anyconnect", "zscaler", "lulu", "little snitch", "karabiner", "rectangle", "magnet", "raycast", "alfred",
+               "bettertouchtool", "bartender", "logi", "steelseries", "razer", "displaylink", "elgato", "stream deck",
+               "loopback", "soundsource", "zoom", "webex", "facetime", "macguard")
+
+
+def focus_file():
+    return os.path.join(STATE_DIR, "focus.json")
+
+
+def load_focus():
+    try:
+        return json.loads(read_text(focus_file()))
+    except (OSError, ValueError):
+        return None
+
+
+def frontmost_pid():
+    """The app in front right now (it is never paused). lsappinfo needs no permissions."""
+    _, asn, _ = run(["lsappinfo", "front"], timeout=10)
+    if not asn.strip():
+        return None
+    m = re.search(r"pid\s*=\s*(\d+)", run(["lsappinfo", "info", "-only", "pid", asn.strip()], timeout=10)[1])
+    return int(m.group(1)) if m else None
+
+
+def dev_process(p, allow=()):
+    low = p["exe"].lower()
+    return (os.path.basename(low) in DEV_BINS or any(w in p["exe"] for w in DEV_PATHS)
+            or any(w in owner_name(p).lower() for w in DEV_APPS) or any(w in low for w in allow))
+
+
+def focus_plan(table, front=None, allow=(), ollama_idle=False):
+    """Apps (whole bundles: main process and helpers) that may be paused, and why the others stay running.
+    Only your own processes inside an .app bundle are candidates; macOS, root, this session, the frontmost app,
+    dev tools, anything that starts a dev process and the NEVER_PAUSE list always keep running."""
+    allow = tuple(a.lower() for a in allow if a)
+    protected = session_pids(table)
+    by_pid = {p["pid"]: p for p in table}
+    already = {e["pid"] for e in (load_focus() or {}).get("paused", [])}
+    keep = {}
+    for p in table:
+        if dev_process(p, allow):  # the dev process's own app, and every app above it (Terminal -> zsh -> node)
+            q, hops = by_pid.get(p["ppid"]), 0
+            keep.setdefault(owner_name(p), "in your focus_allow setting" if dev_process(p, allow) and not dev_process(p)
+                            else "development tool")
+            while q and q["pid"] > 1 and hops < 50:
+                keep.setdefault(owner_name(q), f"runs {owner_name(p)}")
+                q, hops = by_pid.get(q["ppid"]), hops + 1
+        if p["pid"] in protected:
+            keep.setdefault(owner_name(p), "runs this tool")
+    if front in by_pid:
+        keep[owner_name(by_pid[front])] = "the app in front"
+    groups = {}
+    for p in table:
+        if ".app/" in p["exe"] and stoppable(p, protected) and p["pid"] not in already:
+            groups.setdefault(owner_name(p), []).append(p)
+    pause, kept = [], []
+    for name, procs in sorted(groups.items()):
+        low = name.lower()
+        why = keep.get(name) or ("needed for input, security, network or calls" if any(w in low for w in NEVER_PAUSE) else None) \
+            or ("in your focus_allow setting" if any(w in low for w in allow) else None) \
+            or ("serving a model" if low == "ollama" and not ollama_idle else None)
+        cpu, mem = sum(p["cpu"] for p in procs), sum(p["mem"] for p in procs)
+        if why:
+            kept.append(dict(name=name, reason=why))
+        elif cpu >= FOCUS_MIN_CPU or mem >= FOCUS_MIN_MEM:
+            pause.append(dict(name=name, cpu=cpu, mem=mem, count=len(procs), procs=procs))
+    return dict(pause=sorted(pause, key=lambda g: (-g["cpu"], -g["mem"])), kept=kept)
+
+
+def focus_snapshot():
+    table = perf_table()
+    ollama = next((it for it in dev_items(table) if it["id"] == "ollama"), None)
+    return table, focus_plan(table, frontmost_pid(), load_settings()["focus_allow"], bool(ollama and ollama["risk"] == "safe"))
+
+
+def start_focus_timer():
+    """A detached `macguard focus-timer` resumes everything when the time is up, even after this terminal closes."""
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "focus-timer"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def focus_pause(groups, hours, source="cli"):
+    """SIGSTOP every process of the given app groups (re-checked first) and record them in focus.json."""
+    now = {p["pid"]: p for p in perf_table()}
+    protected = session_pids(list(now.values()))
+    state = load_focus() or {"paused": [], "since": time.time()}
+    paused = []
+    for g in groups:
+        for p in g["procs"]:
+            q = now.get(p["pid"])
+            if not q or q["exe"] != p["exe"] or not stoppable(q, protected):
+                continue
+            try:
+                os.kill(p["pid"], signal.SIGSTOP)
+            except (ProcessLookupError, PermissionError):
+                continue
+            paused.append(dict(pid=p["pid"], exe=p["exe"], name=g["name"]))
+    state["paused"] += paused
+    state.update(until=time.time() + hours * 3600, source=source)
+    ensure_state()
+    write_json(focus_file(), state)
+    if paused:
+        log_event("focus", f"paused {len(paused)} process(es): {', '.join(sorted({e['name'] for e in paused}))}")
+        start_focus_timer()
+    return paused, state["until"]
+
+
+def focus_resume(reason="resume"):
+    """SIGCONT everything focus paused (only pids that still run the same program), then forget the state."""
+    state = load_focus()
+    if not state:
+        return []
+    now = {p["pid"]: p for p in perf_table()}
+    resumed = []
+    for e in state["paused"]:
+        p = now.get(e["pid"])
+        if p and p["exe"] == e["exe"]:
+            try:
+                os.kill(e["pid"], signal.SIGCONT)
+                resumed.append(e)
+            except (ProcessLookupError, PermissionError):
+                pass
+    try:
+        os.remove(focus_file())
+    except OSError:
+        pass
+    log_event("focus", f"resumed {len(resumed)} process(es) ({reason})")
+    return resumed
+
+
+def focus_check_expired():
+    """Nothing stays paused (or in developer mode) forever: called by every command, the watcher and the focus timer."""
+    dev = load_devmode()
+    if dev and time.time() >= dev.get("until", 0):
+        devmode_off("timeout")
+    state = load_focus()
+    if state and time.time() >= state.get("until", 0):
+        return focus_resume("timeout")
+    return None
+
+
+def focus_status():
+    state = load_focus() or {}
+    return dict(active=bool(state.get("paused")), count=len(state.get("paused", [])), until=state.get("until"),
+                names=sorted({e["name"] for e in state.get("paused", [])}), hours=load_settings()["focus_hours"])
+
+
+def cmd_focus_timer(args):
+    """Detached: ends dev focus and developer mode when their time is up, then exits."""
+    while True:
+        focus_check_expired()
+        states = [s for s in (load_focus(), load_devmode()) if s]
+        if not states:
+            return
+        time.sleep(max(1, min(60, min(s.get("until", 0) for s in states) - time.time())))
+
+
+def cmd_focus(args):
+    if args.resume:
+        res = focus_resume("macguard perf --resume")
+        print(f"{C['g']}Resumed {len(res)} process(es){C['x']}" + (f": {', '.join(sorted({e['name'] for e in res}))}" if res else
+                                                                   " (nothing was paused)"))
+        return
+    _, plan = focus_snapshot()
+    hours = load_settings()["focus_hours"]
+    print(f"{C['B']}Dev focus{C['x']}  {C['d']}pauses background apps that aren't dev tools (SIGSTOP); they continue exactly "
+          f"where they were on resume{C['x']}")
+    for g in plan["pause"]:
+        print(f"  {g['cpu']:>6.1f}% {human(g['mem']):>7}  {C['y']}pause{C['x']}  {g['name']}  {C['d']}({g['count']} process"
+              f"{'es' if g['count'] != 1 else ''}){C['x']}")
+    if not plan["pause"]:
+        print(f"  {C['g']}Nothing to pause: only dev tools are busy.{C['x']}")
+    if plan["kept"]:
+        print(f"  {C['d']}keeps running: " + ", ".join(f"{k['name']} ({k['reason']})" for k in plan["kept"][:20]) + C["x"])
+    if not args.apply or not plan["pause"]:
+        if plan["pause"]:
+            print(f"\nDry run. Pause them: {C['B']}macguard perf --focus --apply{C['x']}   "
+                  f"(add apps to keep: macguard settings focus_allow 'Spotify,Figma')")
+        return
+    if not args.yes and input(f"\nPause these apps for up to {hours}h? They may show as 'Not Responding' until resumed. "
+                              "Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    paused, until = focus_pause(plan["pause"], hours)
+    print(f"{C['g']}Paused {len(paused)} process(es) in {len({e['name'] for e in paused})} app(s).{C['x']}  "
+          f"They may look 'Not Responding' - that's expected.")
+    print(f"Resume: {C['B']}macguard perf --resume{C['x']}  (automatic at {dt.datetime.fromtimestamp(until):%H:%M})")
+
+
+# ---------------------------------------------------------------- developer mode (one switch for dev work)
+
+# (domain, key, type, value): user-level settings that turn off motion. The old value is saved and put back on `off`.
+MOTION_DEFAULTS = [
+    ("com.apple.universalaccess", "reduceMotion", "bool", "true"),         # system-wide Reduce Motion
+    ("com.apple.universalaccess", "reduceTransparency", "bool", "true"),   # no blur behind menus and the Dock
+    ("NSGlobalDomain", "NSAutomaticWindowAnimationsEnabled", "bool", "false"),  # window open/close zoom
+    ("NSGlobalDomain", "NSWindowResizeTime", "float", "0.001"),            # sheets and resizes
+    ("NSGlobalDomain", "NSScrollAnimationEnabled", "bool", "false"),       # smooth-scroll animation
+    ("com.apple.dock", "launchanim", "bool", "false"),                     # bouncing app launch
+    ("com.apple.dock", "mineffect", "string", "scale"),                    # minimize: scale, not genie
+    ("com.apple.dock", "expose-animation-duration", "float", "0.1"),       # Mission Control
+    ("com.apple.dock", "autohide-delay", "float", "0"),
+    ("com.apple.dock", "autohide-time-modifier", "float", "0.15"),
+    ("com.apple.finder", "DisableAllAnimations", "bool", "true"),          # Finder windows (from its next launch)
+]
+DEFAULTS_TYPES = {"boolean": "bool", "float": "float", "integer": "int", "string": "string"}
+DEVMODE_PARTS = ("stop", "pause", "motion", "awake")
+
+
+def devmode_file():
+    return os.path.join(STATE_DIR, "devmode.json")
+
+
+def load_devmode():
+    try:
+        return json.loads(read_text(devmode_file()))
+    except (OSError, ValueError):
+        return None
+
+
+def read_default(domain, key):
+    """(type, value) of a user default; (None, None) if it isn't set; ('unsupported', None) for dicts/arrays/dates."""
+    rc, out, _ = run(["defaults", "read-type", domain, key], timeout=10)
+    if rc:
+        return None, None
+    kind = DEFAULTS_TYPES.get(out.strip().removeprefix("Type is ").strip(), "unsupported")
+    if kind == "unsupported":
+        return kind, None
+    rc, out, _ = run(["defaults", "read", domain, key], timeout=10)
+    return (kind, out.strip()) if rc == 0 else (None, None)
+
+
+def apply_motion():
+    """Write MOTION_DEFAULTS, remembering each previous value. Returns (records, failed keys)."""
+    records, failed = [], []
+    for domain, key, kind, value in MOTION_DEFAULTS:
+        prev_kind, prev = read_default(domain, key)
+        if prev_kind == "unsupported":
+            continue
+        rc, _, err = run(["defaults", "write", domain, key, f"-{kind}", value], timeout=10)
+        if rc:
+            failed.append(f"{key} ({err.strip()[:60] or 'not allowed'})")
+            continue
+        records.append(dict(domain=domain, key=key, prev_kind=prev_kind, prev=prev))
+    if any(r["domain"] == "com.apple.dock" for r in records):
+        run(["killall", "Dock"], timeout=10)  # the Dock re-reads its settings when it restarts (a second, no windows lost)
+    return records, failed
+
+
+def restore_motion(records):
+    for r in records:
+        if r["prev_kind"] is None:
+            run(["defaults", "delete", r["domain"], r["key"]], timeout=10)
+        else:
+            value = {"1": "true", "0": "false"}.get(r["prev"], r["prev"]) if r["prev_kind"] == "bool" else r["prev"]
+            run(["defaults", "write", r["domain"], r["key"], f"-{r['prev_kind']}", value], timeout=10)
+    if any(r["domain"] == "com.apple.dock" for r in records):
+        run(["killall", "Dock"], timeout=10)
+
+
+def restart_cmd(item):
+    """How `devmode off` brings back a service it stopped (only apps people expect to find running again)."""
+    if item["id"] == "docker":
+        return ["open", "-a", "Docker"]
+    if item["id"] == "ollama":
+        if item["stop"] and item["stop"][0][0] == "quit":
+            return ["open", "-a", "Ollama"]
+        if item["stop"] and item["stop"][0][0] == "cmd" and item["stop"][0][1][:2] == ["launchctl", "bootout"]:
+            label = item["stop"][0][1][2].rsplit("/", 1)[-1]
+            return ["launchctl", "bootstrap", f"gui/{os.getuid()}", os.path.join(HOME, "Library/LaunchAgents", label + ".plist")]
+    return None
+
+
+def devmode_plan(skip=()):
+    """Everything `devmode on` would do, computed fresh: what it stops, pauses and changes, plus advice it can't apply."""
+    r = perf_report()
+    stop = perf_plan(r["items"]) if "stop" not in skip else []
+    stopping = {p["pid"] for it in stop for p in it["procs"]}
+    pause = [g for g in focus_snapshot()[1]["pause"] if not stopping & {p["pid"] for p in g["procs"]}] \
+        if "pause" not in skip else []  # no point pausing what is about to be stopped
+    advice = []
+    if r["state"]["low_power"]:
+        advice.append("Turn off Low Power Mode: System Settings > Battery (it slows the CPU)")
+    advice.append("Silence notifications: Control Center > Focus > Do Not Disturb")
+    if any(it["id"] == "spotlight" for it in r["items"]):
+        advice.append("Keep Spotlight out of build output: System Settings > Spotlight > Search Privacy")
+    if r["disk"].get("low"):
+        advice.append("Free disk space first: macguard clean --apply")
+    return dict(stop=stop, pause=pause, motion="motion" not in skip, awake="awake" not in skip, advice=advice,
+                skip=[s for s in skip if s in DEVMODE_PARTS])
+
+
+def devmode_on(plan, hours, source="cli"):
+    """Apply a devmode_plan and record how to undo every part in ~/.macguard/devmode.json."""
+    if load_devmode():
+        raise ValueError("developer mode is already on")
+    state = dict(since=time.time(), until=time.time() + hours * 3600, source=source, stopped=[], motion=[], failed=[],
+                 caffeinate=None, paused=0)
+    for res, it in zip(apply_perf(plan["stop"]), plan["stop"]):
+        state["stopped"].append(dict(id=it["id"], name=it["name"], start=it["start"], restart=restart_cmd(it), detail=res["detail"]))
+    if plan["pause"]:
+        paused, _ = focus_pause(plan["pause"], hours, source="devmode")
+        state["paused"] = len(paused)
+    if plan["motion"]:
+        state["motion"], state["failed"] = apply_motion()
+    if plan["awake"] and shutil.which("caffeinate"):
+        # -i: no idle sleep, -s: no system sleep on power, -t: ends by itself when the time is up anyway
+        p = subprocess.Popen(["caffeinate", "-i", "-s", "-t", str(int(hours * 3600))], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        state["caffeinate"] = p.pid
+    ensure_state()
+    write_json(devmode_file(), state)
+    start_focus_timer()  # also turns developer mode off when the time is up
+    log_event("devmode", f"on: stopped {len(state['stopped'])}, paused {state['paused']}, {len(state['motion'])} motion setting(s)"
+                         + (", keeping awake" if state["caffeinate"] else ""))
+    return state
+
+
+def devmode_off(reason="devmode off"):
+    """Undo everything devmode_on did: resume paused apps, restore settings, restart stopped services, let the Mac sleep."""
+    state = load_devmode()
+    if not state:
+        return None
+    resumed = focus_resume(reason) if (load_focus() or {}).get("source") == "devmode" else []
+    restore_motion(state.get("motion", []))
+    restarted = []
+    for s in state.get("stopped", []):
+        if s.get("restart") and run(s["restart"], timeout=60)[0] == 0:
+            restarted.append(s["name"])
+    pid = state.get("caffeinate")
+    if pid and any(p["pid"] == pid and _base(p) == "caffeinate" for p in perf_table()):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        os.remove(devmode_file())
+    except OSError:
+        pass
+    log_event("devmode", f"off ({reason}): resumed {len(resumed)}, restored {len(state.get('motion', []))} setting(s), "
+                         f"restarted {', '.join(restarted) or 'nothing'}")
+    return dict(resumed=len(resumed), restored=len(state.get("motion", [])), restarted=restarted,
+                not_restarted=[f"{s['name']}: {s['start']}" for s in state.get("stopped", []) if s["name"] not in restarted])
+
+
+def devmode_status():
+    s = load_devmode() or {}
+    return dict(active=bool(s), since=s.get("since"), until=s.get("until"), stopped=[x["name"] for x in s.get("stopped", [])],
+                paused=s.get("paused", 0), motion=len(s.get("motion", [])), failed=s.get("failed", []),
+                awake=bool(s.get("caffeinate")), hours=load_settings()["focus_hours"])
+
+
+def cmd_devmode(args):
+    st = load_devmode()
+    if args.action == "off":
+        r = devmode_off("macguard devmode off")
+        if r is None:
+            print("Developer mode is not on.")
+            return
+        print(f"{C['g']}Developer mode off.{C['x']} Resumed {r['resumed']} process(es), restored {r['restored']} setting(s)"
+              + (f", started {', '.join(r['restarted'])} again" if r["restarted"] else "") + ".")
+        for x in r["not_restarted"]:
+            print(f"  {C['d']}not restarted (start it when you need it): {x}{C['x']}")
+        return
+    if st:
+        print(f"{C['y']}Developer mode is on{C['x']} since {dt.datetime.fromtimestamp(st['since']):%H:%M}, until "
+              f"{dt.datetime.fromtimestamp(st['until']):%H:%M}: stopped {', '.join(x['name'] for x in st['stopped']) or 'nothing'}; "
+              f"paused {st['paused']} process(es); animations {'off' if st['motion'] else 'unchanged'}; "
+              f"{'keeping the Mac awake' if st['caffeinate'] else 'normal sleep'}.\nTurn it off: {C['B']}macguard devmode off{C['x']}")
+        return
+    skip = tuple(x.strip() for x in (args.skip or "").split(",") if x.strip())
+    plan = devmode_plan(skip)
+    hours = load_settings()["focus_hours"]
+    print(f"{C['B']}Developer mode{C['x']}  {C['d']}one switch: only development work runs, no animations; "
+          f"`macguard devmode off` puts everything back{C['x']}")
+    print(f"  stop      {', '.join(it['name'] for it in plan['stop']) or '-'}")
+    print(f"  pause     {', '.join(g['name'] for g in plan['pause']) or '-'}  {C['d']}(SIGSTOP, may look 'Not Responding'){C['x']}")
+    print(f"  motion    {'Reduce Motion & Transparency, window/Dock/Finder animations off' if plan['motion'] else '-'}")
+    print(f"  awake     {'keep the Mac from sleeping during long builds (caffeinate)' if plan['awake'] else '-'}")
+    print(f"  ends      by `macguard devmode off`, or by itself after {hours} h")
+    for a in plan["advice"]:
+        print(f"  {C['d']}tip: {a}{C['x']}")
+    if args.action != "on":
+        print(f"\nTurn it on: {C['B']}macguard devmode on{C['x']}   (leave parts out: --skip stop,pause,motion,awake)")
+        return
+    if not args.yes and input("\nTurn on developer mode? Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    st = devmode_on(plan, hours)
+    print(f"{C['g']}Developer mode on.{C['x']} Stopped {len(st['stopped'])}, paused {st['paused']} process(es), "
+          f"{len(st['motion'])} motion setting(s) changed" + (", keeping the Mac awake." if st["caffeinate"] else "."))
+    for f in st["failed"]:
+        print(f"  {C['y']}couldn't change{C['x']} {f} - System Settings > Accessibility > Display has the same switches")
+    print(f"Turn it off: {C['B']}macguard devmode off{C['x']}  (automatic at {dt.datetime.fromtimestamp(st['until']):%H:%M})")
+
+
 # ---------------------------------------------------------------- watch mode
 
 def read_text(path):
@@ -2242,6 +3139,7 @@ def cmd_watch(args):
             if events or disk_changed:  # also remember recovery, so the alert re-arms
                 write_json(BASELINE, base)
             recorder.sample()
+            focus_check_expired()
             if args.once:
                 return
             # keep the connection history fine-grained between the (slower) full checks
@@ -2256,7 +3154,7 @@ def cmd_watch(args):
 
 # ---------------------------------------------------------------- settings
 
-DEFAULT_SETTINGS = {"background_watcher": False, "watch_interval": 60}
+DEFAULT_SETTINGS = {"background_watcher": False, "watch_interval": 60, "focus_allow": [], "focus_hours": 4}
 
 
 def load_settings():
@@ -2312,7 +3210,9 @@ def cmd_settings(args):
         for k, v in s.items():
             print(f"  {k:<20} {v}")
         print(f"\n  background watcher is {'RUNNING' if running else 'not running'}")
-        print("\n  macguard settings background_watcher on|off\n  macguard settings watch_interval <seconds>")
+        print("\n  macguard settings background_watcher on|off\n  macguard settings watch_interval <seconds>"
+              "\n  macguard settings focus_allow 'Spotify,Figma'   (apps dev focus never pauses; '' clears)"
+              "\n  macguard settings focus_hours <hours>           (dev focus resumes by itself after this)")
         return
     if args.key not in DEFAULT_SETTINGS:
         sys.exit(f"Unknown setting '{args.key}'. Known: {', '.join(DEFAULT_SETTINGS)}")
@@ -2323,9 +3223,14 @@ def cmd_settings(args):
         if args.value.lower() not in ("on", "off", "true", "false", "1", "0"):
             sys.exit("Use on or off.")
         s[args.key] = args.value.lower() in ("on", "true", "1")
+    elif isinstance(DEFAULT_SETTINGS[args.key], list):
+        s[args.key] = [x.strip().lower() for x in args.value.split(",") if x.strip()]
     else:
         s[args.key] = int(args.value)
     save_settings(s)
+    if args.key.startswith("focus_"):
+        print(f"{args.key} = {s[args.key]}")
+        return
     # apply: the background agent exists only while the setting is on
     if s["background_watcher"]:
         ok, err = install_agent(s["watch_interval"])
@@ -2480,6 +3385,9 @@ def cmd_ui(args):
                 return self.send(200, [dict(name=a["name"], version=a["version"], bundle_id=a["bundle_id"], path=a["path"],
                                             protected=protected_app(a), kill_protected=kill_protected(a),
                                             processes=len(app_process_tree(a, table))) for a in app_inventory()])
+            if self.path.split("?")[0] == "/api/perf":
+                return self.send(200, dict(perf_json(perf_report("heavy" if self.path.endswith("?before=heavy") else None)),
+                                           focus=focus_status(), devmode=devmode_status()))
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -2544,6 +3452,44 @@ def cmd_ui(args):
                     return self.send(409, {"error": str(e)})
                 return self.send(200, dict(view, moved=len(moved), freed=sum(n for _, n in moved),
                                            failed=[{"path": p.replace(HOME, "~"), "error": e} for p, e in failed]))
+            if self.path in ("/api/perf/focus/plan", "/api/perf/focus"):
+                # re-planned on the server every time: the page never names pids
+                with lock:
+                    _, plan = focus_snapshot()
+                    view = dict(pause=[{k: g[k] for k in ("name", "cpu", "mem", "count")} for g in plan["pause"]],
+                                kept=plan["kept"], hours=load_settings()["focus_hours"])
+                    if self.path == "/api/perf/focus/plan":
+                        return self.send(200, view)
+                    paused, until = focus_pause(plan["pause"], view["hours"], source="ui")
+                return self.send(200, dict(view, paused=len(paused), until=until))
+            if self.path in ("/api/devmode/plan", "/api/devmode/on"):
+                # planned on the server every time; the page only chooses which parts to leave out
+                skip = tuple(s for s in body.get("skip") or [] if s in DEVMODE_PARTS)
+                with lock:
+                    plan = devmode_plan(skip)
+                    view = dict(stop=[it["name"] for it in plan["stop"]], pause=[g["name"] for g in plan["pause"]],
+                                motion=plan["motion"], awake=plan["awake"], advice=plan["advice"],
+                                hours=load_settings()["focus_hours"])
+                    if self.path == "/api/devmode/plan":
+                        return self.send(200, view)
+                    try:
+                        devmode_on(plan, view["hours"], source="ui")
+                    except ValueError as e:
+                        return self.send(409, {"error": str(e)})
+                return self.send(200, dict(view, status=devmode_status()))
+            if self.path == "/api/devmode/off":
+                with lock:
+                    return self.send(200, devmode_off("Mac Cleanup UI") or {"error": "not on"})
+            if self.path == "/api/perf/resume":
+                with lock:
+                    return self.send(200, {"resumed": len(focus_resume("Mac Cleanup UI"))})
+            if self.path == "/api/perf/stop":
+                # re-plan from a fresh snapshot: the page only names item ids, never pids or commands
+                ids = {str(i) for i in body.get("ids") or []}
+                with lock:
+                    plan = perf_plan(perf_report()["items"], ids) if ids else []
+                    results = apply_perf(plan)
+                return self.send(200, {"stopped": results})
             if self.path == "/api/settings":
                 s = load_settings()
                 if "background_watcher" in body:
@@ -2556,6 +3502,13 @@ def cmd_ui(args):
                 return self.send(200, s)
             self.send(404, {"error": "not found"})
 
+    def end_ui_session(*_):
+        # the app (or Ctrl-C) ends the session: what the UI paused must not stay paused
+        if (load_focus() or {}).get("source") == "ui":
+            focus_resume("Mac Cleanup closed")
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, lambda *a: (end_ui_session(), os._exit(0)))  # the app quits with launchctl bootout
     if args.parent_pid:
         # launched by the app: exit when the app goes away
         def watchdog():
@@ -2564,6 +3517,7 @@ def cmd_ui(args):
                 try:
                     os.kill(args.parent_pid, 0)
                 except OSError:
+                    end_ui_session()
                     os._exit(0)
         threading.Thread(target=watchdog, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
@@ -2576,7 +3530,7 @@ def cmd_ui(args):
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
+        end_ui_session()
 
 
 def cmd_mcp(args):
@@ -2705,6 +3659,18 @@ def main():
     p.add_argument("app", help="app name or bundle id"); p.add_argument("--yes", action="store_true")
     p.add_argument("--keep-agents", action="store_true", help="don't unload its launch agents (it may relaunch)")
     p.set_defaults(fn=cmd_kill)
+    p = sub.add_parser("perf", help="what's hogging CPU/memory/heat; free resources for dev work")
+    p.add_argument("--apply", action="store_true", help="stop the safe items (or the --only ones)")
+    p.add_argument("--only", help="comma-separated item ids (needed for review items)")
+    p.add_argument("--before", choices=["heavy"], help="also check readiness for a Unity/Xcode/Android build or render")
+    p.add_argument("--focus", action="store_true", help="pause background apps that aren't dev tools (dry run without --apply)")
+    p.add_argument("--resume", action="store_true", help="resume everything --focus paused")
+    p.add_argument("--yes", action="store_true"); p.set_defaults(fn=cmd_perf)
+    sub.add_parser("focus-timer", help=argparse.SUPPRESS).set_defaults(fn=cmd_focus_timer)
+    p = sub.add_parser("devmode", help="one switch for dev work: stop, pause, no animations, stay awake")
+    p.add_argument("action", nargs="?", choices=["status", "on", "off"], default="status")
+    p.add_argument("--skip", help="leave parts out: stop,pause,motion,awake"); p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_devmode)
     p = sub.add_parser("traffic"); p.add_argument("--seconds", type=int, default=8); p.set_defaults(fn=cmd_traffic)
     p = sub.add_parser("netmon"); p.add_argument("--interval", type=int, default=5); p.add_argument("--seconds", type=int)
     p.set_defaults(fn=cmd_netmon)
@@ -2727,6 +3693,8 @@ def main():
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_ui)
     sub.add_parser("mcp", help="MCP server on stdio for AI clients").set_defaults(fn=cmd_mcp)
     args = ap.parse_args()
+    if args.fn is not cmd_focus_timer:
+        focus_check_expired()  # nothing stays paused past its time, whichever command runs next
     args.fn(args)
 
 

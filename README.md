@@ -9,6 +9,8 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
 - **Apps and traffic**: flags installed apps with broken or missing signatures, outdated, end-of-life or remote-access apps and orphaned root helpers, and samples live traffic per process to spot heavy uploads, scanning or odd destinations.
 - **Full uninstall and app reset**: removes an app plus its scattered data (Application Support, Caches, Preferences, Containers, saved state, cookies, launch agents and system launch daemons) by exact bundle ID or name, and finds leftovers from apps you've already deleted. Everything goes to the **Trash**, so it's recoverable. Apple apps and running apps are refused.
+- **Performance for dev work**: finds what is hogging CPU, memory and heat, grouped by app: Docker Desktop and its VM, Ollama, Remotion/headless-Chrome renders and ffmpeg, Spotlight indexing, booted iOS simulators, Gradle and Kotlin daemons, Unity, Android emulators, Node dev servers, and leftover processes whose parent has exited. Shows thermal throttling, load, memory pressure and swap. Each item is **safe** to stop or **review**, and stopping one always tells you how to start it again. `--before heavy` checks you're ready for a Unity, Xcode or Android build or a video render. **Dev focus** (`--focus`) pauses background apps that aren't dev tools, so only development work runs, and resumes them exactly where they were.
+- **Developer mode**: one switch (`macguard devmode on`, or **⚡ Developer mode** in the app) that stops idle dev services, pauses apps that aren't dev tools, turns off animations and motion (Reduce Motion and Transparency, window, Dock and Finder animations), and keeps the Mac awake for long builds. `devmode off` puts every setting back and restarts what it stopped. It turns itself off after `focus_hours`.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
 - **Network monitor**: records every connection (program → IP:port, bytes) into a day-by-day history, names the IPs by reverse DNS, and warns about risky traffic: suspicious ports, unsigned or temp-folder programs online, inbound connections, unencrypted protocols, new destinations.
 - **Heavy processes**: lists what is eating CPU or memory and says which are safe to stop. macOS, root-owned and the session's own processes are never killed.
@@ -54,6 +56,15 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
 | `macguard uninstall <app> [--apply] [--leftovers-only]` | Dry-run by default: lists the app and every leftover. `--apply` moves them to the Trash; `--leftovers-only` resets the app and keeps it. Also in the UI under Applications → Manage apps. |
 | `macguard kill <app> [--keep-agents]` | Quit an app **and everything under it**: helpers, XPC services, child processes and root helpers. It unloads the app's launch agents first so it can't relaunch, then sends TERM, then KILL after 5 s. Root processes get a ready `sudo kill` line. In the UI, running apps show a badge and a **Quit** button. `uninstall --quit` stops the app before removing it. |
+| `macguard perf` | What's using CPU, memory and heat: dev daemons and leftover processes marked **safe** or **review**, the heaviest apps, thermal state, load, memory pressure and swap. Read-only. In the UI: **Performance**. |
+| `macguard perf --apply` | Stop the **safe** items after you type `yes`: idle Docker Desktop and Ollama, idle Gradle daemons (`gradle --stop`), booted simulators (`xcrun simctl shutdown all`), leftover render helpers. Prints what it stopped and how to start each again. Never touches macOS or root processes, never uses `sudo`. |
+| `macguard perf --only docker,unity --apply` | Stop specific **review** items (a busy Docker, Unity, an emulator, a running render, dev servers, orphans). |
+| `macguard perf --before heavy` | Also checks free space (~30 GB for Unity or Xcode), Low Power Mode and battery, and lists what to close before a heavy build. |
+| `macguard perf --focus [--apply]` | **Dev focus:** pause (SIGSTOP) your background apps that aren't development tools, such as browsers, chat, music, cloud sync, updaters and idle Ollama, with their helpers. Never paused: dev tools (Unity, Xcode and simulators, Android Studio/Gradle, VS Code, JetBrains, terminals and shells, node/python/dotnet/git, Docker, Claude), anything that starts a dev process, the app in front, password managers, VPNs, input and window tools, call apps, and macOS or root processes. Dry run without `--apply`; with it you type `yes`. No `sudo`. **Paused apps can show as "Not Responding"** until resumed; nothing is closed or lost. |
+| `macguard perf --resume` | Continue (SIGCONT) everything dev focus paused, recorded in `~/.macguard/focus.json`. It also happens by itself after `focus_hours` (default 4) through a small background timer, at the next `macguard` run or watcher check after that, and when you close Mac Cleanup if focus was turned on there. |
+| `macguard devmode` | Shows what developer mode would do on this Mac right now. Read-only. |
+| `macguard devmode on [--skip stop,pause,motion,awake]` | After you type `yes`, it does four things. It **stops** the safe `perf` items (idle Docker and Ollama, simulators, idle Gradle, leftover renders). It **pauses** non-dev apps, like `perf --focus`. It turns off **motion** by saving and then changing user settings: Reduce Motion and Transparency, window open/resize and smooth-scroll animations, Dock launch and minimize animations, Mission Control speed, and Finder animations. The Dock restarts for a second. It keeps the Mac **awake** with `caffeinate`. It also lists what it can't change without admin rights: Low Power Mode, Do Not Disturb, Spotlight exclusions. No `sudo`. If macOS refuses the Reduce Motion setting, it tells you where to switch it in System Settings. |
+| `macguard devmode off` | Restores every changed setting to its previous value, resumes paused apps, opens Docker and Ollama again if it stopped them, and ends `caffeinate`. Simulators and Gradle start again by themselves when you next build. It also turns off by itself after `focus_hours` (default 4). |
 | `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
 | `macguard netmon [--interval 5] [--seconds N]` | Record connections into `~/.macguard/netlog.db` until Ctrl-C. |
 | `macguard netlog [--days 7] [--proc NAME]` | Network history: connections per day, top programs and destinations (with names, ports, days seen), and risky-traffic findings. |
@@ -63,7 +74,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
 | `macguard report` | Static HTML report in `~/.macguard/report.html`. |
-| `macguard settings [key value]` | `background_watcher on/off` (off by default), `watch_interval <sec>`. |
+| `macguard settings [key value]` | `background_watcher on/off` (off by default), `watch_interval <sec>`, `focus_allow 'Spotify,Figma'` (apps dev focus never pauses), `focus_hours <h>` (auto-resume). |
 | `macguard doctor [--bundle]` | Check prerequisites and optionally write a support file. |
 
 ## MCP server
@@ -103,7 +114,7 @@ It records the connection table every 10 seconds and keeps 90 days. It reads the
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 151 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 188 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
