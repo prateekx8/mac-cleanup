@@ -1896,6 +1896,59 @@ class TestWebUI(TempHome):
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
+    def test_netlog_and_procs_routes(self):
+        rec = mg.NetRecorder()
+        with mock.patch.object(mg, "sockets", lambda: [dict(proto="tcp4", lhost="10.0.0.2", lport=50000, rhost="8.8.8.8",
+                                                            rport=443, state="ESTABLISHED", proc="curl", pid=7, rx=10, tx=20)]), \
+                mock.patch.object(mg, "process_table", lambda: [dict(pid=7, ppid=1, uid=os.getuid(), cpu=0, mem=0,
+                                                                     elapsed=1, exe="/usr/bin/curl")]):
+            rec.sample()
+        with mock.patch.object(mg, "resolve_names", lambda ips, **k: {"8.8.8.8": "dns.google"}):
+            r = json.loads(self.req("/api/netlog?days=abc")[1])
+        self.assertEqual(r["days"], 7)
+        self.assertEqual(r["totals"]["connections"], 1)
+        self.assertEqual(r["destinations"][0]["name"], "dns.google")
+        self.assertIn("recording", r["status"])
+        with mock.patch.object(mg, "process_table", lambda: [
+                dict(pid=999999, ppid=1, uid=os.getuid(), cpu=90.0, mem=1, elapsed=60, exe="/opt/x/bin/hog"),
+                dict(pid=1, ppid=0, uid=0, cpu=95.0, mem=1, elapsed=60, exe="/sbin/launchd")]):
+            procs = json.loads(self.req("/api/procs")[1])
+            self.assertEqual([(p["name"], p["killable"]) for p in procs], [("launchd", False), ("hog", True)])
+            r = json.loads(self.req("/api/procs/kill", body={"pid": 1, "exe": "/sbin/launchd"})[1])
+            self.assertFalse(r["ok"])
+            self.assertIn("refused", r["detail"])
+        self.assertEqual(self.req("/api/procs/kill", body={"pid": "x"})[0], 400)
+        self.assertEqual(self.req("/api/procs", token=None)[0], 403)
+
+    def test_capture_routes(self):
+        import macguard_capture as cap
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from test_capture import MAC, ESP, eth, ip4, tcp, write_pcap
+        cdir = os.path.join(self.home, ".macguard", "captures")
+        os.makedirs(os.path.join(self.home, "Downloads"))
+
+        def fake_admin(script, reason):
+            write_pcap(script.split(" -w ")[1].split(" ")[0].strip("'"),
+                       [eth(ip4(MAC, ESP, 6, tcp(50000, 80, 1, b"GET /led HTTP/1.1\r\nHost: esp\r\n\r\n")))])
+            return True, ""
+        with mock.patch.object(cap, "CAPTURE_DIR", cdir), mock.patch.object(cap, "run_as_admin", fake_admin), \
+                mock.patch.object(cap, "interfaces", lambda: ["en0"]), mock.patch.object(cap, "default_iface", lambda: "en0"), \
+                mock.patch.object(cap, "local_addrs", lambda: {MAC}), mock.patch.object(mg, "sockets", lambda: []), \
+                mock.patch.object(mg, "run", lambda *a, **k: (0, "", "")):
+            self.assertEqual(json.loads(self.req("/api/captures")[1])["captures"], [])
+            self.assertEqual(self.req("/api/capture/start", body={"host": "1.2.3.4; id"})[0], 409)
+            cid = json.loads(self.req("/api/capture/start", body={"seconds": 1, "preset": "local", "host": ESP})[1])["id"]
+            rep = json.loads(self.req("/api/capture?id=" + cid)[1])
+            self.assertEqual(rep["items"][0]["details"][0], "GET esp/led")
+            code, raw = self.req(f"/api/capture/file?id={cid}&flow=0&dir=out")
+            self.assertTrue(raw.startswith("GET /led"))
+            self.assertEqual(self.req("/api/capture/file?id=../../etc/passwd")[0], 404)
+            saved = json.loads(self.req("/api/capture/save", body={"id": cid})[1])
+            self.assertEqual(saved["path"], os.path.join(self.home, "Downloads", f"macguard-{cid}.pcap"))
+            self.assertTrue(os.path.exists(saved["path"]))
+            self.assertEqual(self.req("/api/capture/save", body={"id": "../x"})[0], 404)
+            self.assertEqual(self.req("/api/capture/start", body={}, token=None)[0], 403)
+
     def test_page_served_with_token(self):
         code, page = self.req("/", token=None)
         self.assertEqual(code, 200)

@@ -21,6 +21,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import macguard as mg  # noqa: E402
+import macguard_capture as cap  # noqa: E402
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 PLAN_TTL = 15 * 60
@@ -189,6 +190,27 @@ def t_network_record(a):
     return {"samples": samples, "status": mg.netlog_status()}
 
 
+def t_capture_list(a):
+    return {"captures": cap.list_captures(), "keylog": cap.keylog_status(), "interfaces": cap.interfaces(),
+            "default_interface": cap.default_iface()}
+
+
+def t_capture_analyze(a):
+    rep = cap.analyze(cid=a.get("id"), path=a.get("file"), limit=a.get("limit", 50))
+    if not a.get("payloads", True):
+        for r in rep["items"]:
+            r["preview_out"]["text"] = r["preview_in"]["text"] = ""
+    return rep
+
+
+def t_packet_capture(a):
+    if a.get("confirm") is not True:
+        raise ValueError("refusing to capture without confirm=true (it shows the user an admin password dialog)")
+    meta = cap.capture(a.get("seconds", 30), a.get("interface"), a.get("preset", "all"), a.get("host"), a.get("port"),
+                       a.get("filter"))
+    return {"id": meta["id"], "size": meta["size"], "filter": meta["filter"], "next": "call capture_analyze with this id"}
+
+
 def t_doctor(a):
     return {"checks": [{"ok": ok, "name": n, "detail": d} for ok, n, d in mg.doctor_checks()]}
 
@@ -258,6 +280,24 @@ TOOLS = [
      _obj({"seconds": {"type": "integer", "minimum": 1, "maximum": 120, "default": 10},
            "interval": {"type": "integer", "minimum": 1, "maximum": 30, "default": 2}}),
      {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_network_record),
+    ("capture_list", "Saved packet captures (pcap files under ~/.macguard/captures), network interfaces, and how to "
+     "set up an SSLKEYLOGFILE so Wireshark can decrypt TLS. Read-only.", _obj(), READ_ONLY, t_capture_list),
+    ("capture_analyze", "Read a saved capture (id) or any classic .pcap (file): every TCP/UDP flow with process, bytes "
+     "each way, protocol, and what was sent when it is readable: HTTP requests, MQTT CONNECT/PUBLISH topics and "
+     "payloads, DNS/mDNS names, CoAP paths, SSDP, raw text/hex. TLS shows only the server name (SNI). Flags "
+     "plaintext credentials and unencrypted IoT protocols to the internet. Read-only.",
+     _obj({"id": {"type": "string"}, "file": {"type": "string"},
+           "payloads": {"type": "boolean", "default": True, "description": "include payload previews (may hold secrets)"},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}}), READ_ONLY, t_capture_analyze),
+    ("packet_capture", "Record packets with tcpdump for a few seconds. Needs root, so macOS shows the user an admin "
+     "password dialog; they type it, never you. Presets: all, local (LAN only, for IoT devices), plaintext (HTTP/MQTT/"
+     "CoAP/DNS ports). Ask the user first and pass confirm=true.",
+     _obj({"seconds": {"type": "integer", "minimum": 1, "maximum": 300, "default": 30},
+           "preset": {"type": "string", "enum": ["all", "local", "plaintext"], "default": "all"},
+           "host": {"type": "string", "description": "only this IP or hostname (e.g. an IoT device)"},
+           "port": {"type": "integer"}, "filter": {"type": "string", "description": "extra tcpdump filter"},
+           "interface": {"type": "string"}, "confirm": {"type": "boolean", "description": "Must be true"}}, ("confirm",)),
+     {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_packet_capture),
     ("doctor", "Check prerequisites (system Python, socket visibility, required and optional tools).", _obj(), READ_ONLY, t_doctor),
     ("recent_events", "Recent macguard events (cleanups, watcher alerts) and current settings.",
      _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 30}}), READ_ONLY, t_recent_events),

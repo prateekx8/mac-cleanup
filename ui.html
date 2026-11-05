@@ -170,6 +170,13 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 /* installed apps */
 .search{flex:1;max-width:320px;height:34px;padding:0 14px;border-radius:999px;border:1px solid var(--stroke);background:var(--glass-2);color:var(--fg);font:inherit}
 .legend:has(.search){align-items:center}
+.sel{flex:0 0 auto;max-width:none;padding:0 10px}
+.capform{flex-wrap:wrap;gap:8px;align-items:center;padding:4px 0 10px}.capform .search{flex:1 1 180px}.capform .sel{flex:0 0 auto}
+.flow{border:1px solid var(--stroke);border-radius:14px;padding:10px 12px;margin:8px 0;background:var(--glass-2)}
+.flow summary{cursor:pointer;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;list-style:none}
+.flow summary small{color:var(--fg-3)}.flow ul{margin:8px 0 0 18px;padding:0;font-size:13px}
+.flow pre{white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto;font-size:12px;background:var(--glass);padding:8px;border-radius:10px;margin:8px 0 0}
+.flow .acts{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 .app{display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:14px}
 .app:hover{background:var(--glass)}
 .app .n{flex:1;min-width:0}
@@ -306,6 +313,32 @@ footer code{font-family:var(--mono)}
     <div class="ph"><span class="ic">📈</span><div class="grow"><h2>Live traffic</h2><small>Who's sending data right now: heavy uploads, scanning, odd ports</small></div>
       <button class="btn ghost sm" id="trafficBtn">Sample 6s</button></div>
     <div id="traffic" class="empty">Not sampled yet.</div>
+  </section>
+
+  <section class="panel glass">
+    <div class="ph"><span class="ic">🔬</span><div class="grow"><h2>Packet capture</h2><small>See what is actually sent — IoT calls, HTTP, MQTT, CoAP, DNS · asks for your admin password</small></div>
+      <button class="btn ghost sm" id="capListBtn">Saved</button></div>
+    <div class="legend capform">
+      <select id="capPreset" class="search sel" aria-label="What to capture"><option value="all">All traffic</option><option value="local">Local network (IoT devices)</option><option value="plaintext">Plaintext protocols</option></select>
+      <input id="capHost" class="search" placeholder="Device IP or host (optional)" aria-label="Device IP or host">
+      <select id="capSecs" class="search sel" aria-label="Duration"><option>10</option><option selected>30</option><option>60</option><option>120</option><option>300</option></select><span>s</span>
+      <select id="capIface" class="search sel" aria-label="Interface"></select>
+      <button class="btn primary sm" id="capBtn">Capture</button></div>
+    <div id="capture" class="empty">No capture open. HTTPS contents stay encrypted; you see the server name. For TLS decryption see Saved.</div>
+  </section>
+
+  <section class="panel glass">
+    <div class="ph"><span class="ic">🛰️</span><div class="grow"><h2>Network history</h2><small id="nlTxt">Which programs talk to which IPs, how often, over days · warns about unknown or risky traffic</small></div>
+      <select id="nlDays" class="search sel" aria-label="Period"><option value="1">24 h</option><option value="7" selected>7 days</option><option value="30">30 days</option><option value="90">90 days</option></select>
+      <button class="btn ghost sm" id="nlRec" title="Record connections for 10 seconds">Record 10s</button>
+      <button class="btn ghost sm" id="nlBtn">Check</button></div>
+    <div id="netlog" class="empty">Not checked yet.</div>
+  </section>
+
+  <section class="panel glass">
+    <div class="ph"><span class="ic">🧮</span><div class="grow"><h2>Heavy processes</h2><small>Over 30% CPU or 1 GB memory · macOS and root processes are never stopped</small></div>
+      <button class="btn ghost sm" id="procBtn">Check</button></div>
+    <div id="procs" class="empty">Not checked yet.</div>
   </section>
 
   <section class="panel glass">
@@ -495,6 +528,122 @@ async function checkTraffic(){
     issues.traffic = serious(r.findings); countIssues();
   } catch(e){ $("traffic").textContent = "Failed: " + e.message; }
   busy($("trafficBtn"), false, "Sample again");
+}
+let capRep = null;
+async function loadCaptures(){
+  const r = await api("/api/captures");
+  if (!$("capIface").options.length) $("capIface").innerHTML = r.ifaces.filter(i => /^(en|lo|bridge|utun|awdl)/.test(i))
+    .map(i => `<option ${i===r.iface?"selected":""}>${esc(i)}</option>`).join("");
+  return r;
+}
+async function listCaptures(){
+  try {
+    const r = await loadCaptures(); $("capture").className = "";
+    $("capture").innerHTML = (r.captures.length ? `<div class="list">` + r.captures.map(c => `<div class="app"><div class="n">${esc(c.id)}
+        <small>${human(c.size)} · ${esc(c.iface||"?")} · ${c.seconds||"?"}s · ${esc(c.filter||"all traffic")}</small></div>
+        <button class="btn ghost sm" data-open="${esc(c.id)}">Open</button></div>`).join("") + `</div>`
+      : '<div class="empty">No captures yet.</div>') +
+      `<div class="dgroup"><h3>Decrypting HTTPS</h3></div><p class="note" style="font-size:13px">${esc(r.keylog.how)}<br>Key log: <code>${esc(r.keylog.path)}</code> ${r.keylog.exists ? "· " + human(r.keylog.size) : "· not created yet"}</p>`;
+    $("capture").querySelectorAll("[data-open]").forEach(b => b.onclick = () => openCapture(b.dataset.open));
+  } catch(e){ $("capture").textContent = "Failed: " + e.message; }
+}
+async function startCapture(){
+  const secs = +$("capSecs").value;
+  busy($("capBtn"), true);
+  $("capture").className="empty"; $("capture").innerHTML=`<span class="spin"></span>&nbsp; Enter your admin password in the macOS dialog, then capturing for ${secs}s…`;
+  try {
+    const r = await api("/api/capture/start", {seconds: secs, preset: $("capPreset").value, host: $("capHost").value, iface: $("capIface").value});
+    toast(`Captured ${human(r.size)}`); await openCapture(r.id);
+  } catch(e){ $("capture").className="empty"; $("capture").textContent = "Capture failed: " + e.message; }
+  busy($("capBtn"), false, "Capture");
+}
+async function openCapture(id){
+  $("capture").className="empty"; $("capture").innerHTML='<span class="spin"></span>&nbsp; Decoding packets…';
+  try { capRep = await api("/api/capture?id=" + encodeURIComponent(id)); renderCapture(); }
+  catch(e){ $("capture").textContent = "Failed: " + e.message; }
+}
+function renderCapture(){
+  const r = capRep;
+  let h = `<div class="netinfo"><div><span class="k">Capture</span>${esc(r.id)} <span style="opacity:.6">${esc(r.iface||"")} · ${esc(r.filter||"all traffic")}</span></div>
+      <div><span class="k">Flows</span>${r.flows} · ${r.readable} readable · ${human(r.bytes)}</div>
+      <div><span class="k">Protocols</span>${Object.entries(r.protocols).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${esc(k)} ${v}`).join(" · ")}</div></div>
+    <div class="acts" style="display:flex;gap:8px;margin:8px 0"><button class="btn ghost sm" id="capSave">Save .pcap to Downloads</button>
+      <button class="btn ghost sm" id="capBack">All captures</button></div>` + renderFindings(r.findings);
+  h += r.items.map(f => `<details class="flow"><summary>${f.encrypted?"🔒":"📖"} <b>${esc(f.app)}</b> ${esc(f.process||"")}
+        <span>${esc(f.client)}:${f.cport} → ${esc(f.server)}:${f.sport}</span>${f.local_network?' <span class="chip safe">LAN</span>':""}
+        <small>↑ ${human(f.bytes_out)} · ↓ ${human(f.bytes_in)} · ${f.packets_out+f.packets_in} pkts · ${f.duration}s</small></summary>
+      ${f.details.length ? `<ul>${f.details.map(d=>`<li>${esc(d)}</li>`).join("")}</ul>` : ""}
+      ${f.preview_out.text ? `<div class="k" style="margin-top:8px">Sent (${f.preview_out.kind})</div><pre>${esc(f.preview_out.text)}</pre>` : ""}
+      ${f.preview_in.text ? `<div class="k" style="margin-top:8px">Received (${f.preview_in.kind})</div><pre>${esc(f.preview_in.text)}</pre>` : ""}
+      ${f.encrypted ? '<p class="note" style="font-size:13px">Encrypted: only the server name is visible. Save the .pcap and use a key log in Wireshark to decrypt.</p>' : ""}
+      <div class="acts">${f.bytes_out?`<button class="btn ghost sm" data-save="${f.id}" data-dir="out">Save sent bytes</button>`:""}
+        ${f.bytes_in?`<button class="btn ghost sm" data-save="${f.id}" data-dir="in">Save received bytes</button>`:""}</div></details>`).join("");
+  $("capture").className = ""; $("capture").innerHTML = h;
+  $("capSave").onclick = () => saveCapture({id: r.id});
+  $("capBack").onclick = listCaptures;
+  $("capture").querySelectorAll("[data-save]").forEach(b => b.onclick = () => saveCapture({id: r.id, flow: +b.dataset.save, dir: b.dataset.dir}));
+  issues.capture = serious(r.findings); countIssues();
+}
+async function saveCapture(body){
+  try { const r = await api("/api/capture/save", body); toast(`Saved ${r.path.split("/").pop()} to Downloads`); }
+  catch(e){ toast("Save failed: " + e.message); }
+}
+async function checkNetlog(){
+  busy($("nlBtn"), true);
+  $("netlog").className="empty"; $("netlog").innerHTML='<span class="spin"></span>&nbsp; Reading history and looking up names…';
+  try {
+    const r = await api("/api/netlog?days=" + $("nlDays").value), st = r.status, t = r.totals; $("netlog").className="";
+    $("nlTxt").textContent = (st.recording ? "Recording in the background" : "Not recording in the background (turn on Background watcher below)") +
+      (st.last_sample ? ` · last sample ${st.last_sample}` : "") + ` · keeps ${st.keeps_days} days`;
+    if (!t.connections){ $("netlog").className="empty";
+      $("netlog").innerHTML = "No history yet. Press Record 10s, or turn on the Background watcher to record all the time."; issues.netlog = 0; countIssues(); return; }
+    const maxd = Math.max(1, ...r.per_day.map(d => d.conns));
+    let h = `<div class="netinfo">
+        <div><span class="k">Connections</span>${t.connections.toLocaleString()} <span style="opacity:.6">over ${r.period.days_with_data} day${r.period.days_with_data===1?"":"s"}</span></div>
+        <div><span class="k">Destinations</span>${t.destinations} IPs · ${t.programs} programs</div>
+        <div><span class="k">Data</span>↓ ${human(t.rx)} · ↑ ${human(t.tx)}</div></div>`;
+    h += renderFindings(r.findings);
+    h += `<div class="dgroup"><h3>Per day</h3></div><div class="top">` + r.per_day.slice().reverse().map(d => `<div class="tr"><div class="n">${esc(d.day)}<small>${d.procs} programs · ${d.dests} IPs</small></div>
+      <div class="bars"><i class="d" style="width:${(d.conns/maxd*100).toFixed(1)}%"></i></div><div class="v">${d.conns}</div><div class="v">${human(d.rx+d.tx)}</div></div>`).join("") + `</div>`;
+    h += `<div class="dgroup"><h3>Programs</h3></div><div class="top"><div class="tr h"><div>Program</div><div></div><div class="v">Conns</div><div class="v">IPs</div></div>` +
+      r.programs.map(p => `<div class="tr"><div class="n">${esc(p.name)}<small title="${esc(p.exe)}">${esc(p.exe)} · ${p.days} day${p.days===1?"":"s"} · last ${esc(p.last_seen)}</small></div><div></div>
+      <div class="v">${p.conns}</div><div class="v">${p.dests}</div></div>`).join("") + `</div>`;
+    h += `<div class="dgroup"><h3>Destinations</h3></div><div class="top"><div class="tr h"><div>IP / name</div><div></div><div class="v">Conns</div><div class="v">Data</div></div>` +
+      r.destinations.map(d => `<div class="tr"><div class="n">${esc(d.ip)} ${d.name?`<span style="color:var(--fg-3)">${esc(d.name)}</span>`:""}${d.inbound?' <span class="chip review">inbound</span>':""}
+        <small>${d.private?"local network · ":""}ports ${esc(d.ports.join(", "))} · ${esc(d.procs.join(", "))} · first ${esc(d.first_seen)}</small></div><div></div>
+      <div class="v">${d.conns}</div><div class="v">${human(d.rx+d.tx)}</div></div>`).join("") + `</div>`;
+    $("netlog").innerHTML = h; issues.netlog = serious(r.findings); countIssues();
+  } catch(e){ $("netlog").textContent = "Failed: " + e.message; }
+  busy($("nlBtn"), false, "Recheck");
+}
+async function recordNetlog(){
+  busy($("nlRec"), true);
+  try { await api("/api/netlog/record", {seconds: 10}); toast("Recorded 10 seconds of connections"); }
+  catch(e){ toast("Record failed: " + e.message); }
+  busy($("nlRec"), false, "Record 10s"); checkNetlog();
+}
+let procs = [];
+async function checkProcs(){
+  busy($("procBtn"), true);
+  try {
+    procs = await api("/api/procs"); $("procs").className="";
+    $("procs").innerHTML = procs.length ? `<div class="legend"><span class="chip system">system</span> never stopped
+        <span class="chip app">app</span> quit the app to keep unsaved work <span class="chip safe">background</span> safe for macOS to stop</div>
+      <div class="list">` + procs.map((p,i) => `<div class="app"><div class="n">${esc(p.name)} <span style="color:var(--fg-3)">pid ${p.pid}</span>
+        <small title="${esc(p.exe)}">${p.cpu.toFixed(0)}% CPU · ${human(p.mem)} · running ${esc(p.elapsed)} · ${esc(p.advice)}</small></div>
+        <span class="chip ${p.kind==="background"?"safe":esc(p.kind)}">${esc(p.kind)}</span>
+        ${p.killable ? `<button class="btn ghost sm" data-stop="${i}">Stop</button>` : `<span class="lock">🔒</span>`}</div>`).join("") + `</div>`
+      : '<div class="empty">Nothing heavy right now.</div>';
+    $("procs").querySelectorAll("[data-stop]").forEach(b => b.onclick = () => stopProc(procs[+b.dataset.stop], b));
+  } catch(e){ $("procs").textContent = "Failed: " + e.message; }
+  busy($("procBtn"), false, "Recheck");
+}
+async function stopProc(p, btn){
+  if (!confirm(`Stop ${p.name} (pid ${p.pid})?\n\n${p.exe}\n${p.advice}\n\nIt gets a normal quit signal (SIGTERM); unsaved work in it may be lost.`)) return;
+  busy(btn, true);
+  try { const r = await api("/api/procs/kill", {pid: p.pid, exe: p.exe}); toast((r.ok ? "Stopped: " : "Not stopped: ") + r.detail); }
+  catch(e){ toast("Stop failed: " + e.message); }
+  checkProcs();
 }
 let installed = [];
 function renderInstalled(){
@@ -718,7 +867,11 @@ $("perfBtn").onclick = () => checkPerf(false); $("perfHeavyBtn").onclick = () =>
 
 $("secBtn").onclick = checkSec; $("netBtn").onclick = checkNet;
 $("appsBtn").onclick = checkApps; $("trafficBtn").onclick = checkTraffic;
-$("checkAll").onclick = () => { checkSec(); checkNet(); checkApps(); checkTraffic(); checkPerf(false); };
+$("nlBtn").onclick = checkNetlog; $("nlRec").onclick = recordNetlog; $("nlDays").onchange = checkNetlog;
+$("procBtn").onclick = checkProcs;
+$("capBtn").onclick = startCapture; $("capListBtn").onclick = listCaptures;
+loadCaptures().catch(()=>{});
+$("checkAll").onclick = () => { checkSec(); checkNet(); checkApps(); checkTraffic(); checkPerf(false); checkNetlog(); checkProcs(); };
 
 async function loadSettings(){
   const s = await api("/api/settings"); $("wToggle").checked = s.background_watcher;
