@@ -67,6 +67,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard devmode off` | Restores every changed setting to its previous value, resumes paused apps, opens Docker and Ollama again if it stopped them, and ends `caffeinate`. Simulators and Gradle start again by themselves when you next build. It also turns off by itself after `focus_hours` (default 4). |
 | `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
 | `macguard netmon [--interval 5] [--seconds N]` | Record connections into `~/.macguard/netlog.db` until Ctrl-C. |
+| `macguard capture [--seconds 30] [--preset all\|local\|plaintext] [--host IP] [--payload]` | Record packets (asks for your admin password) and show every flow: process, bytes, protocol, and what was sent when readable. `--list`, `--show ID`, `--file x.pcap`. |
 | `macguard netlog [--days 7] [--proc NAME]` | Network history: connections per day, top programs and destinations (with names, ports, days seen), and risky-traffic findings. |
 | `macguard procs [--cpu 30] [--mem-mb 1024]` | Heavy processes, classed **system** (never killed), **app** (quit the app instead) or **background** (safe for macOS to stop). |
 | `macguard procs --kill <pid> [--force]` | Stop one non-system process after you type `yes` (SIGTERM, or SIGKILL with `--force`). |
@@ -97,6 +98,8 @@ claude mcp add mac-cleanup -- /usr/bin/python3 /path/to/mac-cleanup/macguard.py 
 | `network_alerts` | Risky traffic found in that history. Read-only. |
 | `network_record` | Sample connections now for a few seconds and add them to the history. |
 | `network_monitor_status` | Whether the background recorder runs and how many days are recorded. |
+| `capture_list`, `capture_analyze` | Saved captures, and one decoded: flows, HTTP requests, MQTT topics and payloads, DNS names, CoAP paths, TLS server names. Read-only. |
+| `packet_capture` | Records packets; macOS shows the user the admin password dialog. Needs `confirm: true`. |
 | `doctor`, `recent_events` | Prerequisites, and the event log with settings. |
 
 `apply_cleanup` and `kill_process` are marked destructive, so clients ask before running them. The server is standard-library Python like the rest.
@@ -111,10 +114,19 @@ macguard settings background_watcher on
 
 It records the connection table every 10 seconds and keeps 90 days. It reads the kernel's socket table, so it needs no root and sends nothing anywhere. Closed TCP connections stay visible for about 30 seconds (`TIME_WAIT`), so most short requests are caught too. Limits: it sees IP addresses, not the domain names a program asked DNS for, so names come from reverse DNS and many IPs have none. Long IPv6 addresses of root-owned processes stay shortened because netstat cuts them.
 
+## Packet capture
+
+The network monitor shows who talks to whom; packet capture shows what they say. In the app, open **Packet capture**, pick *Local network (IoT devices)* or type a device IP, and press **Capture**. macOS asks for your admin password (tcpdump needs root), then every flow is listed with the process that opened it.
+
+- Readable: HTTP (method, host, path, body), MQTT (client id, PUBLISH topic and payload, SUBSCRIBE), DNS and mDNS names, CoAP paths, SSDP, and any other plaintext as text or hex.
+- Encrypted (HTTPS, MQTT over TLS, QUIC): only the server name the program asked for. To decrypt, start the program with `SSLKEYLOGFILE=~/.macguard/sslkeys.log`, capture, then open the saved `.pcap` in Wireshark with that key log.
+- Flags credentials sent over plain HTTP, MQTT logins without TLS, and unencrypted IoT protocols to the internet.
+- Captures are kept in `~/.macguard/captures` (newest 20, readable only by you); **Save .pcap to Downloads** exports one for Wireshark.
+
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 188 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 205 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
