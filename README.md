@@ -8,6 +8,7 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Security audit**: firewall and stealth mode, SIP, Gatekeeper, FileVault, Screen Sharing and SSH, launch agents and daemons (unsigned or orphaned), and private keys left in Downloads, Desktop or Documents.
 - **Apps and traffic**: flags installed apps with broken or missing signatures, outdated, end-of-life or remote-access apps and orphaned root helpers, and samples live traffic per process to spot heavy uploads, scanning or odd destinations.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
+- **Network monitor**: records every connection (program → IP:port, bytes) into a day-by-day history, names the IPs by reverse DNS, and warns about risky traffic: suspicious ports, unsigned or temp-folder programs online, inbound connections, unencrypted protocols, new destinations.
 - **Heavy processes**: lists what is eating CPU or memory and says which are safe to stop. macOS, root-owned and the session's own processes are never killed.
 - **MCP server**: exposes all of it to AI clients such as Claude (`macguard mcp`).
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
@@ -48,6 +49,8 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard net` | Network snapshot and threat findings. |
 | `macguard apps [--online] [--list]` | Installed apps: broken or missing signatures, outdated (Homebrew), end-of-life or risky software, Intel-only, orphaned root helpers, system extensions. `--online` also checks Apple for macOS updates. |
 | `macguard traffic [--seconds 8]` | Samples live traffic per process: heavy uploads, outbound scanning, unsigned or temp-folder programs online, odd ports. |
+| `macguard netmon [--interval 5] [--seconds N]` | Record connections into `~/.macguard/netlog.db` until Ctrl-C. |
+| `macguard netlog [--days 7] [--proc NAME]` | Network history: connections per day, top programs and destinations (with names, ports, days seen), and risky-traffic findings. |
 | `macguard procs [--cpu 30] [--mem-mb 1024]` | Heavy processes, classed **system** (never killed), **app** (quit the app instead) or **background** (safe for macOS to stop). |
 | `macguard procs --kill <pid> [--force]` | Stop one non-system process after you type `yes` (SIGTERM, or SIGKILL with `--force`). |
 | `macguard mcp` | MCP server on stdio for AI clients. See below. |
@@ -73,14 +76,28 @@ claude mcp add mac-cleanup -- /usr/bin/python3 /path/to/mac-cleanup/macguard.py 
 | `process_check` | Heavy CPU/memory processes with `kind` and `killable`. Read-only. |
 | `kill_process` | Stops one non-system process. Needs the `exe` path from `process_check` (guards against pid reuse) and `confirm: true`. |
 | `security_audit`, `network_snapshot`, `apps_audit`, `traffic_sample` | The same audits as the CLI. Read-only. |
+| `network_history` | Recorded connections over N days: per day, top programs, top destination IPs with names. Read-only. |
+| `network_alerts` | Risky traffic found in that history. Read-only. |
+| `network_record` | Sample connections now for a few seconds and add them to the history. |
+| `network_monitor_status` | Whether the background recorder runs and how many days are recorded. |
 | `doctor`, `recent_events` | Prerequisites, and the event log with settings. |
 
 `apply_cleanup` and `kill_process` are marked destructive, so clients ask before running them. The server is standard-library Python like the rest.
 
+## Network monitor
+
+To keep a history all the time, turn on the background watcher (off by default):
+
+```bash
+macguard settings background_watcher on
+```
+
+It records the connection table every 10 seconds and keeps 90 days. It reads the kernel's socket table, so it needs no root and sends nothing anywhere. Closed TCP connections stay visible for about 30 seconds (`TIME_WAIT`), so most short requests are caught too. Limits: it sees IP addresses, not the domain names a program asked DNS for, so names come from reverse DNS and many IPs have none. Long IPv6 addresses of root-owned processes stay shortened because netstat cuts them.
+
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 92 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 102 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
