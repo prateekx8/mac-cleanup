@@ -10,13 +10,13 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 
 | Part | File | Responsibility |
 |---|---|---|
-| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `apps`, `traffic`, `watch`, `report`, `settings`, `ui`, `doctor`). |
+| Engine and CLI | `macguard.py` | All logic, plus the `argparse` subcommands (`scan`, `clean`, `net`, `security`, `apps`, `traffic`, `uninstall`, `kill`, `deepscan`, `watch`, `report`, `settings`, `ui`, `doctor`). |
 | Web UI | `ui.html` | A single page with vanilla JS and glassmorphism styling. It talks to the engine's JSON API. |
 | Native app | `app/main.swift` | An AppKit window with a `WKWebView`. It starts the engine and shows the UI. |
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 75 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 125 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -42,8 +42,16 @@ flowchart LR
 
 - `JUNK` is a declarative list. Each entry has an `id`, a `risk` (`safe` or `review`), and either glob `paths` or a `special` resolver (`simctl`, `docker`, `jetbrains`, `ndk`, `projects`, `downloads`).
 - **Safe** items are caches that rebuild themselves. **Review** items need your decision.
-- Project build folders only count when the project hasn't been edited for `--stale-days`. `build` and `dist` count only next to a matching build file, and `target` only next to `Cargo.toml` or `pom.xml`.
+- Project folders come in two kinds. **Dependencies** (`node_modules`, `.venv`, `venv`) are only offered once the project has gone stale. **Build output** (`target`, `build`, `dist`, `.next`, `__pycache__`, `.gradle`, lint and type caches, `cmake-build-*`) is also offered for active projects, through the optional `build-outputs` review check (`clean --builds`). Anything holding git-tracked files is skipped (`git ls-files`, cached once per repo), so a committed `dist/` is safe.
+- Stale project folders only count when the project hasn't been edited for `--stale-days`. `build` and `dist` count only next to a matching build file, and `target` only next to `Cargo.toml` or `pom.xml`.
 - `clean_item` refuses any path outside `$HOME` or shallower than four levels. Where a tool has its own cleanup command (`xcrun simctl delete unavailable`, `docker system prune`, `npm cache clean`, `brew cleanup`), that command is used.
+
+### Docker and space insights
+
+- Docker is split by risk. Build cache and dangling images are **safe**. Stopped containers, images no container uses, and dangling volumes are **review**, listed as `name (id)`. Cleanup removes exactly those IDs (`docker rm`, `docker rmi` and `docker volume rm` never use `--force`), so in-use objects stay. When Docker's engine isn't running, nothing is listed.
+- `disk_health()`: **low** means under 10 GB or 10% free, **critical** under 5 GB or 5%. Scan and the UI show a banner, and the watcher alerts once per drop, then re-arms after recovery.
+- `measure_dirs()` sizes app-data, container, dot-folder and project directories. `record_sizes()` keeps the last 30 snapshots in `~/.macguard/sizes.json`. `growth()` compares against the newest snapshot that's at least an hour old and drops a parent when a child explains the growth.
+- `managed_storage()` reports large data that its owning app must remove: the Claude Cowork image, Docker's virtual disk, simulator runtimes, Ollama models, iPhone backups, Xcode archives and Time Machine local snapshots. Each comes with how to remove it. macguard never deletes these.
 
 ### Network
 
@@ -68,6 +76,26 @@ flowchart LR
   - outdated Homebrew casks and formulae (`brew outdated --json=v2`, no auto-update)
   - orphaned root helpers and third-party system extensions
 - **Limitation:** CVE matching needs an online vulnerability database, which isn't included. Outdated, unsigned and end-of-life software is the offline signal for "likely vulnerable". `--online` adds pending macOS updates from `softwareupdate --list`.
+
+### Uninstall and leftovers
+
+- `app_leftovers()` matches the app's data in `~/Library` by **exact** bundle ID, or by exact app name for names of 4+ characters that aren't generic. It covers Application Support, Caches, Preferences and ByHost, Containers, Group Containers, Application Scripts, Saved Application State, HTTPStorages, Cookies, WebKit, Logs and LaunchAgents, plus system `/Library/LaunchDaemons`, `/Library/LaunchAgents` and `/Library/PrivilegedHelperTools` entries named after the bundle ID.
+- `do_uninstall()` refuses Apple, system and running apps. It moves each item to `~/.Trash` with `os.rename`, so it's recoverable, and never overwrites a name already there. For root-owned items it falls back to Finder, which asks for your password. The server re-plans from the app's path on every request, so the page never chooses which files go.
+- `orphan_leftovers()` (the `app-leftovers` review item) lists reverse-DNS-named folders and plists whose ID no installed app, Apple app, launch item or running process owns. A shared vendor prefix is flagged "check first". Cleaning these also goes to the Trash.
+
+### Quit app and everything under it
+
+- `app_process_tree()` reads `ps -axo pid,ppid,uid,comm` once. It takes every process whose executable lives inside the app bundle (main app, helpers, XPC services, login items) or in `/Library/PrivilegedHelperTools/<bundle id>*`, adds all their descendants, and removes macguard itself and its ancestors, so it never kills the app or terminal it runs in.
+- `kill_app()` first unloads the app's loaded launch agents (`launchctl bootout gui/<uid>/<label>`) so it can't respawn, which is what kept relaunching CCleaner. It sends TERM to the tree, waits up to 5 s, then sends KILL to survivors. Root-owned processes are reported for `sudo kill`. Core macOS processes (Finder, Dock, WindowServer, loginwindow…) are refused.
+- A real end-to-end test compiles a tiny app binary that forks a child, then checks both are gone.
+
+### Deep scan
+
+- `deep_scan()` runs `space_report`, the security audit, network analysis and the apps audit (plus a traffic sample with `--traffic`) and turns the results into one list of `{area, sev, title, detail, fix}`.
+- `fix_for()` maps each finding to one concrete next step: a System Settings path or a ready-to-run command (`brew upgrade --cask …`, moving a key into `~/.ssh` with `chmod 600`, `launchctl bootout …`).
+- `merge_findings()` merges findings with the same title (AirPlay on two ports, several outdated casks into one `brew upgrade` line). It also drops a security-check line when the network check already reports the same service as exposed.
+- `health_score()` caps each severity's penalty (high at most 36, medium 28, low 8, plus disk), so many small issues can't zero the score.
+- Finding keys (with pids normalized) are saved in `~/.macguard/deepscan.json`, and the next deep scan marks anything not seen before as **new**.
 
 ### Traffic
 
