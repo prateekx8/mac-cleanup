@@ -1444,6 +1444,158 @@ def io_of(fn, *a):
     return out.getvalue()
 
 
+class TestGradleCleanup(TempHome):
+    """Deleting ~/.gradle/caches under a running Gradle daemon broke Spring Boot builds: never again."""
+    JAVA = "/Library/Java/JavaVirtualMachines/temurin-23.jdk/Contents/Home/bin/java"
+
+    def daemon(self, pid, cpu=0.0):
+        return P(pid, self.JAVA, cpu=cpu, args=f"{self.JAVA} -cp gradle-daemon-main-9.8.2.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 9.8.2")
+
+    def test_gradle_is_review_and_daemon_dir_untouched(self):
+        g = next(j for j in mg.JUNK if j["id"] == "gradle")
+        self.assertEqual(g["risk"], "review")  # a plain `clean --apply` no longer removes it
+        self.assertEqual(g["paths"], [f"{mg.H}/.gradle/caches"])
+
+    def test_refuses_while_a_build_runs(self):
+        client = P(600, self.JAVA, args=f"{self.JAVA} -classpath gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain bootRun")
+        for table in ([self.daemon(300), client], [self.daemon(300, cpu=80)]):
+            with mock.patch.object(mg, "perf_table", return_value=table), mock.patch.object(mg, "stop_pids") as sp, \
+                    mock.patch.object(mg, "run") as run:
+                ok, why = mg.gradle_quiesce()
+            self.assertFalse(ok)
+            self.assertIn("build is running", why)
+            sp.assert_not_called()
+            run.assert_not_called()
+
+    def test_stops_idle_daemons_first(self):
+        kotlin = P(310, self.JAVA, args=f"{self.JAVA} org.jetbrains.kotlin.daemon.KotlinCompileDaemon")
+        calls = []
+        with mock.patch.object(mg, "perf_table", return_value=[self.daemon(300), kotlin, P(400, "/bin/zsh")]), \
+                mock.patch.object(mg.shutil, "which", return_value="/opt/homebrew/bin/gradle"), \
+                mock.patch.object(mg, "run", side_effect=lambda cmd, timeout=60: calls.append(cmd) or (0, "", "")), \
+                mock.patch.object(mg, "stop_pids", return_value=2) as sp:
+            self.assertEqual(mg.gradle_quiesce(), (True, ""))
+        self.assertEqual(calls, [["gradle", "--stop"]])
+        self.assertEqual(sp.call_args.args[0], [300, 310])
+        with mock.patch.object(mg, "perf_table", return_value=[P(400, "/bin/zsh")]), mock.patch.object(mg, "stop_pids") as sp:
+            self.assertEqual(mg.gradle_quiesce(), (True, ""))  # nothing running: nothing to stop
+            sp.assert_not_called()
+
+    def test_clean_item_skips_while_busy(self):
+        caches = os.path.dirname(self.mk(".gradle/caches/modules-2/x.jar", 100))
+        item = dict(next(j for j in mg.JUNK if j["id"] == "gradle"), entries=[(caches, 100, "")], size=100)
+        with mock.patch.object(mg, "gradle_quiesce", return_value=(False, "a Gradle build is running (pid 600)")):
+            self.assertEqual(quiet(mg.clean_item, item), 0)
+        self.assertTrue(os.path.exists(caches))
+        with mock.patch.object(mg, "gradle_quiesce", return_value=(True, "")):
+            self.assertEqual(quiet(mg.clean_item, item), 100)
+        self.assertFalse(os.path.exists(caches))
+
+
+class TestReadyForShutdown(TempHome):
+    def item(self, iid, name, risk, why="w"):
+        return dict(id=iid, name=name, risk=risk, why=why, start="s", cpu=0.0, mem=0, count=1, orphan=False,
+                    stop=[("term", [1])] if risk != "system" else [], procs=[])
+
+    def test_find_repos(self):
+        dev = os.path.join(self.home, "DEV")
+        for rel in ("a/.git/HEAD", "group/sub/.git/HEAD", "c/node_modules/pkg/.git/HEAD", "d/.hidden/x/.git/HEAD"):
+            self.mk("DEV/" + rel, 1)
+        self.mk("DEV/b/.git", 1)  # a worktree: .git is a file
+        with mock.patch.object(mg, "project_roots", return_value=[dev]):
+            repos = [os.path.relpath(r, dev) for r in mg.find_repos()]
+        self.assertEqual(repos, ["a", "b", "group/sub"])
+
+    def test_git_state(self):
+        def fake(answers):
+            def _run(cmd, timeout=60):
+                for k, v in answers.items():
+                    if k in " ".join(cmd):
+                        return v
+                return 1, "", ""
+            return _run
+        base = {"status --porcelain": (0, " M a.py\n?? b.txt\n", ""), "--abbrev-ref HEAD": (0, "feature/x\n", ""),
+                "--verify -q HEAD": (0, "abc\n", "")}
+        with mock.patch.object(mg, "run", fake(dict(base, **{"@{u}..HEAD": (0, "2\n", "")}))):
+            g = mg.git_state(os.path.join(self.home, "DEV/a"))
+        self.assertEqual((g["path"], g["branch"], g["changed"], g["unpushed"], g["local_only"]), ("~/DEV/a", "feature/x", 2, 2, False))
+        with mock.patch.object(mg, "run", fake(base)):  # no upstream: the branch exists only here
+            self.assertTrue(mg.git_state("/x")["local_only"])
+        with mock.patch.object(mg, "run", fake(dict(base, **{"--verify -q HEAD": (1, "", "")}))):  # empty repo
+            self.assertFalse(mg.git_state("/x")["local_only"])
+
+    def report(self, render=True):
+        items = [self.item("ollama", "Ollama", "safe"), self.item("docker", "Docker Desktop", "review", "1 container(s) running"),
+                 self.item("spotlight", "Spotlight indexing", "system")] + \
+            ([self.item("render", "Video renders", "review", "a render is running")] if render else [])
+        junk = [dict(id="npm", name="npm cache", risk="safe", size=300, entries=[]),
+                dict(id="maven", name="Maven", risk="review", size=900, entries=[]),
+                dict(id="brew", name="Homebrew", risk="safe", size=0, entries=[])]
+        git = {"/r/clean": dict(path="~/clean", branch="main", changed=0, unpushed=0, local_only=False),
+               "/r/push": dict(path="~/push", branch="main", changed=0, unpushed=2, local_only=False),
+               "/r/local": dict(path="~/local", branch="feat", changed=1, unpushed=0, local_only=True)}
+        with mock.patch.object(mg, "scan_junk", return_value=junk), \
+                mock.patch.object(mg, "perf_report", return_value=dict(items=items, disk=dict(free=GB, total=10 * GB))), \
+                mock.patch.object(mg, "find_repos", return_value=list(git)), mock.patch.object(mg, "git_state", git.get):
+            return mg.shutdown_report()
+
+    def test_report(self):
+        r = self.report()
+        self.assertFalse(r["ready"])
+        sev = {t: s for s, t, _ in r["findings"]}
+        self.assertEqual(sev["A video render is still running"], "high")
+        self.assertEqual(sev["1 repo(s) with commits not pushed"], "medium")
+        self.assertEqual(sev["1 branch(es) never pushed - only on this Mac"], "medium")
+        self.assertEqual(sev["1 repo(s) with uncommitted changes"], "info")
+        self.assertEqual((r["clean_total"], [c["id"] for c in r["clean"]]), (300, ["npm"]))  # review and empty items left out
+        self.assertEqual([s["id"] for s in r["stop"]], ["ollama"])
+        self.assertEqual([x["id"] for x in r["running"]], ["docker", "render"])  # Spotlight (system) isn't listed
+        self.assertIn("cancels", r["running"][1]["warn"])
+        self.assertEqual([g["path"] for g in r["git"]], ["~/push", "~/local"])  # clean repos left out
+        self.assertTrue(self.report(render=False)["ready"])
+        j = mg.ready_json(r)
+        self.assertNotIn("_junk", j)
+        json.dumps(j)
+
+    def test_prepare_does_only_the_safe_part(self):
+        r = self.report()
+        mg.ensure_state()
+        mg.write_json(mg.devmode_file(), dict(until=1e12))
+        mg.write_json(mg.focus_file(), dict(paused=[], until=1e12))
+        with mock.patch.object(mg, "clean_item", side_effect=lambda x: x["size"]) as ci, \
+                mock.patch.object(mg, "devmode_off") as off, mock.patch.object(mg, "focus_resume", return_value=[1, 2]), \
+                mock.patch.object(mg, "apply_perf", return_value=[dict(name="Ollama", ok=True, detail="asked Ollama to quit")]) as ap, \
+                mock.patch.object(mg, "run") as run:
+            done = mg.prepare_shutdown(r)
+        self.assertEqual([c.args[0]["id"] for c in ci.call_args_list], ["npm"])
+        off.assert_called_once()
+        self.assertEqual([it["id"] for it in ap.call_args.args[0]], ["ollama"])  # not Docker, not the render
+        run.assert_not_called()  # no git, no shutdown
+        self.assertEqual(done, ["cleaned 300B of caches", "developer mode off, settings restored", "resumed 2 paused process(es)",
+                                "Ollama: asked Ollama to quit"])
+        self.assertIn("[ready]", mg.read_text(mg.EVENTS_LOG))
+
+    def test_cmd_ready(self):
+        r = self.report()
+        with mock.patch.object(mg, "shutdown_report", return_value=r), mock.patch.object(mg, "prepare_shutdown", return_value=["x"]) as ps:
+            out = io_of(mg.cmd_ready, argparse.Namespace(apply=False, yes=False))
+            self.assertIn("Check before shutting down", out)
+            self.assertIn("~/local [feat]", out)
+            self.assertIn("macguard ready --apply", out)
+            with mock.patch("builtins.input", return_value="no"):
+                quiet(mg.cmd_ready, argparse.Namespace(apply=True, yes=False))
+            ps.assert_not_called()
+            with mock.patch("builtins.input", return_value="yes"):
+                out = io_of(mg.cmd_ready, argparse.Namespace(apply=True, yes=False))
+            ps.assert_called_once()
+        self.assertIn("after the render finishes", out)
+
+    def test_esp32_qemu_is_not_an_android_emulator(self):
+        rule = dict((r[0], r[2]) for r in mg.DEV_RULES)["android-emulator"]
+        self.assertFalse(rule(P(1, "/Users/me/.espressif/tools/qemu-xtensa/qemu/bin/qemu-system-xtensa")))
+        self.assertTrue(rule(P(1, "/Users/me/Library/Android/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64")))
+
+
 # ---------------------------------------------------------------- traffic
 
 def SOCK(pid, proc, rhost, rport, rx, tx, state="ESTABLISHED", lport=50000):
@@ -2079,6 +2231,20 @@ class TestWebUI(TempHome):
             self.assertIn("focus", json.loads(self.req("/api/perf")[1]))
             self.assertIn("devmode", json.loads(self.req("/api/perf")[1]))
 
+    def test_ready_endpoints(self):
+        rep = dict(ready=False, findings=[("high", "A video render is still running", "x")], disk={"free": 1}, clean=[], clean_total=0,
+                   stop=[], running=[], git=[], devmode={"active": False}, focus={"active": False}, _junk=["secret"], _stop=[])
+        with mock.patch.object(mg, "shutdown_report", return_value=rep), \
+                mock.patch.object(mg, "prepare_shutdown", return_value=["cleaned 0B of caches"]) as ps:
+            self.assertEqual(self.req("/api/ready/prepare", body={})[0], 409)  # check first
+            r = json.loads(self.req("/api/ready")[1])
+            self.assertEqual(r["findings"][0]["sev"], "high")
+            self.assertNotIn("_junk", r)
+            self.assertEqual(json.loads(self.req("/api/ready/prepare", body={})[1])["done"], ["cleaned 0B of caches"])
+            ps.assert_called_once_with(rep)
+            self.assertEqual(self.req("/api/ready/prepare", body={})[0], 409)  # each report prepares once
+            self.assertEqual(self.req("/api/ready", token=None)[0], 403)
+
     def test_devmode_endpoints(self):
         plan = dict(stop=[dict(name="Docker Desktop")], pause=[dict(name="Slack", procs=[dict(pid=200)])], motion=True, awake=True,
                     advice=["tip"], skip=[])
@@ -2410,7 +2576,7 @@ class LiveSystem(unittest.TestCase):
         import subprocess
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "macguard.py")
         out = subprocess.run(["/usr/bin/python3", script, "--help"], capture_output=True, text=True).stdout
-        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "perf", "devmode", "deepscan", "watch", "report", "settings", "ui", "doctor"):
+        for cmd in ("scan", "clean", "net", "security", "apps", "traffic", "uninstall", "kill", "perf", "devmode", "ready", "deepscan", "watch", "report", "settings", "ui", "doctor"):
             self.assertIn(cmd, out)
 
 
