@@ -12,6 +12,8 @@ Commands:
   traffic              Sample live traffic: heavy uploads, scanning, odd ports
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   kill APP             Quit an app and every process under it (helpers, children, launch agents)
+  ready                Ready for shutdown: what cleanup frees, what stops, what is still running, git work
+                       only on this Mac (--apply cleans, restores and stops the safe parts)
   devmode [on|off]     Developer mode: stop idle services, pause non-dev apps, turn off animations,
                        keep the Mac awake - one switch, and `off` puts everything back
   perf                 What's hogging CPU, memory and heat: dev daemons, orphans, thermal/swap state
@@ -1808,7 +1810,8 @@ DEV_RULES = [
     ("gradle", "Gradle daemons", lambda p: "GradleDaemon" in p["args"]),
     ("kotlin", "Kotlin compile daemon", lambda p: "KotlinCompileDaemon" in p["args"]),
     ("unity", "Unity Hub / Unity Editor", lambda p: "/Unity Hub.app/" in p["exe"] or "/Unity.app/" in p["exe"]),
-    ("android-emulator", "Android emulator", lambda p: _base(p).startswith("qemu-system") or p["exe"].endswith("/emulator/emulator")),
+    ("android-emulator", "Android emulator", lambda p: (_base(p).startswith("qemu-system") and "xtensa" not in _base(p))  # xtensa = ESP32, not Android
+     or p["exe"].endswith("/emulator/emulator")),
     ("spotlight", "Spotlight indexing", lambda p: _base(p) in ("mds_stores", "mds", "mdworker", "mdworker_shared")),
     ("render", "Video renders (Remotion, headless Chrome, ffmpeg)",
      lambda p: _base(p) in RENDER_NAMES or _base(p) == "remotion" or "Chrome for Testing" in p["exe"]
@@ -2676,6 +2679,136 @@ def cmd_devmode(args):
     print(f"Turn it off: {C['B']}macguard devmode off{C['x']}  (automatic at {dt.datetime.fromtimestamp(st['until']):%H:%M})")
 
 
+# ---------------------------------------------------------------- ready for shutdown
+
+GIT_SKIP_DIRS = {"node_modules", "build", "dist", "target", ".venv", "venv", "Pods", "DerivedData", "Library", "Builds"}
+
+
+def find_repos(max_depth=4):
+    """Git repositories under the usual project folders (nested ones too), each once."""
+    repos, seen = [], set()
+    for base in project_roots():
+        for root, dirs, files in os.walk(base):
+            depth = root.count(os.sep) - base.count(os.sep)
+            if ".git" in dirs or ".git" in files:
+                real = os.path.realpath(root)
+                if real not in seen:
+                    seen.add(real)
+                    repos.append(root)
+            dirs[:] = [] if depth >= max_depth else [d for d in dirs if not d.startswith(".") and d not in GIT_SKIP_DIRS]
+    return sorted(repos, key=str.lower)
+
+
+def git_state(repo):
+    """dict(path, branch, changed, unpushed, local_only) - local_only: the branch has never been pushed anywhere."""
+    _, out, _ = run(["git", "-C", repo, "status", "--porcelain"], timeout=60)
+    changed = len([l for l in out.splitlines() if l.strip()])
+    _, branch, _ = run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"], timeout=15)
+    branch = branch.strip()
+    rc, ahead, _ = run(["git", "-C", repo, "rev-list", "--count", "@{u}..HEAD"], timeout=15)
+    has_commits = run(["git", "-C", repo, "rev-parse", "--verify", "-q", "HEAD"], timeout=15)[0] == 0
+    local_only = rc != 0 and has_commits and branch not in ("", "HEAD")
+    return dict(path=repo.replace(HOME, "~"), branch=branch or "?", changed=changed,
+                unpushed=int(ahead.strip()) if rc == 0 and ahead.strip().isdigit() else 0, local_only=local_only)
+
+
+def shutdown_report(stale_days=30):
+    """Everything to know before shutting the Mac down: what cleanup would free, what would be stopped, what is still
+    running (and would be cut off), and git work that only exists on this Mac."""
+    junk = [r for r in scan_junk(stale_days) if r["risk"] == "safe" and r["size"] > 0]
+    r = perf_report()
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        git = [g for g in ex.map(git_state, find_repos()) if g["changed"] or g["unpushed"] or g["local_only"]]
+    stop = perf_plan(r["items"])
+    stopping = {it["id"] for it in stop}
+    running = []
+    for it in r["items"]:
+        if it["id"] in stopping or it["risk"] == "system":
+            continue
+        warn = {"render": "shutting down now cancels it - wait until it finishes",
+                "docker": "macOS quits Docker at shutdown; its containers stop with it",
+                "node-dev": "it stops at shutdown; start it again next time"}.get(it["id"], "it stops at shutdown")
+        running.append(dict(id=it["id"], name=it["name"], why=it["why"], warn=warn, cpu=it["cpu"]))
+    findings = []
+    if any(x["id"] == "render" for x in running):
+        findings.append(("high", "A video render is still running", "shutting down now cancels it"))
+    unpushed = [g for g in git if g["unpushed"]]
+    local = [g for g in git if g["local_only"]]
+    if unpushed:
+        findings.append(("medium", f"{len(unpushed)} repo(s) with commits not pushed",
+                         ", ".join(f"{g['path']} ({g['unpushed']})" for g in unpushed)))
+    if local:
+        findings.append(("medium", f"{len(local)} branch(es) never pushed - only on this Mac",
+                         ", ".join(f"{g['path']} [{g['branch']}]" for g in local)))
+    edited = [g for g in git if g["changed"]]
+    if edited:
+        findings.append(("info", f"{len(edited)} repo(s) with uncommitted changes",
+                         "safe on disk across a shutdown, but not backed up: " + ", ".join(g["path"] for g in edited[:8])
+                         + (" ..." if len(edited) > 8 else "")))
+    ds, fs = devmode_status(), focus_status()
+    return dict(ready=not any(f[0] == "high" for f in findings), findings=findings, disk=r["disk"],
+                clean=[dict(id=j["id"], name=j["name"], size=j["size"]) for j in junk], clean_total=sum(j["size"] for j in junk),
+                stop=[dict(id=it["id"], name=it["name"], why=it["why"], start=it["start"]) for it in stop],
+                running=running, git=git, devmode=ds, focus=fs, _junk=junk, _stop=stop)
+
+
+def prepare_shutdown(rep):
+    """Do the safe part: clean safe caches, end developer mode / dev focus, stop safe services. Never commits,
+    pushes, shuts down, or touches running work (renders, dev servers, containers)."""
+    done = []
+    if rep["_junk"]:
+        freed = sum(clean_item(r) for r in rep["_junk"])
+        log_event("clean", f"[ready] freed ~{human(freed)} ({', '.join(r['id'] for r in rep['_junk'])})")
+        done.append(f"cleaned {human(freed)} of caches")
+    if load_devmode():
+        devmode_off("ready for shutdown")
+        done.append("developer mode off, settings restored")
+    if load_focus():
+        done.append(f"resumed {len(focus_resume('ready for shutdown'))} paused process(es)")
+    for res in apply_perf(rep["_stop"]):
+        done.append(f"{res['name']}: {res['detail']}" + ("" if res["ok"] else " (partly)"))
+    log_event("ready", "; ".join(done) or "nothing to do")
+    return done
+
+
+def ready_json(rep):
+    return {k: v for k, v in rep.items() if not k.startswith("_")} | {"findings": findings_json(rep["findings"])}
+
+
+def cmd_ready(args):
+    print("Checking caches, services and git work (about a minute)...", flush=True)
+    rep = shutdown_report()
+    verdict = f"{C['g']}Ready for shutdown{C['x']}" if rep["ready"] else f"{C['y']}Check before shutting down{C['x']}"
+    print(f"\n{C['B']}{verdict}{C['x']}   {human(rep['disk']['free'])} free")
+    print_findings(rep["findings"])
+    print(f"\n{C['B']}Will prepare{C['x']}")
+    print(f"  clean     {human(rep['clean_total'])} of safe caches" + (f" ({', '.join(c['id'] for c in rep['clean'])})" if rep["clean"] else ""))
+    print(f"  stop      {', '.join(s['name'] for s in rep['stop']) or '-'}")
+    if rep["devmode"]["active"] or rep["focus"]["active"]:
+        print("  restore   " + ", ".join(x for x in ("developer mode off" if rep["devmode"]["active"] else "",
+                                                       "resume paused apps" if rep["focus"]["active"] else "") if x))
+    if rep["running"]:
+        print(f"\n{C['B']}Still running{C['x']}  {C['d']}(left alone){C['x']}")
+        for x in rep["running"]:
+            print(f"  {x['name']}: {x['why']}\n    {C['d']}{x['warn']}{C['x']}")
+    if rep["git"]:
+        print(f"\n{C['B']}Git work only on this Mac{C['x']}")
+        for g in rep["git"]:
+            bits = [f"{g['changed']} changed"] if g["changed"] else []
+            bits += [f"{g['unpushed']} unpushed"] if g["unpushed"] else []
+            bits += ["branch never pushed"] if g["local_only"] else []
+            print(f"  {g['path']} [{g['branch']}]  {C['d']}{', '.join(bits)}{C['x']}")
+    if not args.apply:
+        print(f"\nPrepare: {C['B']}macguard ready --apply{C['x']}  (it never commits, pushes or shuts down)")
+        return
+    if not args.yes and input("\nClean, restore and stop the above? Type 'yes': ").strip() != "yes":
+        print("Aborted.")
+        return
+    for line in prepare_shutdown(rep):
+        print(f"  {C['g']}✔{C['x']} {line}")
+    print("\nDone. Shut down from the Apple menu when you're ready" + ("." if rep["ready"] else " - after the render finishes."))
+
+
 # ---------------------------------------------------------------- watch mode
 
 def read_text(path):
@@ -3008,6 +3141,10 @@ def cmd_ui(args):
             if self.path.split("?")[0] == "/api/perf":
                 return self.send(200, dict(perf_json(perf_report("heavy" if self.path.endswith("?before=heavy") else None)),
                                            focus=focus_status(), devmode=devmode_status()))
+            if self.path == "/api/ready":
+                with lock:
+                    state["ready"] = shutdown_report(args.stale_days)
+                    return self.send(200, ready_json(state["ready"]))
             if self.path == "/api/traffic":
                 procs = traffic_sample(6)
                 return self.send(200, {"seconds": 6, "top": traffic_json(procs), "findings": findings_json(analyze_traffic(procs, 6))})
@@ -3097,6 +3234,13 @@ def cmd_ui(args):
                     except ValueError as e:
                         return self.send(409, {"error": str(e)})
                 return self.send(200, dict(view, status=devmode_status()))
+            if self.path == "/api/ready/prepare":
+                # acts on the report the page just showed (like /api/clean on the last scan), then forgets it
+                with lock:
+                    if not state.get("ready"):
+                        return self.send(409, {"error": "Check first"})
+                    done, state["ready"] = prepare_shutdown(state["ready"]), None
+                return self.send(200, {"done": done})
             if self.path == "/api/devmode/off":
                 with lock:
                     return self.send(200, devmode_off("Mac Cleanup UI") or {"error": "not on"})
@@ -3281,6 +3425,8 @@ def main():
     p.add_argument("--resume", action="store_true", help="resume everything --focus paused")
     p.add_argument("--yes", action="store_true"); p.set_defaults(fn=cmd_perf)
     sub.add_parser("focus-timer", help=argparse.SUPPRESS).set_defaults(fn=cmd_focus_timer)
+    p = sub.add_parser("ready", help="ready for shutdown: report, and --apply to prepare")
+    p.add_argument("--apply", action="store_true"); p.add_argument("--yes", action="store_true"); p.set_defaults(fn=cmd_ready)
     p = sub.add_parser("devmode", help="one switch for dev work: stop, pause, no animations, stay awake")
     p.add_argument("action", nargs="?", choices=["status", "on", "off"], default="status")
     p.add_argument("--skip", help="leave parts out: stop,pause,motion,awake"); p.add_argument("--yes", action="store_true")

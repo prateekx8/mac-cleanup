@@ -16,7 +16,7 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 166 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py` | 173 tests: unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -108,6 +108,12 @@ flowchart LR
 - `devmode_plan()` combines `perf_plan()` (safe items to stop) and `focus_plan()` (apps to pause, minus anything being stopped), plus the motion and keep-awake parts. It also lists advice for things that need admin rights or a UI toggle (Low Power Mode, Do Not Disturb, Spotlight).
 - `devmode_on()` records how to undo every step in `~/.macguard/devmode.json`. That covers each stopped item with its restart command (`open -a Docker`, `open -a Ollama`, or `launchctl bootstrap` for a brew-services Ollama), the focus pause (source `devmode`), the previous type and value of each `MOTION_DEFAULTS` key (or "unset"), and the `caffeinate` pid. Dict, array and date values are left alone.
 - `devmode_off()` restores each key exactly (`defaults write` with the old type and value, or `defaults delete` if it was unset), restarts the Dock if it changed Dock keys, resumes the paused apps, restarts the services it stopped, and stops `caffeinate` only if that pid still runs `caffeinate`. The `focus-timer` and `focus_check_expired()` also call it when `until` passes.
+
+### Ready for shutdown (`ready`)
+
+- `shutdown_report()` combines the safe `scan_junk` results, `perf_report()` and a `git_state()` per repo. `find_repos()` walks the project roots four levels deep, skipping `node_modules`, build folders and hidden folders, and takes `.git` as a folder or a file (worktrees). git runs with 8 workers in parallel. A branch with commits but no upstream counts as **never pushed**.
+- `perf` items are split into **stop** (safe) and **still running** (review), each with what a shutdown does to it. A running render makes the verdict "Check before shutting down".
+- `prepare_shutdown()` only does the safe part: `clean_item` on the safe caches, `devmode_off`, `focus_resume` and `apply_perf` on the safe items. The UI's `/api/ready/prepare` acts once on the report it just showed (409 otherwise), like `/api/clean`. The native app adds **Ready for Shutdown…** to its app menu, which calls `readyForShutdown()` in the page.
 
 ### Deep scan
 

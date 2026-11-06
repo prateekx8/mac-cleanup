@@ -146,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         a.informativeText = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         // the button says what happens: "Stop 2 item(s)?" -> Stop, "Pause …" -> Pause, "Quit Docker…" -> Quit, cleanup -> Delete
         let verb = String(lines.first?.split(separator: " ").first ?? "")
-        a.addButton(withTitle: ["Start", "Stop", "Pause", "Quit", "Uninstall", "Reset"].contains(verb) ? verb
+        a.addButton(withTitle: ["Start", "Prepare", "Stop", "Pause", "Quit", "Uninstall", "Reset"].contains(verb) ? verb
                     : (message.hasPrefix("Permanently delete") ? "Delete" : "Continue"))
         a.addButton(withTitle: "Cancel")
         a.buttons.first?.hasDestructiveAction = true
@@ -178,6 +178,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About Mac Cleanup", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Ready for Shutdown…", action: #selector(readyForShutdown), keyEquivalent: "")
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Mac Cleanup", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit Mac Cleanup", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -203,6 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     @objc func reload() { web.reload() }
+    @objc func readyForShutdown() { web.evaluateJavaScript("window.readyForShutdown && readyForShutdown()") }
 }
 
 let app = NSApplication.shared

@@ -227,6 +227,10 @@ footer code{font-family:var(--mono)}
 .focusbar.on{border-color:color-mix(in srgb,var(--med) 55%,transparent)}
 .focusbar.dev{background:linear-gradient(color-mix(in srgb,var(--bg) 82%,#7c5cff),color-mix(in srgb,var(--bg) 88%,#2ee6c5))}
 .focusbar.dev.on{border-color:color-mix(in srgb,var(--ok) 60%,transparent)}
+.verdict{display:flex;align-items:center;gap:12px;margin:2px 10px 6px;padding:14px 16px;border-radius:14px;font-weight:700;font-size:15px;border:1px solid var(--stroke)}
+.verdict.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)} .verdict.warn{background:color-mix(in srgb,var(--med) 14%,transparent);color:var(--med)}
+.verdict span{flex:1}.verdict small{display:block;font-weight:500;font-size:12.5px;color:var(--fg-2)}
+.gitrow{display:flex;gap:12px;padding:6px 22px;font-size:13px}.gitrow b{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gitrow span{color:var(--fg-3);margin-left:auto;white-space:nowrap}
 .sugg{margin:0;padding:2px 22px 12px 42px;color:var(--fg-2);font-size:13.5px;line-height:1.7}
 
 @media (max-width:820px){.stats{grid-template-columns:1fr 1fr}.stat.disk{grid-column:1/-1}.netinfo{grid-template-columns:1fr}.netinfo.perfinfo{grid-template-columns:1fr 1fr}}
@@ -252,6 +256,7 @@ footer code{font-family:var(--mono)}
       <button class="btn primary" id="scanBtn">✦ Scan this Mac</button>
       <button class="btn ghost" id="deepBtn">◎ Deep scan</button>
       <button class="btn ghost" id="devTop">⚡ Developer mode</button>
+      <button class="btn ghost" id="readyTop">⏻ Ready for shutdown</button>
       <button class="btn ghost" id="checkAll">Run all checks</button>
     </div>
   </header>
@@ -270,6 +275,12 @@ footer code{font-family:var(--mono)}
     <div class="ph"><span class="ic">◎</span><div class="grow"><h2>Deep scan</h2><small id="deepSub">Everything at once, in priority order, with the fix for each</small></div>
       <div class="score" id="deepScore">—</div></div>
     <div id="deep"></div>
+  </section>
+
+  <section class="panel glass" id="readyPanel" hidden>
+    <div class="ph"><span class="ic">⏻</span><div class="grow"><h2>Ready for shutdown</h2><small>What cleanup frees, what gets stopped, what is still running and git work only on this Mac</small></div>
+      <button class="btn ghost sm" id="readyBtn">Check again</button></div>
+    <div id="ready"></div>
   </section>
 
   <section class="panel glass">
@@ -714,6 +725,47 @@ async function devOff(){
   checkPerf(false);
 }
 $("devTop").onclick = () => { $("perf").scrollIntoView({behavior:"smooth", block:"start"}); devOn(); };
+let readyRep = null;
+async function readyForShutdown(){
+  $("readyPanel").hidden = false; $("readyPanel").scrollIntoView({behavior:"smooth", block:"start"});
+  [$("readyTop"), $("readyBtn")].forEach(b => busy(b, true));
+  $("ready").innerHTML = '<div class="empty"><span class="spin"></span>&nbsp; Checking caches, services and git work (about a minute)…</div>';
+  try { readyRep = await api("/api/ready"); renderReady(); }
+  catch(e){ $("ready").innerHTML = `<div class="empty">Failed: ${esc(e.message)}</div>`; }
+  busy($("readyTop"), false, "⏻ Ready for shutdown"); busy($("readyBtn"), false, "Check again");
+}
+function renderReady(done){
+  const r = readyRep, row = (a, b) => `<div class="gitrow"><b>${a}</b><span>${b}</span></div>`;
+  let h = `<div class="verdict ${r.ready ? "ok" : "warn"}"><span>${r.ready ? "✓ Ready for shutdown" : "⚠ Check before shutting down"}
+      <small>${human(r.disk.free)} free · Mac Cleanup never commits, pushes or shuts down for you</small></span>
+      ${done ? "" : '<button class="btn primary sm" id="readyPrep">Prepare</button>'}</div>`;
+  if (done) h += `<div class="dgroup"><h3>Done</h3></div><ul class="sugg">${done.map(d => `<li>✓ ${esc(d)}</li>`).join("") || "<li>Nothing needed doing.</li>"}</ul>
+      <ul class="sugg"><li><b>Shut down from the Apple menu</b> when you're ready${r.ready ? "." : " — after what's still running has finished."}</li></ul>`;
+  h += renderFindings(r.findings);
+  if (!done){
+    const restore = [r.devmode.active ? "developer mode off, settings restored" : "", r.focus.active ? "resume paused apps" : ""].filter(Boolean);
+    h += `<div class="dgroup"><h3>Prepare will</h3></div><ul class="sugg">
+      <li>Clean ${human(r.clean_total)} of safe caches${r.clean.length ? " (" + esc(r.clean.map(c => c.name).join(", ")) + ")" : ""}</li>
+      <li>Stop ${esc(r.stop.map(s => s.name).join(", ") || "nothing")}</li>${restore.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`;
+  }
+  if (r.running.length) h += `<div class="dgroup"><h3>Still running · left alone</h3></div>` +
+    r.running.map(x => row(esc(x.name) + `<small style="display:block;color:var(--fg-3);font-weight:400">${esc(x.why)}</small>`, esc(x.warn))).join("");
+  if (r.git.length) h += `<div class="dgroup"><h3>Git work only on this Mac</h3></div>` + r.git.map(g => row(`${esc(g.path)} <span style="color:var(--fg-3);font-weight:400">[${esc(g.branch)}]</span>`,
+      [g.changed ? `${g.changed} changed` : "", g.unpushed ? `${g.unpushed} unpushed` : "", g.local_only ? "never pushed" : ""].filter(Boolean).join(" · "))).join("");
+  $("ready").innerHTML = h;
+  if ($("readyPrep")) $("readyPrep").onclick = prepareShutdown;
+}
+async function prepareShutdown(){
+  const r = readyRep;
+  if (!confirm(`Prepare for shutdown?\n\n• Clean ${human(r.clean_total)} of safe caches\n• Stop ${r.stop.map(s => s.name).join(", ") || "nothing"}` +
+               (r.devmode.active ? "\n• Turn developer mode off" : "") + (r.focus.active ? "\n• Resume paused apps" : "") +
+               `\n\nRunning work, git and the shutdown itself are left to you.`)) return;
+  busy($("readyPrep"), true);
+  try { const res = await api("/api/ready/prepare", {}); renderReady(res.done); toast("Prepared for shutdown"); }
+  catch(e){ toast("Failed: " + e.message); busy($("readyPrep"), false, "Prepare"); }
+}
+window.readyForShutdown = readyForShutdown;
+$("readyTop").onclick = readyForShutdown; $("readyBtn").onclick = readyForShutdown;
 $("perfBtn").onclick = () => checkPerf(false); $("perfHeavyBtn").onclick = () => checkPerf(true);
 
 $("secBtn").onclick = checkSec; $("netBtn").onclick = checkNet;
