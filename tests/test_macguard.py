@@ -1434,6 +1434,54 @@ def io_of(fn, *a):
     return out.getvalue()
 
 
+class TestGradleCleanup(TempHome):
+    """Deleting ~/.gradle/caches under a running Gradle daemon broke Spring Boot builds: never again."""
+    JAVA = "/Library/Java/JavaVirtualMachines/temurin-23.jdk/Contents/Home/bin/java"
+
+    def daemon(self, pid, cpu=0.0):
+        return P(pid, self.JAVA, cpu=cpu, args=f"{self.JAVA} -cp gradle-daemon-main-9.8.2.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 9.8.2")
+
+    def test_gradle_is_review_and_daemon_dir_untouched(self):
+        g = next(j for j in mg.JUNK if j["id"] == "gradle")
+        self.assertEqual(g["risk"], "review")  # a plain `clean --apply` no longer removes it
+        self.assertEqual(g["paths"], [f"{mg.H}/.gradle/caches"])
+
+    def test_refuses_while_a_build_runs(self):
+        client = P(600, self.JAVA, args=f"{self.JAVA} -classpath gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain bootRun")
+        for table in ([self.daemon(300), client], [self.daemon(300, cpu=80)]):
+            with mock.patch.object(mg, "perf_table", return_value=table), mock.patch.object(mg, "stop_pids") as sp, \
+                    mock.patch.object(mg, "run") as run:
+                ok, why = mg.gradle_quiesce()
+            self.assertFalse(ok)
+            self.assertIn("build is running", why)
+            sp.assert_not_called()
+            run.assert_not_called()
+
+    def test_stops_idle_daemons_first(self):
+        kotlin = P(310, self.JAVA, args=f"{self.JAVA} org.jetbrains.kotlin.daemon.KotlinCompileDaemon")
+        calls = []
+        with mock.patch.object(mg, "perf_table", return_value=[self.daemon(300), kotlin, P(400, "/bin/zsh")]), \
+                mock.patch.object(mg.shutil, "which", return_value="/opt/homebrew/bin/gradle"), \
+                mock.patch.object(mg, "run", side_effect=lambda cmd, timeout=60: calls.append(cmd) or (0, "", "")), \
+                mock.patch.object(mg, "stop_pids", return_value=2) as sp:
+            self.assertEqual(mg.gradle_quiesce(), (True, ""))
+        self.assertEqual(calls, [["gradle", "--stop"]])
+        self.assertEqual(sp.call_args.args[0], [300, 310])
+        with mock.patch.object(mg, "perf_table", return_value=[P(400, "/bin/zsh")]), mock.patch.object(mg, "stop_pids") as sp:
+            self.assertEqual(mg.gradle_quiesce(), (True, ""))  # nothing running: nothing to stop
+            sp.assert_not_called()
+
+    def test_clean_item_skips_while_busy(self):
+        caches = os.path.dirname(self.mk(".gradle/caches/modules-2/x.jar", 100))
+        item = dict(next(j for j in mg.JUNK if j["id"] == "gradle"), entries=[(caches, 100, "")], size=100)
+        with mock.patch.object(mg, "gradle_quiesce", return_value=(False, "a Gradle build is running (pid 600)")):
+            self.assertEqual(quiet(mg.clean_item, item), 0)
+        self.assertTrue(os.path.exists(caches))
+        with mock.patch.object(mg, "gradle_quiesce", return_value=(True, "")):
+            self.assertEqual(quiet(mg.clean_item, item), 100)
+        self.assertFalse(os.path.exists(caches))
+
+
 # ---------------------------------------------------------------- traffic
 
 def SOCK(pid, proc, rhost, rport, rx, tx, state="ESTABLISHED", lport=50000):

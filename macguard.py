@@ -101,8 +101,10 @@ JUNK = [
     dict(id="npm", name="npm cache", risk="safe", paths=[f"{H}/.npm/_cacache"], cmd="npm cache clean --force"),
     dict(id="pip-uv", name="pip / uv / pkg caches", risk="safe",
          paths=[f"{H}/.cache/pip", f"{H}/.cache/uv", f"{H}/.cache/pkg", f"{H}/Library/Caches/pip"]),
-    dict(id="gradle", name="Gradle caches", risk="safe", paths=[f"{H}/.gradle/caches", f"{H}/.gradle/daemon"],
-         note="re-downloaded on next build"),
+    # review, not safe: deleting it under a running daemon breaks builds, and every Spring/Android build re-downloads it.
+    # ~/.gradle/daemon is never touched (it holds the running daemons' registry).
+    dict(id="gradle", name="Gradle caches", risk="review", paths=[f"{H}/.gradle/caches"],
+         note="stops idle Gradle/Kotlin daemons first, skipped while a build runs; dependencies re-download on the next build"),
     dict(id="maven", name="Maven repository", risk="review", paths=[f"{H}/.m2/repository"]),
     dict(id="cargo", name="Cargo registry cache", risk="safe", paths=[f"{H}/.cargo/registry/cache", f"{H}/.cargo/registry/src"]),
     dict(id="brew", name="Homebrew cache & old versions", risk="safe", paths=[f"{H}/Library/Caches/Homebrew"], cmd="brew cleanup -s --prune=all"),
@@ -594,6 +596,11 @@ def clean_item(r):
             if err:
                 print(f"   {C['r']}failed{C['x']} {p}: {err}")
         return sum(size for p, size in entries if p in result and not result[p])
+    if r["id"] == "gradle":
+        ok, why = gradle_quiesce()
+        if not ok:
+            print(f"   {C['y']}skipped{C['x']}: {why}")
+            return 0
     if r.get("cmd") and shutil.which(r["cmd"].split()[0]):
         run(r["cmd"], timeout=900)
     freed = 0
@@ -613,6 +620,23 @@ def clean_item(r):
         except OSError as e:
             print(f"   {C['r']}failed{C['x']} {p}: {e.strerror}")
     return freed
+
+
+def gradle_quiesce():
+    """Before deleting ~/.gradle/caches: refuse while a Gradle build runs, otherwise stop the idle Gradle and Kotlin
+    daemons so none is left holding deleted jars. Returns (ok, reason)."""
+    table = perf_table()
+    daemons = [p for p in table if "GradleDaemon" in p["args"] or "KotlinCompileDaemon" in p["args"]]
+    clients = [p for p in table if "GradleWrapperMain" in p["args"] or "org.gradle.launcher.GradleMain" in p["args"]]
+    busy = [p for p in daemons if p["cpu"] >= IDLE_CPU]
+    if clients or busy:
+        return False, f"a Gradle build is running (pid {(clients or busy)[0]['pid']}) - run the cleanup when it has finished"
+    if daemons:
+        if shutil.which("gradle"):
+            run(["gradle", "--stop"], timeout=120)
+        stop_pids([p["pid"] for p in daemons], daemons)
+        log_event("clean", f"stopped {len(daemons)} idle Gradle/Kotlin daemon(s) before clearing ~/.gradle/caches")
+    return True, ""
 
 
 # ---------------------------------------------------------------- network

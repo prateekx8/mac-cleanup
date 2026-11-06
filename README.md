@@ -47,6 +47,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard clean` | Dry run of the **safe** cleanup. |
 | `macguard clean --apply` | Delete safe items after you type `yes`. |
 | `macguard clean --only android-avd,project-artifacts --apply` | Clean specific **review** items. |
+| `macguard clean --only gradle --apply` | Gradle caches are a **review** item. Removing them makes every Spring Boot and Android build download its dependencies again. The cleanup refuses while a Gradle build runs and stops idle Gradle and Kotlin daemons first, so no daemon is left holding deleted jars. `~/.gradle/daemon` is never touched. |
 | `macguard clean --builds --apply` | Optional: also remove build output in **active** projects (`target`, `build`, `dist`, `.next`, `__pycache__`, `cmake-build-*`…). Dependencies such as `node_modules` and `.venv` are never touched, and neither is anything committed to git. |
 | `macguard security` | Security posture audit. |
 | `macguard net` | Network snapshot and threat findings. |
@@ -72,7 +73,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 162 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 166 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
