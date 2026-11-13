@@ -5,6 +5,7 @@ Commands:
   scan                 Disk junk analysis (read-only)
   clean                Clean junk (dry-run unless --apply)
   net                  Network snapshot: listeners, connections, ARP/DNS, threats
+                       (--live: outbound connections per process with parent, DNS name, bytes, flags)
   security             Security posture audit (firewall, SIP, launch agents, ...)
   deepscan             Everything at once: health score, prioritised findings with fixes, new since last time
                        (--clean also cleans the safe items, --traffic adds a live traffic sample)
@@ -13,6 +14,13 @@ Commands:
   netmon               Record every connection (program -> IP:port, bytes) into a day-by-day history
   netlog               Report that history: requests per day, top programs/destinations, risky traffic
   procs                Heavy CPU/memory processes, which are safe to stop; --kill PID
+                       (--tree: process trees under node/npm/python/ollama/claude/docker/editors)
+  session start|stop   Dev session security monitor: connections, spawned tools, persistence, sensitive
+                       files, packages, LuLu rules -> one report (also: status, report, list)
+  persist --diff       Launch agents, login items, crontab, shell configs, hosts, git hooks, .npmrc changes
+  scan-deps [PATH]     package-lock.json: install scripts; --online adds OSV.dev vulnerabilities
+  lulu                 Read-only audit of LuLu allow rules, with expiry reminders (--tag UUID --hours N)
+  alerts               The local security alert log
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   kill APP             Quit an app and every process under it (helpers, children, launch agents)
   ready                Ready for shutdown: what cleanup frees, what stops, what is still running, git work
@@ -3312,7 +3320,8 @@ def cmd_watch(args):
 
 # ---------------------------------------------------------------- settings
 
-DEFAULT_SETTINGS = {"background_watcher": False, "watch_interval": 60, "focus_allow": [], "focus_hours": 4}
+DEFAULT_SETTINGS = {"background_watcher": False, "watch_interval": 60, "focus_allow": [], "focus_hours": 4,
+                    "session_interval": 3, "osv_lookups": False}
 
 
 def load_settings():
@@ -3370,7 +3379,9 @@ def cmd_settings(args):
         print(f"\n  background watcher is {'RUNNING' if running else 'not running'}")
         print("\n  macguard settings background_watcher on|off\n  macguard settings watch_interval <seconds>"
               "\n  macguard settings focus_allow 'Spotify,Figma'   (apps dev focus never pauses; '' clears)"
-              "\n  macguard settings focus_hours <hours>           (dev focus resumes by itself after this)")
+              "\n  macguard settings focus_hours <hours>           (dev focus resumes by itself after this)"
+              "\n  macguard settings session_interval <seconds>    (dev session poll interval, 2-5 advised)"
+              "\n  macguard settings osv_lookups on|off            (dev session reports ask OSV.dev about npm packages)")
         return
     if args.key not in DEFAULT_SETTINGS:
         sys.exit(f"Unknown setting '{args.key}'. Known: {', '.join(DEFAULT_SETTINGS)}")
@@ -3386,7 +3397,7 @@ def cmd_settings(args):
     else:
         s[args.key] = int(args.value)
     save_settings(s)
-    if args.key.startswith("focus_"):
+    if args.key.startswith(("focus_", "session_", "osv_")):
         print(f"{args.key} = {s[args.key]}")
         return
     # apply: the background agent exists only while the setting is on
@@ -3497,6 +3508,90 @@ def cmd_ui(args):
             return self.headers.get("Host") in hosts and \
                 self.headers.get("X-Token") == token
 
+        def devsec_get(self):
+            sec = devsec_mod()
+            path, _, query = self.path.partition("?")
+            q = urllib.parse.parse_qs(query)
+            try:
+                if path == "/api/devsec/session":
+                    s = sec.current_session()
+                    ev = [e for e in sec.read_events(s["id"]) if e["kind"] != "session"] if s else []
+                    return self.send(200, {"session": s, "counts": {v: sum(1 for e in ev if e["severity"] == v)
+                                                                    for v in sec.SEVERITIES}})
+                if path == "/api/devsec/alerts":
+                    s = sec.current_session()
+                    rows = [e for e in sec.read_events(s["id"]) if e["kind"] != "session"] if s else sec.read_alerts(300)
+                    return self.send(200, {"alerts": rows})
+                if path == "/api/devsec/connections":
+                    procs = sec.proc_snapshot()
+                    conns = sec.live_connections(procs)
+                    dns = sec.DnsCache()
+                    names = dns.lookup_many([c["rhost"] for c in conns], budget=2.0)
+                    dns.save()
+                    alerts = []
+                    for c in conns:
+                        c["name"] = names.get(c["rhost"], "")
+                        found = sec.connection_alerts(c, c["name"])
+                        c["flags"] = [a["title"] for a in found if a["severity"] != "info"]
+                        alerts += found
+                    alerts += sec.ollama_alerts(sockets(), procs, names)
+                    return self.send(200, {"connections": sorted(conns, key=lambda c: -c["tx"]), "alerts": sec.dedupe(alerts)})
+                if path == "/api/devsec/tree":
+                    trees = sec.watched_trees(sec.proc_snapshot())
+                    return self.send(200, {"trees": trees, "alerts": sec.tree_alerts(trees)})
+                if path == "/api/devsec/persist":
+                    base = sec.persist_baseline_path()
+                    if not os.path.exists(base):
+                        sec.save_json(base, sec.persistence_snapshot())
+                        return self.send(200, {"since": None, "changes": []})
+                    before = sec.load_json(base, {"files": {}})
+                    return self.send(200, {"since": before.get("time"),
+                                           "changes": sec.persistence_diff(before, sec.persistence_snapshot())})
+                if path == "/api/devsec/lulu":
+                    rules, err = sec.lulu_rules()
+                    if err:
+                        return self.send(200, {"available": False, "guidance": err})
+                    rows, alerts = sec.lulu_audit(rules)
+                    return self.send(200, {"available": True, "rules": [r for r in rows if not r["apple"]], "alerts": alerts})
+                if path == "/api/devsec/report":
+                    r = sec.load_report((q.get("id") or [None])[0])
+                    return self.send(200, {"report": r, "markdown": sec.report_markdown(r) if r else ""})
+            except Exception as e:
+                return self.send(500, {"error": f"{type(e).__name__}: {e}"})
+            return self.send(404, {"error": "not found"})
+
+        def devsec_post(self, body):
+            sec = devsec_mod()
+            try:
+                if self.path == "/api/devsec/session":
+                    if body.get("action") == "start":
+                        projects = [p for p in body.get("projects") or [] if isinstance(p, str)]
+                        return self.send(200, {"session": sec.start_session(projects, label="ui")})
+                    if body.get("action") == "stop":
+                        r = sec.stop_session(online=bool(body["online"]) if "online" in body else None)
+                        return self.send(200, {"report": r})
+                    return self.send(400, {"error": "action must be start or stop"})
+                if self.path == "/api/devsec/scan-deps":
+                    path = os.path.expanduser(str(body.get("path") or ""))
+                    if not path or not os.path.isdir(path):
+                        return self.send(400, {"error": "give a project folder that exists"})
+                    return self.send(200, sec.scan_deps(path, online=body.get("online") is True))
+                if self.path == "/api/devsec/persist/snapshot":
+                    sec.save_json(sec.persist_baseline_path(), sec.persistence_snapshot())
+                    return self.send(200, {"ok": True})
+                if self.path == "/api/devsec/lulu/tag":
+                    return self.send(200, {"tag": sec.lulu_tag(str(body["uuid"]), float(body.get("hours", 24)))})
+                if self.path == "/api/devsec/reveal":
+                    # Finder only reveals: still, only absolute paths that exist
+                    p = str(body.get("path") or "")
+                    if not p.startswith("/") or not os.path.exists(p):
+                        return self.send(400, {"error": "no such file"})
+                    run(["open", "-R", p])
+                    return self.send(200, {"ok": True})
+            except (RuntimeError, ValueError, KeyError, FileNotFoundError) as e:
+                return self.send(400, {"error": str(e)})
+            return self.send(404, {"error": "not found"})
+
         def do_GET(self):
             if self.path == "/":
                 if self.headers.get("Host") not in hosts:
@@ -3505,6 +3600,8 @@ def cmd_ui(args):
                     return self.send(200, fh.read().replace(b"__TOKEN__", token.encode()), "text/html; charset=utf-8")
             if not self.allowed():
                 return self.send(403, {"error": "forbidden"})
+            if self.path.split("?")[0].startswith("/api/devsec/"):
+                return self.devsec_get()
             if self.path == "/api/disk":
                 return self.send(200, disk_health())
             if self.path == "/api/scan":
@@ -3604,6 +3701,8 @@ def cmd_ui(args):
                 body = json.loads(raw or b"{}")
             except ValueError:
                 return self.send(400, {"error": "bad json"})
+            if self.path.startswith("/api/devsec/"):
+                return self.devsec_post(body)
             if self.path == "/api/clean":
                 ids = set(body.get("ids") or [])
                 with lock:
@@ -3798,6 +3897,20 @@ def cmd_capture(args):
     capture_mod().cmd_capture(args)
 
 
+def devsec_mod():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import macguard_devsec
+    return macguard_devsec
+
+
+def cmd_devsec(args):
+    getattr(devsec_mod(), args.devsec)(args)
+
+
+def cmd_devsec_as(args, fn):
+    getattr(devsec_mod(), fn)(args)
+
+
 # ---------------------------------------------------------------- HTML report
 
 def cmd_report(args):
@@ -3900,7 +4013,8 @@ def main():
     p.add_argument("--only", help="comma-separated category ids (needed for review items)")
     p.add_argument("--builds", action="store_true", help="also remove build output in active projects (target, build, dist...)")
     p.add_argument("--stale-days", type=int, default=30); p.set_defaults(fn=cmd_clean)
-    sub.add_parser("net").set_defaults(fn=cmd_net)
+    p = sub.add_parser("net"); p.add_argument("--live", action="store_true", help="outbound connections per process")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=lambda a: cmd_devsec_as(a, "cmd_net_live") if a.live else cmd_net(a))
     sub.add_parser("security").set_defaults(fn=cmd_security)
     p = sub.add_parser("deepscan", help="every check in one prioritised report with fixes")
     p.add_argument("--clean", action="store_true", help="then clean the safe items"); p.add_argument("--yes", action="store_true")
@@ -3950,7 +4064,34 @@ def main():
     p = sub.add_parser("procs"); p.add_argument("--cpu", type=float, default=HEAVY_CPU, help="CPU %% threshold")
     p.add_argument("--mem-mb", type=int, default=HEAVY_MEM >> 20, help="memory threshold in MB")
     p.add_argument("--kill", type=int, metavar="PID"); p.add_argument("--force", action="store_true")
-    p.add_argument("--yes", action="store_true"); p.set_defaults(fn=cmd_procs)
+    p.add_argument("--yes", action="store_true"); p.add_argument("--tree", action="store_true",
+                                                               help="process trees under watched dev tools")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=lambda a: cmd_devsec_as(a, "cmd_procs_tree") if a.tree else cmd_procs(a))
+    p = sub.add_parser("session", help="dev session security monitor")
+    p.add_argument("action", choices=["start", "stop", "status", "report", "list", "run"])
+    p.add_argument("--project", action="append", help="project folder to watch (repeatable; default: current folder)")
+    p.add_argument("--no-cwd", action="store_true", help="don't add the current folder")
+    p.add_argument("--label"); p.add_argument("--id", help="session id (report)")
+    p.add_argument("--seconds", type=int, help=argparse.SUPPRESS)
+    p.add_argument("--online", action="store_true", help="stop: also ask OSV.dev about npm packages")
+    p.add_argument("--format", choices=["md", "json"], default="md"); p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_devsec, devsec="cmd_session")
+    p = sub.add_parser("persist", help="persistence and system config changes")
+    p.add_argument("--diff", action="store_true", help="show diffs"); p.add_argument("--snapshot", action="store_true",
+                                                                                   help="save the current state as the baseline")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_persist")
+    p = sub.add_parser("scan-deps", help="npm package-lock scan: install scripts, OSV vulnerabilities")
+    p.add_argument("path", nargs="?", default="."); p.add_argument("--online", action="store_true",
+                                                                   help="ask OSV.dev (names and versions only)")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_scan_deps")
+    p = sub.add_parser("lulu", help="read-only LuLu rule audit")
+    p.add_argument("--all", action="store_true", help="include Apple's rules"); p.add_argument("--limit", type=int, default=60)
+    p.add_argument("--tag", metavar="UUID", help="remind me to revoke this rule"); p.add_argument("--hours", type=float, default=24)
+    p.add_argument("--label"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_lulu")
+    p = sub.add_parser("alerts", help="local security alert log")
+    p.add_argument("--limit", type=int, default=50); p.add_argument("--min", choices=["info", "warning", "critical"], default="info")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_alerts")
     p = sub.add_parser("watch"); p.add_argument("--interval", type=int, default=30); p.add_argument("--once", action="store_true")
     p.add_argument("--reset", action="store_true", help="re-learn the baseline")
     p.add_argument("--agent", action="store_true", help=argparse.SUPPRESS); p.set_defaults(fn=cmd_watch)

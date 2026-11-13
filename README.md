@@ -14,6 +14,7 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Ready for shutdown**: one report before you turn the Mac off. It shows caches to clean, idle services to stop, work still running that a shutdown would cut off (a video render, dev servers, Docker), and git work that exists only on this Mac: uncommitted changes, unpushed commits and branches never pushed. **Prepare** does the safe part. Use `macguard ready`, the **⏻ Ready for shutdown** button, or **Mac Cleanup > Ready for Shutdown…** in the app menu.
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
 - **Network monitor**: records every connection (program → IP:port, bytes) into a day-by-day history, names the IPs by reverse DNS, and warns about risky traffic: suspicious ports, unsigned or temp-folder programs online, inbound connections, unencrypted protocols, new destinations.
+- **Dev session security**: start a session while you run local LLMs (Ollama, Hugging Face), AI agents (Claude Code) and Node projects, and see what they actually do: outbound connections per process with DNS names and bytes, shells, downloaders, `osascript` or `launchctl` spawned under node/npm/python/claude, programs left running, new launch agents, crontab and shell-config changes, edits to `~/.ssh`, `~/.aws` and `.env` files, npm packages with install scripts or known vulnerabilities, and LuLu allow rules that are too broad or past their time. One Markdown/JSON report at the end.
 - **Heavy processes**: lists what is eating CPU or memory and says which are safe to stop. macOS, root-owned and the session's own processes are never killed.
 - **MCP server**: exposes all of it to AI clients such as Claude (`macguard mcp`).
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
@@ -75,11 +76,19 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select 
 | `macguard netlog [--days 7] [--proc NAME]` | Network history: connections per day, top programs and destinations (with names, ports, days seen), and risky-traffic findings. |
 | `macguard procs [--cpu 30] [--mem-mb 1024]` | Heavy processes, classed **system** (never killed), **app** (quit the app instead) or **background** (safe for macOS to stop). |
 | `macguard procs --kill <pid> [--force]` | Stop one non-system process after you type `yes` (SIGTERM, or SIGKILL with `--force`). |
+| `macguard session start [--project DIR]` | Start a **dev session**: snapshot persistence, then watch connections, spawned tools and sensitive files in the background (every `session_interval` seconds, default 3). See [Dev session security](#dev-session-security). |
+| `macguard session status \| stop \| report \| list` | Live alerts; stop and write the report (`--online` also asks OSV.dev about packages); print the last report (`--format json`); list past sessions. |
+| `macguard net --live` | Live outbound connections per process: parent, DNS name, port, bytes, and flags. |
+| `macguard procs --tree` | Process trees under node, npm, npx, python, ollama, claude, docker and editors, with risky children flagged. |
+| `macguard persist [--diff] [--snapshot]` | Launch agents and daemons, login items, crontab, shell configs, `/etc/hosts`, git config and hooks, `.npmrc`: changes since the saved baseline, with diffs (token values hidden). |
+| `macguard scan-deps [PATH] [--online]` | `package-lock.json` (v1–v3): packages with `preinstall`/`install`/`postinstall` scripts; `--online` adds known vulnerabilities from OSV.dev. |
+| `macguard lulu [--all] [--tag UUID --hours N]` | Read-only audit of LuLu's allow rules; `--tag` sets a reminder to revoke a temporary permission. |
+| `macguard alerts [--min warning]` | The local security alert log. |
 | `macguard mcp` | MCP server on stdio for AI clients. See below. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
 | `macguard report` | Static HTML report in `~/.macguard/report.html`. |
-| `macguard settings [key value]` | `background_watcher on/off` (off by default), `watch_interval <sec>`, `focus_allow 'Spotify,Figma'` (apps dev focus never pauses), `focus_hours <h>` (auto-resume). |
+| `macguard settings [key value]` | `background_watcher on/off` (off by default), `watch_interval <sec>`, `focus_allow 'Spotify,Figma'` (apps dev focus never pauses), `focus_hours <h>` (auto-resume), `session_interval <sec>` (dev session polling), `osv_lookups on/off` (dev session reports ask OSV.dev; off by default). |
 | `macguard doctor [--bundle]` | Check prerequisites and optionally write a support file. |
 
 ## MCP server
@@ -104,6 +113,11 @@ claude mcp add mac-cleanup -- /usr/bin/python3 /path/to/mac-cleanup/macguard.py 
 | `network_monitor_status` | Whether the background recorder runs and how many days are recorded. |
 | `capture_list`, `capture_analyze` | Saved captures, and one decoded: flows, HTTP requests, MQTT topics and payloads, DNS names, CoAP paths, TLS server names. Read-only. |
 | `packet_capture` | Records packets; macOS shows the user the admin password dialog. Needs `confirm: true`. |
+| `dev_session` | Start, check, stop a dev session and get its report. Writes only macguard's own state. |
+| `live_connections`, `process_tree` | Outbound connections with flags; process trees under dev tools with risky children. Read-only. |
+| `persistence_changes`, `lulu_audit`, `security_alerts` | Persistence diff, LuLu allow-rule audit, the alert log. Read-only. |
+| `lulu_reminder` | Remind the user to revoke a LuLu rule after N hours. Never edits LuLu. |
+| `scan_dependencies` | Install scripts in a `package-lock.json`; `online: true` needs `confirm_online: true` (sends package names and versions to OSV.dev). |
 | `doctor`, `recent_events` | Prerequisites, and the event log with settings. |
 
 `apply_cleanup` and `kill_process` are marked destructive, so clients ask before running them. The server is standard-library Python like the rest.
@@ -127,10 +141,36 @@ The network monitor shows who talks to whom; packet capture shows what they say.
 - Flags credentials sent over plain HTTP, MQTT logins without TLS, and unencrypted IoT protocols to the internet.
 - Captures are kept in `~/.macguard/captures` (newest 20, readable only by you); **Save .pcap to Downloads** exports one for Wireshark.
 
+## Dev session security
+
+For machines that run local models, AI agents and `npm install` all day: a session records what those tools do, then gives you one report. No root, no kernel extension, nothing sent anywhere (except OSV lookups you turn on).
+
+```bash
+macguard session start --project ~/code/my-app   # snapshot + background monitor
+# ... npm install, ollama run, claude ...
+macguard session status                          # alerts so far
+macguard session stop                            # report: Markdown + JSON in ~/.macguard/devsec/sessions/<id>/
+```
+
+In the app or web UI, the **Dev session security** panel has the same Start/Stop plus live views: **Alerts**, **Connections**, **Process tree**, **Persistence**, **LuLu**, **Packages** and **Last report** (download as Markdown or JSON). Alerts have **Kill…** (with confirmation; macOS, root and the app's own processes are refused), **Copy** and **Show** (in Finder).
+
+| Monitor | How | Flags |
+|---|---|---|
+| Network | `netstat -anv` (every process's sockets and byte counts, no root) plus `ps` for parents; reverse DNS cached for 24 h | IPs with no DNS name; Discord/Telegram webhooks, ngrok and other tunnels, pastebin, file-transfer and webhook-catcher sites; known-bad and uncommon ports; uploads over 50 MB. **Per-project baselines:** a project's first session learns its destinations (npm, GitHub, PyPI and Hugging Face are always fine), later sessions warn about new ones. **Ollama** listening beyond `127.0.0.1`, or connecting anywhere but its model registries. |
+| Processes | `ps` every few seconds, trees under node, npm, npx, pnpm, yarn, bun, deno, python, ollama, claude, docker and editors (VS Code, Cursor, Windsurf, Zed, Antigravity) | `curl`, `wget`, `base64` (warning); `osascript`, `nc`, `launchctl`, `crontab` (critical); anything run from `/tmp` or `~/Downloads`; `curl … \| sh` and `base64 -d` command lines; processes **left running** after their tool exited. Shells are logged as info: npm scripts and agents use them all the time. |
+| Persistence | Snapshot at start, diff at stop (also `macguard persist`) | Added or changed launch agents and daemons (binary plists shown as JSON), login items, crontab, `.zshrc`/`.zprofile`/`.bashrc`/`.bash_profile` and friends, `/etc/hosts`, `~/.gitconfig` and git hooks (global and per project), `.npmrc`, `~/.ssh/config` and `authorized_keys`. Token and password values are replaced with `***` before anything is stored or shown. |
+| Sensitive files | FSEvents (through CoreServices, polling if it can't start) | Changes in `~/.ssh`, `~/.aws`, `~/.config`, `~/.kube`, `~/.gnupg`, `.netrc`, Docker config, keychains, browser credential stores (Login Data, Cookies, logins.json…), and `.env` files in the session's projects. **FSEvents sees changes, not reads**: a program that only reads your keys leaves no trace here. |
+| LuLu | Reads `/Library/Objective-See/LuLu/rules.plist` (read-only) | Interpreters (node, python, java, curl…) allowed to connect anywhere, unsigned programs, programs in temp or Downloads folders, rules for programs that no longer exist, rules over 180 days old. Tag a temporary permission (`lulu --tag`) and the report and alerts remind you to revoke it in LuLu. If the file isn't readable, you get guidance instead. |
+| Packages | `package-lock.json` v1–v3 and installed `package.json` files | Install scripts. With `--online` (or `osv_lookups on`), known vulnerabilities from OSV.dev; only package names and versions are sent. Advice: `npm install --ignore-scripts`, `npm audit`, `ignore-scripts=true` in `.npmrc`. |
+
+Every alert has a severity (**info**, **warning**, **critical**), is written to the session's `events.jsonl` and to a rotating local log (`~/.macguard/devsec/alerts.jsonl`, 1 MB × 5), and critical ones also show a macOS notification.
+
+**Phase 2 (needs Apple entitlements, not built):** an Endpoint Security system extension for real-time exec and file-open/read events, and a Network Extension content filter for live blocking and time-limited allow rules that revoke themselves. Both need an Apple Developer Program membership and Apple's approval for the Endpoint Security entitlement. Everything above keeps working without them.
+
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 216 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 251 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

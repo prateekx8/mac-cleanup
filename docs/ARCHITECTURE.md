@@ -16,7 +16,8 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
-| Tests | `tests/test_macguard.py` | 216 tests (all files): unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Dev session security | `macguard_devsec.py` | Network, process, persistence, sensitive-file, LuLu and npm monitors, and the session that runs them (`session`, `net --live`, `procs --tree`, `persist`, `scan-deps`, `lulu`, `alerts`). |
+| Tests | `tests/test_macguard.py`, `test_mcp.py`, `test_capture.py`, `test_devsec.py` | 251 tests (all files): unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -138,12 +139,26 @@ flowchart LR
 - `fingerprint()` reduces a snapshot to listeners (ephemeral ports collapsed to `dyn`), programs talking to the internet, the gateway MAC, DNS servers and `/etc/hosts`.
 - Each tick it diffs against `baseline.json`, logs new items, sends a macOS notification for medium and high events, and then folds them into the baseline so the same event doesn't alert twice.
 
+### Dev session security (`macguard_devsec.py`)
+
+- Loaded on demand like `macguard_capture.py` (`devsec_mod()`), so the other commands don't pay for it.
+- `start_session()` saves `persist-start.json` and the LuLu allow rules that exist, then starts `macguard session run --id <id>` detached (`start_new_session`), so it outlives the terminal or the app. `stop_session()` sends it SIGTERM, takes the second persistence snapshot, scans the lockfiles of every project the session saw, audits LuLu and writes `report.json` and `report.md`.
+- The monitor loop polls every `session_interval` seconds (default 3): one `ps` pair (`proc_snapshot`), one `netstat -anv` (`mg.sockets`), and the FSEvents queue. Each watcher keeps what it already reported, so an alert appears once per session.
+  - `NetworkWatcher`: public connections with parent and bytes; `DnsCache` does PTR lookups on daemon threads with a time budget (a hanging lookup never blocks exit). Processes under watched roots get a project from their working directory (`lsof -d cwd`), and `Baselines` learns each project's sites in its first session.
+  - `ProcessWatcher`: `watched_trees()` keeps only the top-most watched root of a chain (claude → node → npm counts once) and hides macguard's own subtree. `classify_spawn()` holds the rules. A pid's lineage is kept with its start time, so a reused pid is never called an orphan; a child reparented to launchd after its root exited, and not a launchd job, is.
+  - `FSWatcher`: `FSEventStreamCreate` with file-level events on a dispatch queue, through `ctypes` (no PyObjC). If it can't start, it falls back to comparing mtimes. Folder events are ignored; `file_event_alert()` applies the per-place filters and severities.
+- Persistence entries keep a SHA-256, and text (up to 256 KB, binary plists as JSON) after `redact()`, so diffs can be shown without storing secrets.
+- `lulu_rules()` decodes LuLu's `NSKeyedArchiver` plist with `plistlib` (UIDs resolved by hand). It never writes to it; reminders live in `devsec/lulu_tags.json`.
+- `scan_deps()` reads lockfiles offline. `osv_query()` sends `{package: {name, ecosystem: npm}, version}` in batches of 500, and `osv_details()` fetches summaries for at most 40 IDs.
+
 ## Web UI security
 
 The UI server binds to **127.0.0.1 only**. Every API call needs:
 
 1. a **per-launch random token**, embedded in the page and sent as `X-Token`, so other websites can't call the API (CSRF), and
 2. a `Host` header of `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS-rebinding attacks.
+
+The `/api/devsec/*` routes follow the same rules. The page can start and stop a session, scan a folder it names (offline unless the user ticks OSV), reveal an existing absolute path in Finder, and set a LuLu reminder. Killing goes through `/api/procs/kill`, which re-checks the pid and executable and refuses system processes.
 
 `/api/clean` only accepts category ids from the most recent scan. It never takes paths from the client. `/api/perf/stop` likewise takes only item ids and re-plans from a fresh process snapshot, so the page never chooses pids or commands.
 
@@ -175,6 +190,10 @@ sequenceDiagram
 | `report.html` | `report` |
 | `support-*.txt` | `doctor --bundle` |
 | `app.log`, `ui-session.plist` | the native app |
+| `devsec/session.json` | the running dev session |
+| `devsec/sessions/<id>/` | `persist-start.json`, `persist-end.json`, `events.jsonl`, `connections.json`, `projects.json`, `orphans.json`, `report.json`, `report.md`, `monitor.log` |
+| `devsec/alerts.jsonl` (+ `.1`–`.5`) | every dev session alert, rotated at 1 MB |
+| `devsec/baselines.json`, `dns.json`, `persistence.json`, `lulu_tags.json` | project destinations, reverse-DNS cache, `persist` baseline, LuLu reminders |
 
 ## Design decisions
 
