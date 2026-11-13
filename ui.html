@@ -240,6 +240,17 @@ footer code{font-family:var(--mono)}
 .gitrow{display:flex;gap:12px;padding:6px 22px;font-size:13px}.gitrow b{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gitrow span{color:var(--fg-3);margin-left:auto;white-space:nowrap}
 .sugg{margin:0;padding:2px 22px 12px 42px;color:var(--fg-2);font-size:13.5px;line-height:1.7}
 
+.segtabs{display:flex;flex-wrap:wrap;gap:6px;padding:0 22px 10px}
+.segtabs button{height:30px;padding:0 13px;border-radius:999px;border:1px solid var(--stroke);background:var(--glass-2);color:var(--fg-2);font:600 12.5px var(--sans,inherit);cursor:pointer}
+.segtabs button.on{background:var(--fg);color:var(--bg,#fff);border-color:var(--fg)}
+.sesbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:0 22px 10px;color:var(--fg-2);font-size:13px}
+.sesbar .live{width:9px;height:9px;border-radius:50%;background:var(--fg-3)}.sesbar .live.on{background:var(--ok);box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 25%,transparent)}
+.tree{padding:2px 22px 12px;font:12.5px/1.75 var(--mono);overflow-x:auto;white-space:nowrap}
+.tree .pid{color:var(--fg-3)}.tree .args{color:var(--fg-3)}.tree .hit{font-weight:700}
+.tree .hit.high{color:var(--hi)}.tree .hit.medium{color:var(--med)}
+.f .acts{margin-left:auto;display:flex;gap:6px;flex:none}
+.note{padding:0 22px 10px;color:var(--fg-3);font-size:12.5px}
+pre.diff{margin:6px 0 0;padding:10px 12px;border-radius:10px;background:var(--glass-2);font:11.5px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto}
 @media (max-width:820px){.stats{grid-template-columns:1fr 1fr}.stat.disk{grid-column:1/-1}.netinfo{grid-template-columns:1fr}.netinfo.perfinfo{grid-template-columns:1fr 1fr}}
 @media (max-width:520px){.bar .grow{display:none}.stats{grid-template-columns:1fr 1fr}.items{grid-template-columns:1fr}.hero{padding-top:48px}}
 </style></head>
@@ -302,6 +313,16 @@ footer code{font-family:var(--mono)}
     <div id="sec" class="empty">Not checked yet.</div>
   </section>
 
+
+  <section class="panel glass" id="devsecPanel">
+    <div class="ph"><span class="ic">🧪</span><div class="grow"><h2>Dev session security</h2><small>What your dev tools do: connections, spawned tools, persistence, secrets, packages, LuLu</small></div>
+      <button class="btn primary sm" id="sesBtn">Start session</button></div>
+    <div class="sesbar"><span class="live" id="sesDot"></span><span id="sesTxt">No session running.</span></div>
+    <div class="segtabs" id="dsTabs">
+      <button data-ds="alerts" class="on">Alerts</button><button data-ds="conns">Connections</button><button data-ds="tree">Process tree</button>
+      <button data-ds="persist">Persistence</button><button data-ds="lulu">LuLu</button><button data-ds="deps">Packages</button><button data-ds="report">Last report</button></div>
+    <div id="devsec" class="empty">Start a session, or open a view to check right now.</div>
+  </section>
   <section class="panel glass">
     <div class="ph"><span class="ic">📡</span><div class="grow"><h2>Network</h2><small>Open ports, connections, gateway and DNS</small></div>
       <button class="btn ghost sm" id="netBtn">Check</button></div>
@@ -938,5 +959,136 @@ $("wToggle").onchange = async e => {
 
 api("/api/disk").then(showDisk).catch(()=>{});
 loadSettings().catch(()=>{});
+
+/* ---- dev session security ---- */
+const SEVC = {critical:"high", warning:"medium", info:"info"};
+let ds = {view:"alerts", live:null, timer:null, data:{}};
+function dsAlert(a, i){
+  const acts = [];
+  if (a.pid) acts.push(`<button class="btn ghost sm" data-kill="${i}">Kill…</button>`);
+  if (a.path && a.path.startsWith("/")) acts.push(`<button class="btn ghost sm" data-reveal="${esc(a.path)}">Show</button>`);
+  acts.push(`<button class="btn ghost sm" data-copy="${i}">Copy</button>`);
+  return `<div class="f"><span class="sev ${SEVC[a.severity]||"info"}">${esc(a.severity)}</span><div class="body">${esc(a.title)}
+    <small>${esc(a.time||"")} · ${esc(a.kind)} · ${esc(a.detail||"")}</small>${a.diff?`<pre class="diff">${esc(a.diff)}</pre>`:""}</div>
+    <div class="acts">${acts.join("")}</div></div>`;
+}
+function dsAlerts(list, emptyTxt){
+  ds.data.alerts = list;
+  const order = {critical:0, warning:1, info:2};
+  list = [...list].sort((a,b)=>(order[a.severity]-order[b.severity]));
+  ds.data.alerts = list;
+  return list.length ? `<div class="list">${list.map(dsAlert).join("")}</div>` : `<div class="empty">${emptyTxt||"Nothing to flag."}</div>`;
+}
+function wireAlerts(){
+  const el = $("devsec");
+  el.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
+    const a = ds.data.alerts[+b.dataset.copy];
+    try { await navigator.clipboard.writeText(JSON.stringify(a, null, 1)); toast("Copied"); } catch(e){ toast("Copy failed"); } });
+  el.querySelectorAll("[data-reveal]").forEach(b => b.onclick = () => api("/api/devsec/reveal", {path: b.dataset.reveal}).catch(e => toast(e.message)));
+  el.querySelectorAll("[data-kill]").forEach(b => b.onclick = async () => {
+    const a = ds.data.alerts[+b.dataset.kill];
+    if (!confirm(`Kill pid ${a.pid}?\n\n${a.exe||""}\n${a.title}\n\nIt gets a normal quit signal (SIGTERM). macOS, root and this app's own processes are refused.`)) return;
+    try { const r = await api("/api/procs/kill", {pid: a.pid, exe: a.exe||""}); toast((r.ok?"Stopped: ":"Not stopped: ")+r.detail); } catch(e){ toast(e.message); }
+    dsShow(ds.view);
+  });
+}
+function treeHtml(nodes, hits, depth){
+  return nodes.map(n => { const h = hits[n.pid];
+    return `<div style="padding-left:${depth*18}px">${depth?"└ ":""}<b class="${h?"hit "+SEVC[h.severity]:""}">${esc(n.name)}</b> <span class="pid">${n.pid}</span> <span class="args">${esc((n.args||n.exe).slice(0,140))}</span>${h&&h.severity!=="info"?` <b class="hit ${SEVC[h.severity]}">← ${esc(h.severity)}</b>`:""}</div>`
+      + treeHtml(n.children, hits, depth+1); }).join("");
+}
+async function dsSession(){
+  try {
+    const r = await api("/api/devsec/session");
+    const s = r.session; ds.live = s;
+    $("sesDot").className = "live" + (s && s.monitor_running ? " on" : "");
+    $("sesTxt").textContent = s ? `Session ${s.id} since ${s.started.replace("T"," ")} · ${r.counts.critical} critical, ${r.counts.warning} warnings, ${r.counts.info} info${s.monitor_running?"":" · monitor not running"}`
+                                : "No session running. Views below check the Mac right now.";
+    $("sesBtn").textContent = s ? "Stop & report" : "Start session";
+    $("sesBtn").className = "btn sm " + (s ? "danger" : "primary");
+  } catch(e){ $("sesTxt").textContent = "Failed: " + e.message; }
+}
+async function dsShow(view){
+  ds.view = view; const el = $("devsec");
+  $("dsTabs").querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.ds === view));
+  if (!el.innerHTML || el.className === "empty") { el.className = "empty"; el.innerHTML = '<span class="spin"></span>'; }
+  try {
+    if (view === "alerts") {
+      const r = await api("/api/devsec/alerts");
+      el.className = ""; el.innerHTML = `<div class="note">${ds.live?"Live: refreshes every few seconds while the session runs.":"Local alert log (rotating, never leaves this Mac)."}</div>` + dsAlerts(r.alerts.slice(-150).reverse(), "No alerts yet.");
+    } else if (view === "conns") {
+      const r = await api("/api/devsec/connections"); el.className = "";
+      const rows = r.connections.map(c => `<div class="tr"><div class="n">${esc(c.proc)} <span style="color:var(--fg-3)">${c.pid??""}${c.parent?" · under "+esc(c.parent):""}</span>
+          <small>${esc(c.name||c.rhost)}:${c.rport??""}${c.flags.length?" · "+esc(c.flags.join("; ")):""}</small></div><div></div>
+          <div class="v">${human(c.rx)}</div><div class="v">${human(c.tx)}</div></div>`).join("");
+      el.innerHTML = `<div class="top"><div class="tr h"><div>Process → destination</div><div></div><div class="v">Down</div><div class="v">Up</div></div>${rows||'<div class="empty">No outbound connections.</div>'}</div>`
+        + dsAlerts(r.alerts.filter(a => a.severity !== "info"), "No warnings about these connections.");
+    } else if (view === "tree") {
+      const r = await api("/api/devsec/tree"); el.className = "";
+      const hits = {}; r.alerts.forEach(a => hits[a.pid] = a);
+      el.innerHTML = `<div class="note">Process trees under node, npm, python, Ollama, Claude, Docker and editors. Shells under them are normal (npm scripts, agents); the rest is flagged.</div>
+        <div class="tree">${treeHtml(r.trees, hits, 0) || "No watched tools running."}</div>` + dsAlerts(r.alerts.filter(a => a.severity !== "info"), "Nothing risky spawned.");
+    } else if (view === "persist") {
+      const r = await api("/api/devsec/persist"); el.className = "";
+      el.innerHTML = `<div class="note">${r.since ? "Changes since "+esc(r.since.replace("T"," "))+" to launch agents, login items, crontab, shell configs, /etc/hosts, git hooks, .npmrc. Token values are hidden." : "Baseline saved now. Check again later to see changes."}
+        <button class="btn ghost sm" id="persistAccept">Accept current state</button></div>` + dsAlerts(r.changes, "No changes.");
+      $("persistAccept").onclick = async () => { await api("/api/devsec/persist/snapshot", {}); toast("Baseline updated"); dsShow("persist"); };
+    } else if (view === "lulu") {
+      const r = await api("/api/devsec/lulu"); el.className = "";
+      if (!r.available) { el.innerHTML = `<div class="empty">${esc(r.guidance)}</div>`; }
+      else {
+        ds.data.lulu = r.rules;
+        el.innerHTML = `<div class="note">Read-only: Mac Cleanup never edits LuLu. Set a reminder on a temporary permission, then revoke it in LuLu › Rules.</div><div class="list">`
+          + r.rules.slice(0,120).map((x,i) => `<div class="f"><span class="sev ${SEVC[x.severity]}">${esc(x.severity)}</span><div class="body">${esc(x.name)} → ${esc(x.addr)}:${esc(x.port)}
+            <small>${esc(x.path)} · created ${esc(x.created_iso||"?")}${x.flags.length?" · "+esc(x.flags.join("; ")):""}</small></div>
+            <div class="acts"><button class="btn ghost sm" data-tag="${i}">${x.tag?"Clear reminder":"Remind in 24h"}</button></div></div>`).join("") + "</div>";
+        el.querySelectorAll("[data-tag]").forEach(b => b.onclick = async () => { const x = ds.data.lulu[+b.dataset.tag];
+          await api("/api/devsec/lulu/tag", {uuid: x.uuid, hours: x.tag ? 0 : 24}); toast(x.tag ? "Reminder cleared" : "You'll be reminded to revoke it"); dsShow("lulu"); });
+      }
+    } else if (view === "deps") {
+      el.className = "";
+      el.innerHTML = `<div class="legend capform"><input id="depPath" class="search" placeholder="Project folder with package-lock.json" aria-label="Project folder">
+        <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="depOnline"> Ask OSV.dev (sends package names and versions only)</label>
+        <button class="btn primary sm" id="depBtn">Scan</button></div><div id="depOut" class="empty">Scans install scripts and, if you allow it, known vulnerabilities.</div>`;
+      $("depBtn").onclick = async () => {
+        const out = $("depOut"); out.className = "empty"; out.innerHTML = '<span class="spin"></span>';
+        try { const r = await api("/api/devsec/scan-deps", {path: $("depPath").value.trim(), online: $("depOnline").checked});
+          out.className = "";
+          out.innerHTML = `<div class="note">${esc(r.project)} · ${r.packages} packages · ${r.install_scripts.length} with install scripts · ${r.online ? r.vulnerabilities.length+" vulnerable" : "OSV not asked"}${r.error?" · "+esc(r.error):""}</div>`
+            + dsAlerts(r.alerts, "Nothing flagged.") + `<div class="note">${r.advice.map(esc).join("<br>")}</div>`;
+          wireAlerts();
+        } catch(e){ out.textContent = "Failed: " + e.message; }
+      };
+    } else if (view === "report") {
+      const r = await api("/api/devsec/report"); el.className = "";
+      el.innerHTML = r.report ? `<div class="note">Session ${esc(r.report.id)} · ${r.report.summary.critical} critical, ${r.report.summary.warning} warnings ·
+          <a href="#" id="dlMd">Download Markdown</a> · <a href="#" id="dlJson">Download JSON</a></div><pre class="diff" style="margin:0 22px 14px;max-height:520px">${esc(r.markdown)}</pre>`
+        : '<div class="empty">No finished session yet.</div>';
+      const dl = (name, text, type) => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], {type})); a.download = name; a.click(); };
+      if (r.report) { $("dlMd").onclick = e => { e.preventDefault(); dl(`dev-session-${r.report.id}.md`, r.markdown, "text/markdown"); };
+                      $("dlJson").onclick = e => { e.preventDefault(); dl(`dev-session-${r.report.id}.json`, JSON.stringify(r.report, null, 1), "application/json"); }; }
+    }
+    wireAlerts();
+  } catch(e){ el.className = "empty"; el.textContent = "Failed: " + e.message; }
+}
+$("dsTabs").querySelectorAll("button").forEach(b => b.onclick = () => dsShow(b.dataset.ds));
+$("sesBtn").onclick = async () => {
+  const btn = $("sesBtn");
+  if (ds.live) {
+    if (!confirm("Stop the dev session and write its report?")) return;
+    busy(btn, true);
+    try { await api("/api/devsec/session", {action: "stop"}); toast("Report ready"); } catch(e){ toast(e.message); }
+    busy(btn, false); await dsSession(); dsShow("report");
+  } else {
+    const proj = prompt("Project folder(s) to watch (comma-separated, optional). Others are picked up when their tools connect out.", "");
+    if (proj === null) return;
+    busy(btn, true);
+    try { await api("/api/devsec/session", {action: "start", projects: proj.split(",").map(x => x.trim()).filter(Boolean)}); toast("Session started"); }
+    catch(e){ toast(e.message); }
+    busy(btn, false); await dsSession(); dsShow("alerts");
+  }
+};
+dsSession();
+setInterval(() => { if (ds.live && !document.hidden) { dsSession(); if (["alerts","conns","tree"].includes(ds.view)) dsShow(ds.view); } }, 4000);
 </script>
 </body></html>

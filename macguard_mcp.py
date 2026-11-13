@@ -9,6 +9,7 @@ MCP client can use it. Register it with Claude Code:
 Everything is read-only except `apply_cleanup`, which only deletes what an earlier
 `plan_cleanup` call listed (by plan id), so the client always sees the exact paths first,
 and `kill_process`, which never touches macOS, root-owned or this session's processes.
+The dev session tools only write macguard's own state; scan_dependencies goes online only with consent.
 Stdlib only, like macguard.
 """
 import contextlib
@@ -22,6 +23,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import macguard as mg  # noqa: E402
 import macguard_capture as cap  # noqa: E402
+import macguard_devsec as sec  # noqa: E402
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 PLAN_TTL = 15 * 60
@@ -220,6 +222,78 @@ def t_recent_events(a):
     return {"events": lines[-a.get("limit", 30):], "settings": mg.load_settings()}
 
 
+def t_live_connections(a):
+    procs = sec.proc_snapshot()
+    conns = sec.live_connections(procs)
+    dns = sec.DnsCache()
+    names = dns.lookup_many([c["rhost"] for c in conns]) if a.get("resolve", True) else {}
+    dns.save()
+    alerts = []
+    for c in conns:
+        c["name"] = names.get(c["rhost"], "")
+        found = sec.connection_alerts(c, c["name"])
+        c["flags"] = [x["title"] for x in found]
+        alerts += found
+    alerts += sec.ollama_alerts(mg.sockets(), procs, names)
+    return {"connections": conns, "alerts": sec.dedupe(alerts)}
+
+
+def t_process_tree(a):
+    trees = sec.watched_trees(sec.proc_snapshot())
+    return {"trees": trees, "alerts": sec.tree_alerts(trees)}
+
+
+def t_persistence_changes(a):
+    path = sec.persist_baseline_path()
+    if a.get("snapshot") or not os.path.exists(path):
+        sec.save_json(path, sec.persistence_snapshot())
+        return {"baseline_saved": True, "changes": [], "next": "call again later to see what changed"}
+    before = sec.load_json(path, {"files": {}})
+    return {"since": before.get("time"), "changes": sec.persistence_diff(before, sec.persistence_snapshot())}
+
+
+def t_lulu_audit(a):
+    rules, err = sec.lulu_rules()
+    if err:
+        return {"available": False, "guidance": err}
+    rows, alerts = sec.lulu_audit(rules)
+    if not a.get("include_apple"):
+        rows = [r for r in rows if not r["apple"]]
+    return {"available": True, "rules": rows[:a.get("limit", 100)], "alerts": alerts,
+            "note": "Read-only: macguard never edits LuLu. Revoke rules in LuLu > Rules."}
+
+
+def t_lulu_reminder(a):
+    return {"uuid": a["uuid"], "reminder": sec.lulu_tag(a["uuid"], a.get("hours", 24), a.get("label") or "temporary")}
+
+
+def t_scan_dependencies(a):
+    if a.get("online") and a.get("confirm_online") is not True:
+        raise ValueError("online=true sends package names and versions to OSV.dev: ask the user, then pass confirm_online=true")
+    return sec.scan_deps(a["path"], online=bool(a.get("online")))
+
+
+def t_dev_session(a):
+    act = a.get("action", "status")
+    if act == "start":
+        return {"session": sec.start_session(a.get("projects") or [], label=a.get("label") or "")}
+    if act == "stop":
+        r = sec.stop_session(online=bool(a.get("online")) if a.get("online") is not None else None)
+        return {"report": r, "markdown": sec.report_markdown(r)}
+    if act == "report":
+        r = sec.load_report(a.get("id"))
+        if not r:
+            raise ValueError("no finished session yet")
+        return {"report": r, "markdown": sec.report_markdown(r)}
+    s = sec.current_session()
+    return {"session": s, "events": sec.read_events(s["id"])[-a.get("limit", 50):] if s else [],
+            "sessions": sec.list_sessions()[:10]}
+
+
+def t_security_alerts(a):
+    return {"alerts": sec.read_alerts(a.get("limit", 100), a.get("min_severity", "info"))}
+
+
 TOOLS = [
     ("disk_info", "Free/used space on the Mac's data volume.", _obj(), READ_ONLY, t_disk_info),
     ("scan_junk", "Size up rebuildable junk by category (Xcode, simulators, npm/pip/uv/Gradle/Cargo caches, Homebrew, Docker, "
@@ -298,6 +372,44 @@ TOOLS = [
            "port": {"type": "integer"}, "filter": {"type": "string", "description": "extra tcpdump filter"},
            "interface": {"type": "string"}, "confirm": {"type": "boolean", "description": "Must be true"}}, ("confirm",)),
      {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_packet_capture),
+    ("live_connections", "Live outbound internet connections per process (pid, parent, remote host/IP with reverse DNS, "
+     "port, bytes up/down) with flags: raw IPs, exfiltration/tunnel domains (Discord/Telegram webhooks, ngrok, pastebin, "
+     "transfer sites), suspicious or uncommon ports, heavy uploads, Ollama listening beyond 127.0.0.1. No root. Read-only.",
+     _obj({"resolve": {"type": "boolean", "default": True}}), READ_ONLY, t_live_connections),
+    ("process_tree", "Process trees under watched dev tools (node, npm, npx, python, ollama, claude, docker, code editors), "
+     "flagging shells, curl/wget, osascript, base64, nc, launchctl, crontab and programs from /tmp or Downloads they "
+     "spawned. Read-only.", _obj(), READ_ONLY, t_process_tree),
+    ("persistence_changes", "Diff launch agents/daemons, login items, crontab, shell configs, /etc/hosts, git config and "
+     "hooks, .npmrc and ssh config against a saved baseline (token values are redacted). snapshot=true saves the current "
+     "state as the baseline (writes only macguard's own state file).",
+     _obj({"snapshot": {"type": "boolean", "default": False}}), READ_ONLY, t_persistence_changes),
+    ("lulu_audit", "Read-only audit of the LuLu firewall's allow rules: interpreters allowed anywhere, unsigned or temp-"
+     "folder programs, stale and old rules, expired temporary permissions. Gives guidance when the rules aren't readable.",
+     _obj({"include_apple": {"type": "boolean", "default": False}, "limit": {"type": "integer", "minimum": 1, "default": 100}}),
+     READ_ONLY, t_lulu_audit),
+    ("lulu_reminder", "Remind the user to revoke a LuLu allow rule after some hours (hours=0 removes the reminder). "
+     "Never changes LuLu itself.",
+     _obj({"uuid": {"type": "string"}, "hours": {"type": "number", "minimum": 0, "default": 24}, "label": {"type": "string"}},
+          ("uuid",)), {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_lulu_reminder),
+    ("scan_dependencies", "Scan a project's package-lock.json: packages with install scripts (preinstall/install/"
+     "postinstall). online=true also asks OSV.dev for known vulnerabilities, sending only package names and versions: "
+     "ask the user first and pass confirm_online=true.",
+     _obj({"path": {"type": "string", "description": "project folder"}, "online": {"type": "boolean", "default": False},
+           "confirm_online": {"type": "boolean"}}, ("path",)), {**READ_ONLY, "openWorldHint": True}, t_scan_dependencies),
+    ("dev_session", "Dev session security monitor. start: snapshot persistence and run the network, process and "
+     "sensitive-file monitors in the background. status: live events. stop: end it and get the report (new "
+     "destinations, spawned scripts, persistence changes, sensitive file changes, flagged packages, LuLu rules still "
+     "open). report: the last (or given) report.",
+     _obj({"action": {"type": "string", "enum": ["start", "status", "stop", "report"], "default": "status"},
+           "projects": {"type": "array", "items": {"type": "string"}, "description": "start: project folders to watch"},
+           "label": {"type": "string"}, "id": {"type": "string", "description": "report: session id"},
+           "online": {"type": "boolean", "description": "stop: ask OSV.dev about npm packages (the user must agree)"},
+           "limit": {"type": "integer", "minimum": 1, "default": 50}}), {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_dev_session),
+    ("security_alerts", "The local, rotating security alert log (network, process, persistence, file, LuLu, package "
+     "alerts) from dev sessions. Read-only.",
+     _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+           "min_severity": {"type": "string", "enum": ["info", "warning", "critical"], "default": "info"}}),
+     READ_ONLY, t_security_alerts),
     ("doctor", "Check prerequisites (system Python, socket visibility, required and optional tools).", _obj(), READ_ONLY, t_doctor),
     ("recent_events", "Recent macguard events (cleanups, watcher alerts) and current settings.",
      _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 30}}), READ_ONLY, t_recent_events),
@@ -331,7 +443,8 @@ def handle(msg):
         result = {"protocolVersion": want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                   "capabilities": {"tools": {"listChanged": False}},
                   "serverInfo": {"name": "mac-cleanup", "version": mg.__version__},
-                  "instructions": "Disk cleanup, heavy processes, network history (network_history / network_alerts), security, apps and network checks for this Mac. Everything "
+                  "instructions": "Disk cleanup, heavy processes, network history (network_history / network_alerts), security, apps and network checks for this Mac, "
+                                  "plus a dev session security monitor (dev_session, live_connections, process_tree, persistence_changes, lulu_audit, scan_dependencies). Everything "
                                   "is read-only except apply_cleanup and kill_process: show the user the plan or process "
                                   "first and act only after they agree."}
     elif method == "ping":
