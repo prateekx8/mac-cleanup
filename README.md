@@ -195,6 +195,10 @@ A **Tools** section for one-off jobs, all on your Mac ([design](docs/TOOLS.md)).
 - **Coming next: AI image check** and **AI voice check**: drop in a picture or a voice clip and see whether it carries Content
   Credentials, metadata or other signs of being made by AI, with how strong each sign is. It never claims a file is
   "real" ([design](docs/AI-DETECTION.md)).
+- **Coming: Photo sorter**: point it at a folder or a memory card. It indexes every photo first (date taken, camera,
+  and what Apple's on-device Vision sees: people, screenshots, receipts, places), then proposes folders by event,
+  month or kind, with duplicates set aside. It copies by default; moves can be undone, and nothing is deleted
+  ([design](docs/PHOTO-SORT.md)).
 
 ## Development
 
@@ -211,6 +215,7 @@ Unit tests run against temporary directories and mocked system commands. They ne
 - [Tools: design](docs/TOOLS.md) (planned): the Tools section, with
   - [Recover files](docs/RECOVERY.md): Trash, backups, snapshots and memory cards
   - [AI image and voice check](docs/AI-DETECTION.md): signs that a picture or voice was made by AI
+  - [Photo sorter](docs/PHOTO-SORT.md): index photos with Apple Vision, then sort them by event, month or kind
 - [Architecture](docs/ARCHITECTURE.md): components, data flow, UI security model, app process model, with a [diagram](docs/architecture.png)
 - [Support and troubleshooting](docs/SUPPORT.md)
 

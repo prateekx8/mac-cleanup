@@ -107,13 +107,14 @@ class TestGuide(unittest.TestCase):
             self.assertIn(phrase, guide)
 
     def test_design_docs_link_each_other(self):
-        for doc, links in (("docs/TOOLS.md", ("RECOVERY.md", "AI-DETECTION.md")),
-                           ("docs/RECOVERY.md", ("TOOLS.md",)), ("docs/AI-DETECTION.md", ("TOOLS.md",))):
+        for doc, links in (("docs/TOOLS.md", ("RECOVERY.md", "AI-DETECTION.md", "PHOTO-SORT.md")),
+                           ("docs/RECOVERY.md", ("TOOLS.md",)), ("docs/AI-DETECTION.md", ("TOOLS.md",)),
+                           ("docs/PHOTO-SORT.md", ("TOOLS.md",))):
             text = read(doc)
             for target in links:
                 self.assertIn(f"]({target}", text, f"{doc} -> {target}")
                 self.assertTrue(os.path.exists(os.path.join(ROOT, "docs", target)), target)
-        for target in ("docs/TOOLS.md", "docs/RECOVERY.md", "docs/AI-DETECTION.md"):
+        for target in ("docs/TOOLS.md", "docs/RECOVERY.md", "docs/AI-DETECTION.md", "docs/PHOTO-SORT.md"):
             self.assertIn(f"]({target})", read("README.md"), target)
 
     def test_guide_commands_exist(self):
