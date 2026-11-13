@@ -1,6 +1,15 @@
 # Photo sorter: research and design
 
-**Status:** research and design, 13 Nov 2026. Nothing is built yet. Part of the **Tools** section ([TOOLS.md](TOOLS.md)).
+**Status (14 Nov 2026):** P1 is built, plus two P2 parts (similar-photo groups and search): `macguard photos`, the
+Photo sorter card, MCP `photos_*`, `macguard_photos.py` and `helpers/photo_sense.swift` (prebuilt into the app;
+compiled once into `~/.macguard/bin` for the command line). Best-shot picks, side-by-side review and P3 (Photos
+library albums) are next. Part of the **Tools** section ([TOOLS.md](TOOLS.md)).
+
+**Checked when P1 was built:** a test folder with dated photos, a burst, a screenshot, a receipt, a duplicate, a
+Live Photo with its edit sidecar and an undated file: index (with the real helper), events named from Vision
+("2026-08-10 Bird, owl"), the burst grouped as similar, copy, move, undo of every move, and Finder tags, from the
+command line and the web UI. Similar-photo threshold: a fingerprint distance under 0.45 within 10 seconds (measured:
+a rotated or cropped copy 0.26–0.41, different subjects 0.6 and up).
 
 **Goal:** point Mac Cleanup at a folder of photos (Downloads, an old export, a memory card, a backup drive). It
 first builds an index of every photo: when it was taken, what camera made it, and what Apple's on-device Vision

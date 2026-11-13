@@ -176,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         a.informativeText = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         // the button says what happens: "Stop 2 item(s)?" -> Stop, "Pause …" -> Pause, "Quit Docker…" -> Quit, cleanup -> Delete
         let verb = String(lines.first?.split(separator: " ").first ?? "")
-        a.addButton(withTitle: ["Start", "Prepare", "Stop", "Pause", "Quit", "Uninstall", "Reset"].contains(verb) ? verb
+        a.addButton(withTitle: ["Start", "Prepare", "Stop", "Pause", "Quit", "Uninstall", "Reset", "Copy", "Move", "Add"].contains(verb) ? verb
                     : (message.hasPrefix("Permanently delete") ? "Delete" : "Continue"))
         a.addButton(withTitle: "Cancel")
         a.buttons.first?.hasDestructiveAction = true
@@ -188,6 +188,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         let a = NSAlert()
         a.messageText = message
         a.beginSheetModal(for: window) { _ in completionHandler() }
+    }
+
+    // prompt(): restore and save destinations
+    func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
+        let a = NSAlert()
+        let lines = prompt.components(separatedBy: "\n")
+        a.messageText = lines.first ?? ""
+        a.informativeText = lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        field.stringValue = defaultText ?? ""
+        a.accessoryView = field
+        a.addButton(withTitle: "OK")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        a.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn ? field.stringValue : nil) }
+    }
+
+    // <input type="file">: the AI check's Choose file
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.beginSheetModal(for: window) { completionHandler($0 == .OK ? panel.urls : nil) }
     }
 
     // keep the window on the local UI; open anything else in the default browser

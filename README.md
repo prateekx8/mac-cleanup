@@ -15,7 +15,9 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
 - **Network monitor**: records every connection (program → IP:port, bytes) into a day-by-day history, names the IPs by reverse DNS, and warns about risky traffic: suspicious ports, unsigned or temp-folder programs online, inbound connections, unencrypted protocols, new destinations.
 - **Dev session security**: start a session while you run local LLMs (Ollama, Hugging Face), AI agents (Claude Code) and Node projects, and see what they actually do: outbound connections per process with DNS names and bytes, shells, downloaders, `osascript` or `launchctl` spawned under node/npm/python/claude, programs left running, new launch agents, crontab and shell-config changes, edits to `~/.ssh`, `~/.aws` and `.env` files, npm packages with install scripts or known vulnerabilities, and LuLu allow rules that are too broad or past their time. One Markdown/JSON report at the end.
-- **Tools › Recover files**: get back deleted files from the Trash, editor history (VS Code, Cursor, Windsurf, Antigravity), lost git commits and staged files, and Time Machine, always as a copy; and check a memory card or USB stick for the honest chance of recovering it.
+- **Tools › Recover files**: get back deleted files from the Trash, editor history (VS Code, Cursor, Windsurf, Antigravity), lost git commits and staged files, and Time Machine, always as a copy. For memory cards: an honest chance of recovery, then image the card (read-only) and get deleted photos and files back, with their names on FAT and exFAT.
+- **Tools › AI image and voice check**: drop in a picture or voice clip to see whether it carries Content Credentials, AI metadata or image-generator settings, with how strong each sign is. It never claims a file is "real".
+- **Tools › Photo sorter**: index a folder or card with Apple's on-device Vision (date, camera, what's in each photo), then sort into events, months or kinds. Duplicates and screenshots are set aside; copy by default, moves can be undone.
 - **Heavy processes**: lists what is eating CPU or memory and says which are safe to stop. macOS, root-owned and the session's own processes are never killed.
 - **MCP server**: exposes all of it to AI clients such as Claude (`macguard mcp`).
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
@@ -99,6 +101,12 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools for `/usr/bin/p
 | `macguard recover [--search TEXT] [--source trash,history,git,timemachine]` | Find deleted files you can get back: the Trash, editor local history, lost git commits and staged files (`--repo`, default the current folder), Time Machine versions (`--path`). Lists local snapshots, and where iCloud Drive, Photos and Notes keep deleted items. `--finder` reads a protected Trash through Finder. |
 | `macguard recover --search TEXT --restore ID [--to DIR] --apply` | Restore a **copy** (default `~/Downloads/Recovered <date>`). Never moves or overwrites; a lost commit becomes a branch `recovered/<sha>`. Dry run without `--apply`. |
 | `macguard recover analyze [diskN]` | Connected memory cards and disks with an honest chance of recovery; with a disk, its filesystems, encryption, SMART status and what to do. |
+| `macguard recover image diskN [--to DIR] --apply` | Copy a whole card or USB stick into an image file on the Mac. Read-only on the card, one admin password prompt, unreadable sectors zero-filled and listed. Uses GNU `ddrescue` if installed. Internal and encrypted disks are refused. |
+| `macguard recover scan IMAGE [--everything]` | Deleted files in a card image: FAT12/16/32 and exFAT undelete with names and dates, then carving of free space (JPEG, PNG, HEIC/MP4/MOV, TIFF/RAW, PDF, Office/ZIP, WAV/AVI/WebP), each marked intact or damaged. `--save all\|ID,ID [--to DIR]` writes copies. |
+| `macguard ai-check FILE... [--json] [-v]` | Signs a picture, voice clip or video was made by AI: Content Credentials (signature verified with `c2patool` when installed), IPTC digital source type, EXIF/XMP, Stable Diffusion/ComfyUI/InvokeAI/NovelAI settings, TTS names in audio tags. Verdict, evidence strength, limits. Never says "real". |
+| `macguard photos index FOLDER [--no-vision]` | Photo sorter: index every photo and video (date taken, camera, GPS, Apple Vision labels, faces, text, quality, screenshot/receipt, a fingerprint for similar shots). Re-runs only look at new files. |
+| `macguard photos summary\|plan FOLDER [--by event\|month\|kind] [--to DIR] [--gap H] [--trust-file-dates]` | What's there (years, events, kinds, duplicates, bursts), then a plan of folders. Nothing moves. |
+| `macguard photos apply [--move\|--tag]` · `photos undo` · `photos find "beach 2024"` | Copy into the plan's folders (default), move (same disk, journalled; `undo` puts everything back) or only add Finder tags. Search the index. |
 | `macguard mcp` | MCP server on stdio for AI clients. See below. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
@@ -135,6 +143,10 @@ claude mcp add mac-cleanup -- /usr/bin/python3 /path/to/mac-cleanup/macguard.py 
 | `scan_dependencies` | Install scripts in a `package-lock.json`; `online: true` needs `confirm_online: true` (sends package names and versions to OSV.dev). |
 | `tools_list`, `recover_search`, `recover_analyze` | The Tools section, recoverable files, memory card analysis. Read-only. |
 | `recover_restore` | Restore a copy of one found item; needs `confirm: true`. |
+| `recover_image_card`, `recover_scan_image`, `recover_save_files` | Image a card (admin prompt, `confirm: true`), scan an image (read-only), save chosen files (`confirm: true`). |
+| `ai_check` | AI markers in a picture, voice clip or video, with evidence and limits. Read-only. |
+| `photos_index`, `photos_summary`, `photos_plan`, `photos_find` | Photo sorter index, overview, plan and search. Only macguard's own index is written. |
+| `photos_apply`, `photos_undo` | Copy, move or tag per a plan, and undo a move; need `confirm: true`. Never delete. |
 | `doctor`, `recent_events` | Prerequisites, and the event log with settings. |
 
 `apply_cleanup` and `kill_process` are marked destructive, so clients ask before running them. The server is standard-library Python like the rest.
@@ -188,22 +200,25 @@ Every alert has a severity (**info**, **warning**, **critical**), is written to 
 
 A **Tools** section for one-off jobs, all on your Mac ([design](docs/TOOLS.md)). In the app it's the **Tools** panel.
 
-- **Recover files** (ready, phase R1): search the Trash, editor history, lost git work and Time Machine, and
-  restore a copy; check a memory card or USB stick and get an honest verdict with what to do
-  ([design](docs/RECOVERY.md)). Deep recovery of cards comes next (R2). Files deleted from the Mac's internal SSD after
-  emptying the Trash can't be found by scanning, and the tool says so.
-- **Coming next: AI image check** and **AI voice check**: drop in a picture or a voice clip and see whether it carries Content
-  Credentials, metadata or other signs of being made by AI, with how strong each sign is. It never claims a file is
-  "real" ([design](docs/AI-DETECTION.md)).
-- **Coming: Photo sorter**: point it at a folder or a memory card. It indexes every photo first (date taken, camera,
-  and what Apple's on-device Vision sees: people, screenshots, receipts, places), then proposes folders by event,
-  month or kind, with duplicates set aside. It copies by default; moves can be undone, and nothing is deleted
+- **Recover files**: search the Trash, editor history, lost git work and Time Machine, and restore a copy. For
+  memory cards and USB sticks: an honest verdict, then **Image this card** (one password prompt, read-only) and a
+  scan of the image: FAT and exFAT undelete keeps names and dates, and carving finds photos, videos and documents by
+  their contents. A gallery shows what came back and whether each file looks intact
+  ([design](docs/RECOVERY.md)). Files deleted from the Mac's internal SSD after emptying the Trash can't be found by
+  scanning, and the tool says so.
+- **AI image check** and **AI voice check**: drop in a picture or a voice clip and see whether it carries Content
+  Credentials, AI metadata or generator settings, with how strong each sign is. The file is checked on the Mac and
+  the uploaded copy deleted. It never claims a file is "real" ([design](docs/AI-DETECTION.md)).
+- **Photo sorter**: point it at a folder or a memory card. It indexes every photo first (date taken, camera, and
+  what Apple's on-device Vision sees: scenes, faces, text, screenshots, receipts), then proposes folders by event,
+  month or kind, with duplicates and undated files set aside and bursts grouped. It copies by default; moves can be
+  undone, Finder tags are an option, and nothing is deleted. The Photos library itself is never touched
   ([design](docs/PHOTO-SORT.md)).
 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 286 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 337 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
@@ -212,7 +227,7 @@ Unit tests run against temporary directories and mocked system commands. They ne
 ## Docs
 
 - [Install guide and troubleshooting](docs/INSTALL.md)
-- [Tools: design](docs/TOOLS.md) (planned): the Tools section, with
+- [Tools: design](docs/TOOLS.md): the Tools section, with
   - [Recover files](docs/RECOVERY.md): Trash, backups, snapshots and memory cards
   - [AI image and voice check](docs/AI-DETECTION.md): signs that a picture or voice was made by AI
   - [Photo sorter](docs/PHOTO-SORT.md): index photos with Apple Vision, then sort them by event, month or kind

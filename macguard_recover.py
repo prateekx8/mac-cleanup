@@ -563,10 +563,10 @@ def analyze(ident, quick=False):
         return rec
     deep = [h for h in tools.helpers() if h["name"] == "photorec"][0]
     if chance in ("good", "possible", "low"):
-        steps = steps + (["Deep recovery is built into Mac Cleanup next (phase R2). Need it today? PhotoRec (free) is "
-                          f"installed: sudo photorec /dev/r{ident}, and save to another disk." if deep["path"] else
-                          "Deep recovery is built into Mac Cleanup next (phase R2). Need it today? Install PhotoRec "
-                          f"(free): brew install testdisk, then sudo photorec /dev/r{ident}, and save to another disk."])
+        steps = steps + [f"Deep recovery: image the card first (macguard recover image {ident} --apply, or Image this "
+                         "card in Tools; one password prompt, read-only), then scan the image for deleted files.",
+                         "Optional, for more formats: PhotoRec " + ("is installed" if deep["path"] else
+                         "(brew install testdisk)") + ", run on the image file, not the card."]
     if rec["smart"] not in ("Verified", "Not reported", "Not Supported"):
         steps.insert(0, f"SMART status is {rec['smart']}: the device may be failing. Copy what you can first.")
     return tools.result("recover", "info", f"{rec['name'] or ident}: chance of recovery {chance}",
@@ -598,6 +598,13 @@ def print_items(items):
 
 
 def cmd_recover(args):
+    if args.action in ("image", "scan"):
+        import macguard_carve as cv
+        try:
+            (cv.cmd_image if args.action == "image" else cv.cmd_scan)(args)
+        except ValueError as e:
+            sys.exit(str(e))
+        return
     if args.action == "analyze":
         if not args.target:
             devs = devices()
