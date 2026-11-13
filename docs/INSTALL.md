@@ -6,6 +6,7 @@ This guide takes about 5 minutes on a Mac that already has Apple's Command Line 
 
 **Contents**
 
+0. [Fastest: download the app](#fastest-download-the-app)
 1. [Get the files](#1-get-the-files)
 2. [Run the installer](#2-run-the-installer)
 3. [Check that it works](#3-check-that-it-works)
@@ -14,6 +15,20 @@ This guide takes about 5 minutes on a Mac that already has Apple's Command Line 
 6. [Update or uninstall](#update-or-uninstall)
 
 ---
+
+## Fastest: download the app
+
+If you only want the app and not the `macguard` command:
+
+1. Download **`MacCleanup.dmg`** from https://github.com/prateekx8/mac-cleanup/releases/latest.
+2. Open it and drag **Mac Cleanup** into **Applications**.
+3. Open Mac Cleanup. The first time, macOS says it *can't check it for malicious software*, because the app is free
+   and not notarized by Apple. Open **System Settings › Privacy & Security**, scroll down, click **Open Anyway**,
+   then confirm. If macOS says the app is *damaged*, see [The app won't open](#the-app-wont-open).
+4. If it asks for Apple's **Command Line Tools** (they include Python), click **Install**, wait, then open it again.
+
+Want the `macguard` command, the web UI or the MCP server for AI assistants? Install from source below. It takes
+about a minute.
 
 ## 1. Get the files
 
@@ -91,7 +106,7 @@ macguard scan
 | You want | Do this |
 |---|---|
 | A window with buttons | Double-click **`MacCleanup.command`** in the mac-cleanup folder. It opens the web UI in your browser. Close the Terminal window it opens to stop it. |
-| The native app | `./setup.sh --app`, then open **Mac Cleanup** from Applications. The first time, macOS may ask you to confirm (see [App won't open](#the-app-wont-open)). |
+| The native app | Download it (see [the top of this guide](#fastest-download-the-app)), or build it: `./setup.sh --app`, then open **Mac Cleanup** from Applications. The first time, macOS may ask you to confirm (see [The app won't open](#the-app-wont-open)). |
 | The terminal | `macguard --help`. Start with `macguard scan`, `macguard clean` (dry run) and `macguard deepscan`. |
 | Watch your dev tools | `macguard session start` in your project folder, work as usual, then `macguard session stop` for the report. |
 | Claude or another AI client | `claude mcp add mac-cleanup -- /usr/bin/python3 ~/mac-cleanup/macguard.py mcp` (use your folder's path). |
@@ -170,6 +185,8 @@ If `macguard` itself is not found, use the full path instead: `/usr/bin/python3 
 ---
 
 ## Update or uninstall
+
+**Update the downloaded app:** download the new `MacCleanup.dmg` from the latest release and replace the app in Applications.
 
 **Update** (git install):
 
