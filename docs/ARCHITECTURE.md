@@ -17,7 +17,7 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and a quick self-check (`--app` builds the app, `--test` runs the suite). Every failure prints a `fix:` line; output goes to `~/.macguard/setup.log`. Walkthrough: [INSTALL.md](INSTALL.md). |
 | Dev session security | `macguard_devsec.py` | Network, process, persistence, sensitive-file, LuLu and npm monitors, and the session that runs them (`session`, `net --live`, `procs --tree`, `persist`, `scan-deps`, `lulu`, `alerts`). |
-| Tools | `macguard_tools.py`, `macguard_recover.py` | The Tools registry and shared result shape; Recover files R1 (`tools`, `recover`) |
+| Tools | `macguard_tools.py`, `macguard_recover.py`, `macguard_carve.py`, `macguard_aicheck.py`, `macguard_photos.py`, `helpers/photo_sense.swift` | The Tools registry, shared result shape, uploads and background jobs; Recover files (`recover`), deep card recovery (`recover image/scan`), AI image and voice check (`ai-check`), Photo sorter (`photos`) |
 | Tests | `tests/test_macguard.py`, `test_mcp.py`, `test_capture.py`, `test_devsec.py`, `test_install.py`, `test_recover.py` | 286 tests (all files): unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
@@ -158,6 +158,24 @@ flowchart LR
 - Every item has an id (a hash of source and path). `restore()` copies into a folder (default `~/Downloads/Recovered <date>`), never moves, never overwrites (`name (2).ext`), refuses the Trash and system folders, turns a commit into branch `recovered/<sha>` and a blob into a file. The UI restores only items from its last search (409 otherwise), like `/api/clean`.
 - `analyze()` reads `diskutil info/list -plist`, follows APFS physical stores to their containers, and gives a chance per volume: internal SSD = none (encryption and TRIM), encrypted APFS = very low, APFS on SSD = low, FAT/exFAT cards = good. Identifiers must match `disk\d+(s\d+)*`. Nothing here opens a raw device.
 
+### Tools › deep card recovery (`macguard_carve.py`, R2–R3)
+
+- `image_device()` unmounts the card (`diskutil unmountDisk`), then runs one admin prompt (`run_as_admin`, like packet capture). The worker is a string passed to `/usr/bin/python3 -I -c`, so root never runs a file someone could have edited. It reads `/dev/rdiskN` with `O_RDONLY` in 1 MB blocks, retries a failing block sector by sector, zero-fills unreadable sectors, writes a JSON map of them and hands the image back to the user. GNU `ddrescue` is used instead when installed. Internal and encrypted disks, and an output folder on the card itself, are refused before anything runs.
+- `scan()` maps the image read-only (`mmap`), finds FAT or exFAT volumes (bare, MBR or GPT), walks every folder, including deleted ones, for deleted entries (FAT `0xE5` with long names, the lost 8.3 first letter rebuilt from the long-name checksum when possible; exFAT entry sets with the in-use bit cleared), and reads each file as contiguous clusters, marking it overwritten if the FAT or allocation bitmap says newer files use them. Carving then searches only free clusters (`--everything` for all) at sector boundaries for JPEG, PNG, BMFF, TIFF/RAW, PDF, ZIP and RIFF, following each format's own structure to find the end and checking it (JPEG markers, PNG CRCs, `zipfile.testzip`).
+- `save()` copies chosen byte ranges into a folder (never overwriting), restoring names, folders and modified times for undeleted files.
+
+### Tools › AI image and voice check (`macguard_aicheck.py`, phase A)
+
+- `check()` reads the file (200 MB cap), sniffs the format from its bytes, and runs bounds-checked parsers: JPEG segments, PNG chunks, RIFF (WAV, WebP), AIFF, ID3v2.2–2.4, ISO-BMFF boxes, FLAC blocks, TIFF IFDs. XMP and a one-piece C2PA manifest store are also searched for anywhere in the file.
+- C2PA: JUMBF superboxes are parsed into a tree; the active manifest's claim (`claim_generator(_info)`) and `c2pa.actions(.v2)` assertions are decoded with a small CBOR reader (depth and item limits). Signatures are verified only by `c2patool` when installed; without it the result says "unverified".
+- Verdicts rank evidence (proven > strong > moderate > weak). Camera EXIF is shown but never counted as proof of anything. Uploads from the web UI go to `~/.macguard/tools/inbox` (0700, files 0600) and are deleted in a `finally` after the check.
+
+### Tools › Photo sorter (`macguard_photos.py`, `helpers/photo_sense.swift`)
+
+- `photo_sense` (Swift, ImageIO, AVFoundation, Vision) reads paths on stdin and prints one JSON line each: EXIF date and offset, camera, size, GPS, video creation date and location, and from a 1024 px thumbnail the Vision labels (≥ 0.3), face count, text line count, aesthetics score and `isUtility` (macOS 15+), and a 768-float feature print. The app bundles it prebuilt; the command line compiles it once into `~/.macguard/bin` (keyed by the source's hash). Without Swift, dates and cameras come from a Python EXIF reader.
+- `index()` keeps one row per file in `~/.macguard/photos/index.sqlite` (0600), skipping files whose size and mtime haven't changed. `analyse()` adds the kind (screenshot, document, saved, video, photo), exact duplicates (size + head/tail hash, then full SHA-256), similar groups (feature-print distance < 0.45 within 10 s) and events (gap > 3 h or a GPS jump > 50 km), named from the most common non-generic labels.
+- `plan()` writes a JSON plan (Live Photo videos, RAW twins and `.AAE`/`.XMP` sidecars follow their photo). `apply()` copies (free-space check), moves (same disk only; each move is written and fsynced to `undo-<time>.jsonl` before `os.rename`) or adds Finder tags with `xattr`. `undo()` replays the journal backwards and removes only folders it emptied. The Photos library is refused at every step.
+
 ## Web UI security
 
 The UI server binds to **127.0.0.1 only**. Every API call needs:
@@ -166,6 +184,8 @@ The UI server binds to **127.0.0.1 only**. Every API call needs:
 2. a `Host` header of `127.0.0.1:<port>` or `localhost:<port>`, which blocks DNS-rebinding attacks.
 
 The `/api/devsec/*` routes follow the same rules. The page can start and stop a session, scan a folder it names (offline unless the user ticks OSV), reveal an existing absolute path in Finder, and set a LuLu reminder. Killing goes through `/api/procs/kill`, which re-checks the pid and executable and refuses system processes.
+
+The Tools routes follow them too. `/api/tools/ai-check` takes a raw file body (checked against the token and a 200 MB limit before anything is read), saves it privately, checks it and deletes it. Previews and thumbnails are served only for items of the last card scan or files in the photo index, never for any path the page names. Card imaging, scans, saves and photo index/apply run as background jobs the page polls (`/api/tools/job`).
 
 `/api/clean` only accepts category ids from the most recent scan. It never takes paths from the client. `/api/perf/stop` likewise takes only item ids and re-plans from a fresh process snapshot, so the page never chooses pids or commands.
 
@@ -201,7 +221,11 @@ sequenceDiagram
 | `devsec/sessions/<id>/` | `persist-start.json`, `persist-end.json`, `events.jsonl`, `connections.json`, `projects.json`, `orphans.json`, `report.json`, `report.md`, `monitor.log` |
 | `devsec/alerts.jsonl` (+ `.1`–`.5`) | every dev session alert, rotated at 1 MB |
 | `devsec/baselines.json`, `dns.json`, `persistence.json`, `lulu_tags.json` | project destinations, reverse-DNS cache, `persist` baseline, LuLu reminders |
-| `~/Downloads/Recovered <date>/` | copies restored by Recover files (outside `~/.macguard`, where you'll look for them) |
+| `~/Downloads/Recovered <date>/` | copies restored by Recover files, card images and saved files (outside `~/.macguard`, where you'll look for them) |
+| `recover/scan-last.json` | the last card scan (so `recover scan --save` and the UI can save from it) |
+| `tools/inbox/` | AI check uploads, deleted after each check |
+| `photos/index.sqlite`, `photos/plans/`, `photos/undo-*.jsonl` | the Photo sorter's index, plans and move journals |
+| `bin/photo_sense` (+ `.sha`) | the Photo sorter's Vision helper, compiled for the command line |
 
 ## Design decisions
 

@@ -42,6 +42,9 @@ class TestScripts(unittest.TestCase):
         self.assertIn("macguard_devsec.py", modules)
         for m in modules:  # the post-copy import check names each module macguard.py loads on demand
             self.assertIn(m[:-3], build)
+        # the Photo sorter's Vision helper is prebuilt into the bundle where macguard_photos looks for it
+        self.assertIn('"$DIR/helpers/photo_sense.swift"', build)
+        self.assertIn('"$APP/Contents/Resources/helpers/photo_sense"', build)
 
     def test_installed_command_detects_a_moved_folder(self):
         setup = read("setup.sh")

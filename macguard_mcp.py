@@ -10,6 +10,8 @@ Everything is read-only except `apply_cleanup`, which only deletes what an earli
 `plan_cleanup` call listed (by plan id), so the client always sees the exact paths first,
 and `kill_process`, which never touches macOS, root-owned or this session's processes.
 The dev session tools only write macguard's own state; scan_dependencies goes online only with consent.
+Tools that copy, move or image (recover_restore, recover_image_card, recover_save_files, photos_apply, photos_undo)
+need confirm=true; none of them deletes anything.
 Stdlib only, like macguard.
 """
 import contextlib
@@ -24,6 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import macguard as mg  # noqa: E402
 import macguard_capture as cap  # noqa: E402
 import macguard_devsec as sec  # noqa: E402
+import macguard_aicheck as aic  # noqa: E402
+import macguard_carve as carve  # noqa: E402
+import macguard_photos as photos  # noqa: E402
 import macguard_recover as rec  # noqa: E402
 import macguard_tools as mtools  # noqa: E402
 
@@ -323,6 +328,67 @@ def t_recover_restore(a):
     return rec.restore(item, a.get("to"))
 
 
+def _confirm(a, what):
+    if a.get("confirm") is not True:
+        raise ValueError(f"refusing to {what} without confirm=true (show the user the plan first)")
+
+
+def t_ai_check(a):
+    path = os.path.expanduser(a["path"])
+    if not os.path.isfile(path):
+        raise ValueError("no such file")
+    return aic.check(os.path.abspath(path))
+
+
+def t_photos_index(a):
+    return photos.index(a["folder"], vision=a.get("vision", True))
+
+
+def t_photos_summary(a):
+    r = photos.summary(a["folder"], a.get("gap_hours", 3.0), a.get("trust_file_dates", False))
+    r["events"] = r.get("events", [])[-a.get("events", 40):]
+    return r
+
+
+def t_photos_plan(a):
+    p = photos.plan(a["folder"], a.get("layout", "event"), a.get("dest"), a.get("gap_hours", 3.0),
+                    a.get("trust_file_dates", False))
+    return {k: v for k, v in p.items() if k != "moves"} | {"files": len(p["moves"]), "sample": p["moves"][:30],
+            "next": "show the user the folders, then call photos_apply with plan_id, mode and confirm=true"}
+
+
+def t_photos_apply(a):
+    _confirm(a, "sort photos")
+    return photos.apply(a["plan_id"], a.get("mode", "copy"))
+
+
+def t_photos_undo(a):
+    _confirm(a, "undo the last move")
+    return photos.undo()
+
+
+def t_photos_find(a):
+    return {"matches": photos.find(a["query"], a.get("folder"), a.get("limit", 100))}
+
+
+def t_recover_scan_image(a):
+    r = carve.scan(a["image"], undelete=a.get("undelete", True), do_carve=a.get("carve", True),
+                   everything=a.get("everything", False))
+    r["items"] = r["items"][:a.get("limit", 200)]
+    r["next"].append("To save files, show the user the list, then call recover_save_files with ids and confirm=true.")
+    return r
+
+
+def t_recover_save_files(a):
+    _confirm(a, "save recovered files")
+    return carve.save("all" if a["ids"] == ["all"] else [str(i) for i in a["ids"]], a.get("to"))
+
+
+def t_recover_image_card(a):
+    _confirm(a, "image a card")
+    return carve.image_device(a["disk"], a.get("to"))
+
+
 def t_recover_analyze(a):
     if not a.get("disk"):
         return {"devices": rec.devices(), "next": "call again with disk=<id> for details"}
@@ -448,7 +514,7 @@ TOOLS = [
      _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
            "min_severity": {"type": "string", "enum": ["info", "warning", "critical"], "default": "info"}}),
      READ_ONLY, t_security_alerts),
-    ("tools_list", "The Tools section (Recover files; AI image and voice check, planned) and which optional helpers "
+    ("tools_list", "The Tools section (Recover files, AI image and voice check, Photo sorter) and which optional helpers "
      "(PhotoRec, ddrescue, Sleuth Kit, c2patool, exiftool) are installed. Read-only.", _obj(), READ_ONLY, t_tools_list),
     ("recover_search", "Find deleted or lost files that can be restored: the Trash (read through Finder when macOS "
      "blocks direct access), editor local history (VS Code, Cursor, Windsurf, Antigravity), lost git commits and "
@@ -473,6 +539,57 @@ TOOLS = [
      "disk (e.g. disk4), its filesystems, encryption, SMART status and the honest chance of recovering deleted "
      "files, with what to do. The Mac's internal SSD is explained as not recoverable by scanning. Read-only.",
      _obj({"disk": {"type": "string"}}), READ_ONLY, t_recover_analyze),
+    ("ai_check", "Does this picture, voice clip or video carry signs of being made by AI? Reads Content Credentials "
+     "(C2PA), IPTC digital source type, EXIF/XMP, PNG text from image generators and audio tags; c2patool verifies "
+     "signatures when installed. Gives a verdict with the evidence, its strength and the limits. It never says a "
+     "file is real: 'no-markers' means nothing was found. Local only. Read-only.",
+     _obj({"path": {"type": "string", "description": "the file"}}, ("path",)), READ_ONLY, t_ai_check),
+    ("photos_index", "Photo sorter: build or update the index of a folder of photos (date taken, camera, GPS, and "
+     "what Apple Vision sees: labels, faces, text, quality, screenshots/receipts, a fingerprint for similar photos). "
+     "Writes only macguard's own index; never touches the photos. The Photos library is refused.",
+     _obj({"folder": {"type": "string"}, "vision": {"type": "boolean", "default": True}}, ("folder",)),
+     READ_ONLY, t_photos_index),
+    ("photos_summary", "Photo sorter: what an indexed folder holds: kinds, years, events, duplicates, similar groups, "
+     "undated files. Read-only.",
+     _obj({"folder": {"type": "string"}, "gap_hours": {"type": "number", "default": 3},
+           "trust_file_dates": {"type": "boolean", "default": False},
+           "events": {"type": "integer", "minimum": 1, "maximum": 200, "default": 40}}, ("folder",)),
+     READ_ONLY, t_photos_summary),
+    ("photos_plan", "Photo sorter: plan where every file goes (layout event, month or kind; duplicates and undated set "
+     "aside). Nothing moves. Returns a plan id for photos_apply.",
+     _obj({"folder": {"type": "string"}, "layout": {"type": "string", "enum": ["event", "month", "kind"]},
+           "dest": {"type": "string"}, "gap_hours": {"type": "number"}, "trust_file_dates": {"type": "boolean"}},
+          ("folder",)), READ_ONLY, t_photos_plan),
+    ("photos_apply", "Photo sorter: carry out a plan after the user agrees. mode copy (default; source untouched), move "
+     "(same disk only; journalled, undo with photos_undo) or tag (Finder tags only). Never deletes.",
+     _obj({"plan_id": {"type": "string"}, "mode": {"type": "string", "enum": ["copy", "move", "tag"]},
+           "confirm": {"type": "boolean", "description": "Must be true"}}, ("plan_id", "confirm")),
+     {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_photos_apply),
+    ("photos_undo", "Photo sorter: put every file of the last move back where it was.",
+     _obj({"confirm": {"type": "boolean", "description": "Must be true"}}, ("confirm",)), {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_photos_undo),
+    ("photos_find", "Photo sorter: search indexed photos by what's in them, kind, camera, month or year "
+     "(e.g. 'beach 2024', 'receipt', 'dog august'). Read-only.",
+     _obj({"query": {"type": "string"}, "folder": {"type": "string"},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}, ("query",)),
+     READ_ONLY, t_photos_find),
+    ("recover_scan_image", "Deep recovery: scan a card IMAGE file (from recover_image_card) for deleted files: FAT and "
+     "exFAT undelete with names, and signature carving (JPEG, PNG, HEIC/MP4/MOV, RAW/TIFF, PDF, Office, WAV). "
+     "Read-only; never scans a device directly.",
+     _obj({"image": {"type": "string"}, "undelete": {"type": "boolean"}, "carve": {"type": "boolean"},
+           "everything": {"type": "boolean", "description": "also carve files that weren't deleted"},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}}, ("image",)),
+     READ_ONLY, t_recover_scan_image),
+    ("recover_save_files", "Deep recovery: write chosen items from the last recover_scan_image to a folder on the Mac "
+     "(default ~/Downloads/Recovered <date>), never onto the card. ids: item ids, or [\"all\"].",
+     _obj({"ids": {"type": "array", "items": {"type": "string"}}, "to": {"type": "string"},
+           "confirm": {"type": "boolean", "description": "Must be true"}}, ("ids", "confirm")),
+     {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_recover_save_files),
+    ("recover_image_card", "Deep recovery: copy a whole memory card or USB stick (e.g. disk4, from recover_analyze) "
+     "into an image file, read-only. Shows the user the macOS admin password dialog once. Refuses internal and "
+     "encrypted disks. Only for cards the user owns.",
+     _obj({"disk": {"type": "string"}, "to": {"type": "string", "description": "folder for the image (not the card)"},
+           "confirm": {"type": "boolean", "description": "Must be true"}}, ("disk", "confirm")),
+     {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_recover_image_card),
     ("doctor", "Check prerequisites (system Python, socket visibility, required and optional tools).", _obj(), READ_ONLY, t_doctor),
     ("recent_events", "Recent macguard events (cleanups, watcher alerts) and current settings.",
      _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 30}}), READ_ONLY, t_recent_events),
@@ -507,9 +624,10 @@ def handle(msg):
                   "capabilities": {"tools": {"listChanged": False}},
                   "serverInfo": {"name": "mac-cleanup", "version": mg.__version__},
                   "instructions": "Disk cleanup, heavy processes, network history (network_history / network_alerts), security, apps and network checks for this Mac, "
-                                  "plus a dev session security monitor (dev_session, live_connections, process_tree, persistence_changes, lulu_audit, scan_dependencies) and Tools (recover_search, recover_restore, recover_analyze). Everything "
-                                  "is read-only except apply_cleanup and kill_process: show the user the plan or process "
-                                  "first and act only after they agree."}
+                                  "plus a dev session security monitor (dev_session, live_connections, process_tree, persistence_changes, lulu_audit, scan_dependencies) and Tools (recover_search, recover_restore, recover_analyze, recover_image_card, recover_scan_image, recover_save_files, ai_check, photos_index, photos_summary, photos_plan, photos_apply, photos_undo, photos_find). Everything "
+                                  "is read-only except apply_cleanup, kill_process and the confirm=true tools (recover_restore, "
+                                  "recover_image_card, recover_save_files, photos_apply, photos_undo): show the user the plan, "
+                                  "process or files first and act only after they agree."}
     elif method == "ping":
         result = {}
     elif method == "tools/list":

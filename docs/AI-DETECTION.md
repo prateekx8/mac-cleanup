@@ -1,7 +1,15 @@
 # AI image and voice check: research and design
 
-**Status:** research and design, 13 Nov 2026. Nothing is built yet. Part of the **Tools** section
-([TOOLS.md](TOOLS.md)), built after Recover files (R1).
+**Status (14 Nov 2026):** phase A is built: `macguard ai-check`, the AI image and AI voice cards in Tools (drop a
+file; the uploaded copy is deleted after the check), MCP `ai_check`, `macguard_aicheck.py`. It reads C2PA in JPEG
+(multi-segment APP11), PNG, WebP, HEIC/AVIF/MP4/MOV/M4A, WAV and MP3; XMP, EXIF, PNG text, RIFF INFO, AIFF, ID3,
+MP4 and FLAC tags. Phases B (optional local models) and C (optional online checks) are not built. Part of the
+**Tools** section ([TOOLS.md](TOOLS.md)).
+
+**Checked when phase A was built:** synthetic files for each marker and format, 300 randomly damaged files (none
+crashed the parser), a PNG chunk that claims 2 GB, and Apple's own sample pictures and sounds (all "no markers").
+`c2patool` is stubbed in tests; with it installed, a valid signature gives "Made with AI" at proven strength and a
+failed one drops to weak.
 
 **Goal:** you give Mac Cleanup a picture or a voice clip, and it tells you whether it carries signs of being made
 by AI. It shows what it found, how strong that evidence is, and what it couldn't check.

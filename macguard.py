@@ -23,7 +23,12 @@ Commands:
   alerts               The local security alert log
   tools                The Tools section: Recover files, AI image and voice check (planned), helpers
   recover [--search Q] Recover deleted files: Trash, editor history, git, Time Machine (copies, never moves);
-                       `recover analyze [diskN]` says what a memory card or disk holds and the chances
+                       `recover analyze [diskN]` says what a memory card or disk holds and the chances;
+                       `recover image diskN` copies a card to an image (one admin prompt, read-only);
+                       `recover scan IMAGE` finds deleted files in it (undelete with names, and carving)
+  ai-check FILE...     Does this picture or voice clip carry signs of being made by AI? (evidence, never "real")
+  photos ACTION        Photo sorter: index a folder with Apple Vision, summary, plan (by event/month/kind),
+                       apply (copy; --move with undo; --tag), undo, find
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   kill APP             Quit an app and every process under it (helpers, children, launch agents)
   ready                Ready for shutdown: what cleanup frees, what stops, what is still running, git work
@@ -43,7 +48,7 @@ Commands:
 
 Stdlib only. Nothing is deleted without `clean --apply` and a confirmation.
 """
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import datetime as dt
@@ -3440,7 +3445,8 @@ def doctor_checks():
         checks.append((False, "State dir writable", f"{STATE_DIR}: {e}"))
     here = os.path.dirname(os.path.abspath(__file__))
     missing = [f for f in ("ui.html", "macguard_mcp.py", "macguard_capture.py", "macguard_devsec.py",
-                           "macguard_tools.py", "macguard_recover.py")
+                           "macguard_tools.py", "macguard_recover.py", "macguard_carve.py", "macguard_aicheck.py",
+                           "macguard_photos.py")
                if not os.path.exists(os.path.join(here, f))]
     checks.append((not missing, "Engine files", "ok" if not missing else
                    f"missing next to macguard.py: {', '.join(missing)}. Re-download mac-cleanup, or rebuild the app "
@@ -3634,6 +3640,118 @@ def cmd_ui(args):
                 return self.send(400, {"error": str(e)})
             return self.send(404, {"error": "not found"})
 
+        def tools_more_get(self):
+            """Photo sorter, card scans and job progress (GET)."""
+            mtools = tool_mod("macguard_tools")
+            path, _, query = self.path.partition("?")
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+            try:
+                if path == "/api/tools/job":
+                    name = q.get("name") or ""
+                    if name not in ("photos", "recover-image", "recover-scan", "recover-save"):
+                        return self.send(400, {"error": "unknown job"})
+                    st = mtools.job_status(name)
+                    if name == "recover-image" and st.get("running") and st.get("note"):
+                        st["progress"] = tool_mod("macguard_carve").image_progress(st["note"])
+                    return self.send(200, st)
+                if path == "/api/photos/summary":
+                    ph = tool_mod("macguard_photos")
+                    return self.send(200, ph.summary(q.get("root") or "", float(q.get("gap") or 3),
+                                                     q.get("trust") == "1"))
+                if path == "/api/photos/thumb":
+                    data = tool_mod("macguard_photos").thumbnail(q.get("path") or "")
+                    return self.send(200, data, "image/jpeg")
+                if path == "/api/recover/preview":
+                    cv = tool_mod("macguard_carve")
+                    item = (cv.last_scan().get("items") or {}).get(q.get("id") or "")
+                    types = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif",
+                             "webp": "image/webp", "heic": "image/heic"}
+                    ext = (item or {}).get("name", "").rsplit(".", 1)[-1].lower()
+                    if not item or item.get("offset") is None or ext not in types or item["size"] > 25 << 20:
+                        return self.send(404, {"error": "no preview"})
+                    return self.send(200, cv.item_bytes(item), types[ext])
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            return self.send(404, {"error": "not found"})
+
+        def tools_more_post(self, body):
+            mtools = tool_mod("macguard_tools")
+            try:
+                if self.path == "/api/photos/index":
+                    ph = tool_mod("macguard_photos")
+                    root = os.path.expanduser(str(body.get("root") or ""))
+                    if not os.path.isdir(root):
+                        return self.send(400, {"error": "give a folder that exists"})
+                    ph.refuse_library(root)
+                    vision = body.get("vision") is not False
+                    mtools.start_job("photos", lambda report: {"index": ph.index(root, vision=vision, report=report)})
+                    return self.send(200, {"started": True})
+                if self.path == "/api/photos/plan":
+                    ph = tool_mod("macguard_photos")
+                    p = ph.plan(str(body.get("root") or ""), str(body.get("layout") or "event"), body.get("dest") or None,
+                                float(body.get("gap") or 3), body.get("trust") is True)
+                    sample = {}
+                    for mv in p["moves"]:
+                        sample.setdefault(mv["dir"], []).append(os.path.basename(mv["src"]))
+                    return self.send(200, {k: v for k, v in p.items() if k != "moves"} |
+                                     {"files": len(p["moves"]), "sample": {k: v[:6] for k, v in sample.items()}})
+                if self.path == "/api/photos/apply":
+                    ph = tool_mod("macguard_photos")
+                    mode, plan_id = str(body.get("mode") or "copy"), str(body.get("plan") or "")
+                    ph.load_plan(plan_id)  # fail now, not in the background
+                    mtools.start_job("photos", lambda report: {"apply": ph.apply(plan_id, mode, report=report)})
+                    return self.send(200, {"started": True})
+                if self.path == "/api/photos/undo":
+                    return self.send(200, tool_mod("macguard_photos").undo())
+                if self.path == "/api/recover/image":
+                    cv = tool_mod("macguard_carve")
+                    p = cv.image_plan(str(body.get("disk") or ""), body.get("to") or None)
+                    disk, to = str(body.get("disk")), body.get("to") or None
+
+                    def job(report):
+                        report(note=p["image"])
+                        return cv.image_device(disk, to)
+                    mtools.start_job("recover-image", job)
+                    return self.send(200, {"started": True, "image": p["image"], "size": p["size"]})
+                if self.path == "/api/recover/scan":
+                    cv = tool_mod("macguard_carve")
+                    image = os.path.expanduser(str(body.get("image") or ""))
+                    if not os.path.isfile(image):
+                        return self.send(400, {"error": "give an image file that exists"})
+                    everything = body.get("everything") is True
+                    mtools.start_job("recover-scan", lambda report: cv.scan(image, everything=everything))
+                    return self.send(200, {"started": True})
+                if self.path == "/api/recover/save":
+                    cv = tool_mod("macguard_carve")
+                    ids = body.get("ids")
+                    ids = "all" if ids == "all" else [str(i) for i in ids or []]
+                    to = body.get("to") or None
+                    mtools.start_job("recover-save", lambda report: cv.save(ids, to))
+                    return self.send(200, {"started": True})
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            return self.send(404, {"error": "not found"})
+
+        def ai_upload(self):
+            """Raw file upload for the AI check: saved privately, checked, deleted (docs/TOOLS.md)."""
+            mtools = tool_mod("macguard_tools")
+            length = int(self.headers.get("Content-Length") or 0)
+            if not self.allowed():
+                self.close_connection = True
+                return self.send(403, {"error": "forbidden"})
+            if length > mtools.MAX_UPLOAD:
+                self.close_connection = True
+                return self.send(413, {"error": f"the file is over {mtools.MAX_UPLOAD >> 20} MB"})
+            name = urllib.parse.unquote((urllib.parse.parse_qs(self.path.partition("?")[2]).get("name") or [""])[0])[:200]
+            try:
+                path = mtools.receive(self.rfile, length, name)
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            try:
+                return self.send(200, tool_mod("macguard_aicheck").check(path, display_name=os.path.basename(name) or "upload"))
+            finally:
+                os.remove(path)
+
         def recover_restore(self, body):
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import macguard_recover as rec
@@ -3690,6 +3808,8 @@ def cmd_ui(args):
                 return self.devsec_get()
             if self.path.split("?")[0] in ("/api/tools", "/api/recover/search", "/api/recover/devices", "/api/recover/analyze"):
                 return self.tools_get()
+            if self.path.split("?")[0] in ("/api/tools/job", "/api/photos/summary", "/api/photos/thumb", "/api/recover/preview"):
+                return self.tools_more_get()
             if self.path == "/api/disk":
                 return self.send(200, disk_health())
             if self.path == "/api/scan":
@@ -3781,6 +3901,8 @@ def cmd_ui(args):
             self.send(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.path.split("?")[0] == "/api/tools/ai-check":
+                return self.ai_upload()  # a raw file, not JSON
             # read the body first so a rejected request still gets a clean response, not a reset
             raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 1 << 20))
             if not self.allowed():
@@ -3793,6 +3915,9 @@ def cmd_ui(args):
                 return self.devsec_post(body)
             if self.path == "/api/recover/restore":
                 return self.recover_restore(body)
+            if self.path in ("/api/photos/index", "/api/photos/plan", "/api/photos/apply", "/api/photos/undo",
+                             "/api/recover/image", "/api/recover/scan", "/api/recover/save"):
+                return self.tools_more_post(body)
             if self.path == "/api/clean":
                 ids = set(body.get("ids") or [])
                 with lock:
@@ -4009,6 +4134,23 @@ def cmd_recover(args):
     macguard_recover.cmd_recover(args)
 
 
+def tool_mod(name):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import importlib
+    return importlib.import_module(name)
+
+
+def cmd_ai_check(args):
+    tool_mod("macguard_aicheck").cmd_ai_check(args)
+
+
+def cmd_photos(args):
+    try:
+        tool_mod("macguard_photos").cmd_photos(args)
+    except ValueError as e:
+        sys.exit(str(e))
+
+
 def cmd_devsec_as(args, fn):
     getattr(devsec_mod(), fn)(args)
 
@@ -4193,8 +4335,9 @@ def main():
     p.add_argument("--label"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_lulu")
     sub.add_parser("tools", help="the Tools section and optional helpers").set_defaults(fn=cmd_tools)
     p = sub.add_parser("recover", help="recover deleted files (copies, never moves); analyze a card or disk")
-    p.add_argument("action", nargs="?", choices=["search", "analyze"], default="search")
-    p.add_argument("target", nargs="?", help="analyze: a disk like disk4 (none = list connected cards and disks)")
+    p.add_argument("action", nargs="?", choices=["search", "analyze", "image", "scan"], default="search")
+    p.add_argument("target", nargs="?", help="analyze/image: a disk like disk4 (analyze with none = list connected "
+                   "cards and disks); scan: an image file")
     p.add_argument("--search", "-s", metavar="TEXT", help="part of a name or path, or a pattern like '*.jpg'")
     p.add_argument("--source", help="comma-separated: trash,history,git,timemachine (default: all)")
     p.add_argument("--repo", help="git repository to search (default: the current folder if it is one)")
@@ -4202,8 +4345,28 @@ def main():
     p.add_argument("--finder", action="store_true", help="read a protected Trash through Finder (macOS may ask once)")
     p.add_argument("--restore", metavar="ID", help="restore a copy of this item (an id from the search)")
     p.add_argument("--to", metavar="DIR", help="where to put the copy (default: ~/Downloads/Recovered <date>)")
-    p.add_argument("--apply", action="store_true", help="restore for real (otherwise a dry run)")
+    p.add_argument("--apply", action="store_true", help="restore or image for real (otherwise a dry run)")
+    p.add_argument("--save", metavar="IDS", help="scan: save these items from the last scan (comma-separated ids, or all)")
+    p.add_argument("--no-carve", action="store_true", help="scan: undelete only")
+    p.add_argument("--no-undelete", action="store_true", help="scan: carving only")
+    p.add_argument("--everything", action="store_true", help="scan: carve files that weren't deleted too")
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_recover)
+    p = sub.add_parser("ai-check", help="signs that a picture or voice clip was made by AI (evidence, never 'real')")
+    p.add_argument("files", nargs="+", metavar="FILE"); p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_ai_check)
+    p = sub.add_parser("photos", help="Photo sorter: index with Apple Vision, then sort by event, month or kind")
+    p.add_argument("action", choices=["index", "summary", "plan", "apply", "undo", "find"])
+    p.add_argument("target", nargs="?", help="the folder (find: what to look for, e.g. 'beach 2024')")
+    p.add_argument("--by", choices=["event", "month", "kind"], default="event", help="plan: the layout")
+    p.add_argument("--to", metavar="DIR", help="plan: where sorted files go (default ~/Pictures/Sorted Photos <date>)")
+    p.add_argument("--gap", type=float, default=3.0, help="hours between photos that start a new event")
+    p.add_argument("--trust-file-dates", action="store_true", help="sort files with only a file date instead of Undated")
+    p.add_argument("--no-vision", action="store_true", help="index: dates and cameras only (faster)")
+    p.add_argument("--move", action="store_true", help="apply: move (undoable) instead of copy")
+    p.add_argument("--tag", action="store_true", help="apply: only add Finder tags")
+    p.add_argument("--plan", help="apply: plan id (default: the last plan)")
+    p.add_argument("--in", dest="within", metavar="DIR", help="find: only in this indexed folder")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_photos)
     p = sub.add_parser("alerts", help="local security alert log")
     p.add_argument("--limit", type=int, default=50); p.add_argument("--min", choices=["info", "warning", "critical"], default="info")
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_alerts")

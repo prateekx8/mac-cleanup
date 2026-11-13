@@ -4,3 +4,4 @@ __pycache__/
 report.html
 dist/
 build/
+helpers/photo_sense
