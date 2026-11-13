@@ -40,7 +40,7 @@ Commands:
 
 Stdlib only. Nothing is deleted without `clean --apply` and a confirmation.
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import datetime as dt

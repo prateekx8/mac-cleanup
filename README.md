@@ -28,6 +28,11 @@ Standard-library Python plus a small Swift wrapper. No root, no telemetry, nothi
 
 **New to Terminal? Follow the [step-by-step install guide](docs/INSTALL.md)**, which also covers every common install problem.
 
+**Two ways to install:**
+
+1. **Download the app** (no Terminal): get `MacCleanup.dmg` from the [latest release](https://github.com/prateekx8/mac-cleanup/releases/latest), drag **Mac Cleanup** to Applications, and open it. The app isn't notarized by Apple, so the first time macOS says it can't check it: open **System Settings › Privacy & Security** and click **Open Anyway**. It needs Apple's Command Line Tools, and offers to install them if they're missing.
+2. **Install from source** (adds the `macguard` command, the web UI and the MCP server):
+
 ```bash
 git clone https://github.com/prateekx8/mac-cleanup.git
 cd mac-cleanup
@@ -41,7 +46,7 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools for `/usr/bin/p
 
 | I want… | Do this |
 |---|---|
-| The app | `./setup.sh --app`, then open **Mac Cleanup** from Applications |
+| The app | Download `MacCleanup.dmg` from [Releases](https://github.com/prateekx8/mac-cleanup/releases/latest), or build it: `./setup.sh --app` |
 | One-click setup and the UI | Double-click **`MacCleanup.command`** in Finder |
 | The CLI | `./setup.sh`, then open a new terminal and run `macguard --help` |
 | Help with an install problem | [docs/INSTALL.md › Troubleshooting](docs/INSTALL.md#troubleshooting), or `macguard doctor` |
