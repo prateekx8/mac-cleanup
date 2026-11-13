@@ -21,6 +21,9 @@ Commands:
   scan-deps [PATH]     package-lock.json: install scripts; --online adds OSV.dev vulnerabilities
   lulu                 Read-only audit of LuLu allow rules, with expiry reminders (--tag UUID --hours N)
   alerts               The local security alert log
+  tools                The Tools section: Recover files, AI image and voice check (planned), helpers
+  recover [--search Q] Recover deleted files: Trash, editor history, git, Time Machine (copies, never moves);
+                       `recover analyze [diskN]` says what a memory card or disk holds and the chances
   uninstall APP        Remove an app and all its ~/Library data (to the Trash); --leftovers-only resets it
   kill APP             Quit an app and every process under it (helpers, children, launch agents)
   ready                Ready for shutdown: what cleanup frees, what stops, what is still running, git work
@@ -3436,7 +3439,8 @@ def doctor_checks():
     except OSError as e:
         checks.append((False, "State dir writable", f"{STATE_DIR}: {e}"))
     here = os.path.dirname(os.path.abspath(__file__))
-    missing = [f for f in ("ui.html", "macguard_mcp.py", "macguard_capture.py", "macguard_devsec.py")
+    missing = [f for f in ("ui.html", "macguard_mcp.py", "macguard_capture.py", "macguard_devsec.py",
+                           "macguard_tools.py", "macguard_recover.py")
                if not os.path.exists(os.path.join(here, f))]
     checks.append((not missing, "Engine files", "ok" if not missing else
                    f"missing next to macguard.py: {', '.join(missing)}. Re-download mac-cleanup, or rebuild the app "
@@ -3464,6 +3468,14 @@ def doctor_checks():
                        "installed but not readable by this user: the LuLu audit shows guidance instead"))
     else:
         checks.append((None, "optional: LuLu", "not installed (the LuLu audit is skipped)"))
+    sys.path.insert(0, here)
+    try:
+        import macguard_tools
+        for h in macguard_tools.helpers():
+            checks.append((True if h["path"] else None, f"optional: {h['name']}", h["path"] or
+                           f"not installed ({h['why']}; brew install {h['formula']})"))
+    except ImportError:
+        pass
     s = load_settings()
     checks.append((True, "Dev session settings", f"poll every {s.get('session_interval', 3)}s, OSV lookups "
                    f"{'on' if s.get('osv_lookups') else 'off'}"))
@@ -3596,6 +3608,44 @@ def cmd_ui(args):
                 return self.send(500, {"error": f"{type(e).__name__}: {e}"})
             return self.send(404, {"error": "not found"})
 
+        def tools_get(self):
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import macguard_recover as rec
+            import macguard_tools as mtools
+            path, _, query = self.path.partition("?")
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+            try:
+                if path == "/api/tools":
+                    return self.send(200, {"tools": mtools.TOOLS, "helpers": mtools.helpers()})
+                if path == "/api/recover/search":
+                    sources = tuple(x for x in (q.get("sources") or ",".join(rec.SOURCES)).split(",") if x in rec.SOURCES)
+                    repo = os.path.expanduser(q["repo"]) if q.get("repo") else None
+                    r = rec.search(q.get("q") or None, sources, repo=repo, path=q.get("path") or None,
+                                   finder=q.get("finder") == "1")
+                    with lock:  # restore only what this search showed (like /api/clean)
+                        state["recover"] = {i["id"]: i for i in r["items"]}
+                    return self.send(200, r)
+                if path == "/api/recover/devices":
+                    return self.send(200, {"devices": rec.devices()})
+                if path == "/api/recover/analyze":
+                    r = rec.analyze(q.get("disk") or "")
+                    return self.send(200, r) if r else self.send(404, {"error": "no such disk"})
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+            return self.send(404, {"error": "not found"})
+
+        def recover_restore(self, body):
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import macguard_recover as rec
+            with lock:
+                item = (state.get("recover") or {}).get(str(body.get("id") or ""))
+            if not item:
+                return self.send(409, {"error": "search again first: restore only takes items from the last search"})
+            try:
+                return self.send(200, rec.restore(item, body.get("to") or None))
+            except ValueError as e:
+                return self.send(400, {"error": str(e)})
+
         def devsec_post(self, body):
             sec = devsec_mod()
             try:
@@ -3638,6 +3688,8 @@ def cmd_ui(args):
                 return self.send(403, {"error": "forbidden"})
             if self.path.split("?")[0].startswith("/api/devsec/"):
                 return self.devsec_get()
+            if self.path.split("?")[0] in ("/api/tools", "/api/recover/search", "/api/recover/devices", "/api/recover/analyze"):
+                return self.tools_get()
             if self.path == "/api/disk":
                 return self.send(200, disk_health())
             if self.path == "/api/scan":
@@ -3739,6 +3791,8 @@ def cmd_ui(args):
                 return self.send(400, {"error": "bad json"})
             if self.path.startswith("/api/devsec/"):
                 return self.devsec_post(body)
+            if self.path == "/api/recover/restore":
+                return self.recover_restore(body)
             if self.path == "/api/clean":
                 ids = set(body.get("ids") or [])
                 with lock:
@@ -3943,6 +3997,18 @@ def cmd_devsec(args):
     getattr(devsec_mod(), args.devsec)(args)
 
 
+def cmd_tools(args):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import macguard_tools
+    macguard_tools.cmd_tools(args)
+
+
+def cmd_recover(args):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import macguard_recover
+    macguard_recover.cmd_recover(args)
+
+
 def cmd_devsec_as(args, fn):
     getattr(devsec_mod(), fn)(args)
 
@@ -4125,6 +4191,19 @@ def main():
     p.add_argument("--all", action="store_true", help="include Apple's rules"); p.add_argument("--limit", type=int, default=60)
     p.add_argument("--tag", metavar="UUID", help="remind me to revoke this rule"); p.add_argument("--hours", type=float, default=24)
     p.add_argument("--label"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_lulu")
+    sub.add_parser("tools", help="the Tools section and optional helpers").set_defaults(fn=cmd_tools)
+    p = sub.add_parser("recover", help="recover deleted files (copies, never moves); analyze a card or disk")
+    p.add_argument("action", nargs="?", choices=["search", "analyze"], default="search")
+    p.add_argument("target", nargs="?", help="analyze: a disk like disk4 (none = list connected cards and disks)")
+    p.add_argument("--search", "-s", metavar="TEXT", help="part of a name or path, or a pattern like '*.jpg'")
+    p.add_argument("--source", help="comma-separated: trash,history,git,timemachine (default: all)")
+    p.add_argument("--repo", help="git repository to search (default: the current folder if it is one)")
+    p.add_argument("--path", help="Time Machine: the file or folder to find older versions of")
+    p.add_argument("--finder", action="store_true", help="read a protected Trash through Finder (macOS may ask once)")
+    p.add_argument("--restore", metavar="ID", help="restore a copy of this item (an id from the search)")
+    p.add_argument("--to", metavar="DIR", help="where to put the copy (default: ~/Downloads/Recovered <date>)")
+    p.add_argument("--apply", action="store_true", help="restore for real (otherwise a dry run)")
+    p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_recover)
     p = sub.add_parser("alerts", help="local security alert log")
     p.add_argument("--limit", type=int, default=50); p.add_argument("--min", choices=["info", "warning", "critical"], default="info")
     p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_devsec, devsec="cmd_alerts")
