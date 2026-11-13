@@ -1,6 +1,7 @@
 # Data recovery: research and design
 
 **Status:** research and design, 13 Nov 2026. Nothing is built yet. This is the plan we develop against.
+It's the first tool in the new **Tools** section ([TOOLS.md](TOOLS.md)), which also gets the AI image and voice checks.
 
 **Goal:** help people get back files they deleted by mistake, on the Mac and on memory cards (SD, microSD, USB
 sticks, camera cards), without ever making things worse. It comes in tiers, from a safe "light recovery" anyone can
@@ -45,7 +46,7 @@ Sources: [Apple Platform Security, data protection](https://support.apple.com/gu
 
 ### Tier 1 · Light recovery (no root, no risk)
 
-`macguard recover` (and a **Recover** panel in the app):
+`macguard recover` (and the **Recover files** card in the app's Tools section):
 
 | Source | How | Notes |
 |---|---|---|
@@ -121,7 +122,7 @@ mac-cleanup stays MIT):
 
 | Phase | Ships | Root |
 |---|---|---|
-| **R1 · Light recovery and analyze** | `recover` (Trash, Time Machine, snapshots, git, VS Code history, iCloud and Photos guidance), `recover analyze`, the Recover panel, MCP tools `recover_search` and `recover_analyze` (read-only) | No |
+| **R1 · Light recovery and analyze** | The Tools section itself ([TOOLS.md](TOOLS.md)), `recover` (Trash, Time Machine, snapshots, git, VS Code history, iCloud and Photos guidance), `recover analyze`, the Recover files card, MCP tools `recover_search` and `recover_analyze` (read-only) | No |
 | **R2 · Card imaging and carving** | `recover image diskN` (admin prompt, read-only, bad-block map, ddrescue if present), `recover carve <image>` (stdlib carver, about 8 formats, intact checks), the gallery | Imaging only |
 | **R3 · Filesystem undelete** | FAT32/exFAT directory-entry undelete in pure Python (keeps names), Sleuth Kit as an optional backend for HFS+, PhotoRec as an optional deep carver | Imaging only |
 | **R4 · Polish** | Resume interrupted imaging, recover straight from a mounted card's free space where possible, reports | — |

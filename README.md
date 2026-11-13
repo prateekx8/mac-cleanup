@@ -177,6 +177,16 @@ Every alert has a severity (**info**, **warning**, **critical**), is written to 
 
 **Phase 2 (needs Apple entitlements, not built):** an Endpoint Security system extension for real-time exec and file-open/read events, and a Network Extension content filter for live blocking and time-limited allow rules that revoke themselves. Both need an Apple Developer Program membership and Apple's approval for the Endpoint Security entitlement. Everything above keeps working without them.
 
+## Coming next: Tools
+
+A **Tools** section for one-off jobs, all on your Mac ([design](docs/TOOLS.md)):
+
+- **Recover files**: get back deleted files from the Trash, Time Machine, local snapshots and git, and from memory
+  cards and USB sticks, without ever writing to them ([design](docs/RECOVERY.md)).
+- **AI image check** and **AI voice check**: drop in a picture or a voice clip and see whether it carries Content
+  Credentials, metadata or other signs of being made by AI, with how strong each sign is. It never claims a file is
+  "real" ([design](docs/AI-DETECTION.md)).
+
 ## Development
 
 ```bash
@@ -189,7 +199,9 @@ Unit tests run against temporary directories and mocked system commands. They ne
 ## Docs
 
 - [Install guide and troubleshooting](docs/INSTALL.md)
-- [Data recovery: research and design](docs/RECOVERY.md) (planned feature)
+- [Tools: design](docs/TOOLS.md) (planned): the Tools section, with
+  - [Recover files](docs/RECOVERY.md): Trash, backups, snapshots and memory cards
+  - [AI image and voice check](docs/AI-DETECTION.md): signs that a picture or voice was made by AI
 - [Architecture](docs/ARCHITECTURE.md): components, data flow, UI security model, app process model, with a [diagram](docs/architecture.png)
 - [Support and troubleshooting](docs/SUPPORT.md)
 
