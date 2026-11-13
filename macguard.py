@@ -3435,8 +3435,41 @@ def doctor_checks():
         checks.append((True, "State dir writable", STATE_DIR))
     except OSError as e:
         checks.append((False, "State dir writable", f"{STATE_DIR}: {e}"))
-    ui = os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html"))
-    checks.append((ui, "UI page (ui.html)", "ok" if ui else "missing next to macguard.py"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    missing = [f for f in ("ui.html", "macguard_mcp.py", "macguard_capture.py", "macguard_devsec.py")
+               if not os.path.exists(os.path.join(here, f))]
+    checks.append((not missing, "Engine files", "ok" if not missing else
+                   f"missing next to macguard.py: {', '.join(missing)}. Re-download mac-cleanup, or rebuild the app "
+                   "(./build_app.sh --install)"))
+    if not here.endswith(".app/Contents/Resources"):  # the CLI install; the app has no `macguard` command
+        cmd = os.path.join(HOME, ".local/bin/macguard")
+        if not os.path.exists(cmd):
+            checks.append((None, "macguard command", "not installed: run ./setup.sh"))
+        else:
+            target = re.search(r'exec \S+ "([^"]+)"', read_text(cmd))
+            points = target.group(1) if target else ""
+            good = os.path.realpath(points) == os.path.realpath(os.path.abspath(__file__)) or os.path.exists(points)
+            checks.append((good, "macguard command", cmd if good else
+                           f"points to {points}, which is gone (folder moved?): run ./setup.sh from the new folder"))
+        on_path = os.path.join(HOME, ".local/bin") in os.environ.get("PATH", "").split(":")
+        checks.append((True if on_path else None, "~/.local/bin on PATH", "ok" if on_path else
+                       "not in this shell's PATH: open a new terminal window, or add "
+                       'export PATH="$HOME/.local/bin:$PATH" to ~/.zshrc'))
+    # dev session security
+    checks.append((bool(shutil.which("ps")), "tool: ps (process monitor)", shutil.which("ps") or "missing"))
+    lulu = "/Library/Objective-See/LuLu/rules.plist"
+    if os.path.exists(lulu):
+        readable = os.access(lulu, os.R_OK)
+        checks.append((True if readable else None, "LuLu rules (read-only audit)", "readable" if readable else
+                       "installed but not readable by this user: the LuLu audit shows guidance instead"))
+    else:
+        checks.append((None, "optional: LuLu", "not installed (the LuLu audit is skipped)"))
+    s = load_settings()
+    checks.append((True, "Dev session settings", f"poll every {s.get('session_interval', 3)}s, OSV lookups "
+                   f"{'on' if s.get('osv_lookups') else 'off'}"))
+    free = disk_info()["free"]
+    checks.append((free >= 1 << 30, "Free disk space", human(free) + ("" if free >= 1 << 30 else
+                   ": under 1 GB, macOS and this tool may fail to write. Run: macguard scan")))
     return checks
 
 
@@ -3447,6 +3480,9 @@ def cmd_doctor(args):
         print(f"  {mark} {name:<36} {C['d']}{detail}{C['x']}")
     failed = [c for c in checks if c[0] is False]
     print(f"\n{C['g']}All required checks passed.{C['x']}" if not failed else f"\n{C['r']}{len(failed)} required check(s) failed.{C['x']}")
+    if failed:
+        print(f"{C['d']}Each ✘ line says how to fix it. More help: docs/INSTALL.md (Troubleshooting), or "
+              f"`macguard doctor --bundle` for a support file.{C['x']}")
     if args.bundle:
         ensure_state()
         path = os.path.join(STATE_DIR, f"support-{dt.datetime.now():%Y%m%d-%H%M%S}.txt")
