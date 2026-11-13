@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sys
 import tempfile
@@ -789,11 +790,12 @@ class TestKill(TempHome):
                      'int main(void){ if (fork()==0) { execl("/bin/sleep","sleep","300",(char*)0); _exit(1);} '
                      'pause(); return 0; }\n')
         subprocess.run([cc, "-o", exe, src], check=True, capture_output=True)
-        proc = subprocess.Popen([exe])
+        # Own process group and no shared stdout: a leftover child can't hold the test runner's output open.
+        proc = subprocess.Popen([exe], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         app = dict(name="Sleepy", bundle_id="io.test.sleepy", path=bundle, version="1", exe=exe, updated=0)
         try:
-            for _ in range(40):
-                if mg.app_process_tree(app):
+            for _ in range(100):  # wait for the parent AND its forked child, or the child is missed and survives
+                if len(mg.app_process_tree(app)) >= 2:
                     break
                 time.sleep(0.05)
             before = mg.app_process_tree(app)
@@ -803,7 +805,10 @@ class TestKill(TempHome):
             self.assertEqual(r["survivors"], [])
             self.assertEqual(mg.app_process_tree(app), [])
         finally:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:  # already gone (macOS says EPERM for a group with only a zombie left)
+                pass
             proc.wait()
 
 
