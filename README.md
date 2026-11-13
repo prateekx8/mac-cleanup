@@ -189,6 +189,7 @@ Unit tests run against temporary directories and mocked system commands. They ne
 ## Docs
 
 - [Install guide and troubleshooting](docs/INSTALL.md)
+- [Data recovery: research and design](docs/RECOVERY.md) (planned feature)
 - [Architecture](docs/ARCHITECTURE.md): components, data flow, UI security model, app process model, with a [diagram](docs/architecture.png)
 - [Support and troubleshooting](docs/SUPPORT.md)
 
