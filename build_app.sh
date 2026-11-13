@@ -40,8 +40,14 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 echo "==> Bundling engine"
 # every engine module (macguard.py loads the others on demand) plus the page
 cp "$DIR"/macguard*.py "$DIR/ui.html" "$APP/Contents/Resources/"
+# the Photo sorter's Apple Vision helper, prebuilt so users don't need Swift
+mkdir -p "$APP/Contents/Resources/helpers"
+for arch in arm64 x86_64; do
+  swiftc -O -swift-version 5 -target "$arch-apple-macos$MIN_OS" -o "$BUILD/photo_sense-$arch" "$DIR/helpers/photo_sense.swift"
+done
+lipo -create -output "$APP/Contents/Resources/helpers/photo_sense" "$BUILD"/photo_sense-arm64 "$BUILD"/photo_sense-x86_64
 # fail the build, not the user's first click, if a module is missing or broken
-/usr/bin/python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import macguard, macguard_mcp, macguard_capture, macguard_devsec, macguard_tools, macguard_recover" \
+/usr/bin/python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import macguard, macguard_mcp, macguard_capture, macguard_devsec, macguard_tools, macguard_recover, macguard_carve, macguard_aicheck, macguard_photos" \
   "$APP/Contents/Resources" || { echo "The bundled engine does not import; see the error above."; exit 1; }
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

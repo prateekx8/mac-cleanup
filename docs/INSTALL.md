@@ -186,6 +186,29 @@ If `macguard` itself is not found, use the full path instead: `/usr/bin/python3 
 | *Time Machine isn't set up* | Nothing to restore from backups. Turn on Time Machine for next time; check iCloud's and Photos' Recently Deleted now. |
 | A memory card shows *Not by scanning* or *Very low* | It's the Mac's internal SSD or an encrypted APFS disk: deleted files there can't be found by scanning. Use backups. |
 | My memory card isn't listed | Use a card reader, check it shows in Finder or `diskutil list external`, then press **Check again**. |
+| *couldn't unmount the card* when imaging | An app (Photos, Image Capture, Finder preview) is using it. Quit it, then try again. |
+| *imaging didn't run: cancelled* | The password prompt was cancelled. Imaging needs it once to read the card; nothing else runs as admin. |
+| *not enough space for the image* | The image is as big as the whole card. Pick a folder on a disk with that much free space (not the card). |
+| The scan finds files with names like `_MG_0001.JPG` | FAT keeps only 8.3 names for short names, and deleting erases their first letter. The file itself is fine. |
+| A file shows **overwritten** or **damaged** | Newer files used some of its space, or it was fragmented. Save it anyway: photos often open partly. |
+
+### Tools › AI image and voice check
+
+| What you see | Fix |
+|---|---|
+| *No AI markers found* on a picture you think is AI | Most shared copies have lost their markers. Ask for the original file, not a screenshot or a downloaded copy. |
+| *Signature not checked* | Install `c2patool` (`brew install c2patool`) to verify Content Credentials signatures. |
+| *That file is over 200 MB* | Check it from Terminal: `macguard ai-check FILE`. |
+
+### Tools › Photo sorter
+
+| What you see | Fix |
+|---|---|
+| *without Vision: no Swift helper, dates only* | The command line compiles the helper with `swiftc` the first time; install the Command Line Tools (`xcode-select --install`) or use the app, which has it built in. |
+| *That's inside a Photos library* | The sorter never touches the Photos library. In Photos, select the photos and use **File › Export › Export Unmodified Original**, then sort that folder. |
+| *move only works on the same disk* | Choose **Copy** to sort onto another disk or from a card. |
+| Many files in **Undated** | They have no date inside and none in the name; the file's own date only shows when it was copied. Tick **trust file dates** if you know those dates are right. |
+| macOS asks to allow access to a folder or removable volume | Allow it once: the sorter only reads the folder until you choose Copy or Move. |
 
 ### Still stuck?
 

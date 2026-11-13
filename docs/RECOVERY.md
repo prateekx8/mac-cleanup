@@ -1,6 +1,17 @@
 # Data recovery: research and design
 
-**Status:** R1 (light recovery and analyze) is built: `macguard recover`, the Recover files card, MCP `recover_*`, `macguard_recover.py`. R2–R4 are the plan below.
+**Status (14 Nov 2026):** R1 (light recovery and analyze), R2 (card imaging and carving) and R3 (FAT and exFAT
+undelete) are built: `macguard recover search|analyze|image|scan`, the Recover files card with the gallery, MCP
+`recover_*`, `macguard_recover.py` and `macguard_carve.py`. R4 (resumable imaging, scanning a mounted card's free space,
+reports) and Sleuth Kit/PhotoRec as optional back ends are next.
+
+**Checked when R2/R3 were built:** FAT32 (MBR), FAT16 (no partition table) and exFAT (GPT) images made with
+`hdiutil`, with three files deleted on each: every deleted file came back byte for byte (`tests/test_carve.py`).
+exFAT and long FAT names come back whole; a deleted 8.3 name loses its first letter (`_MG_0001.JPG`), as on every
+FAT undelete tool. Carving finds JPEG, PNG, PDF, DOCX, WAV, MP4, HEIC and NEF in a hand-built "formatted card". The
+imaging worker runs as root only inside the password prompt, passed inline (`python3 -I -c`), so no file on disk
+can be swapped in; it was tested on a regular file with a simulated bad sector. Imaging a real card wasn't tried
+from automation, because it needs the password dialog.
 It's the first tool in the new **Tools** section ([TOOLS.md](TOOLS.md)), which also gets the AI image and voice checks.
 
 **Goal:** help people get back files they deleted by mistake, on the Mac and on memory cards (SD, microSD, USB
