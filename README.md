@@ -15,6 +15,7 @@ Dev Macs pile up gigabytes of rebuildable junk: Xcode DerivedData, orphaned iOS 
 - **Network analysis**: every listening port with its owning binary and code signature, connections by process, gateway, DNS and ARP. Flags exposed services, known-bad ports, unsigned programs, inbound scans and ARP spoofing.
 - **Network monitor**: records every connection (program → IP:port, bytes) into a day-by-day history, names the IPs by reverse DNS, and warns about risky traffic: suspicious ports, unsigned or temp-folder programs online, inbound connections, unencrypted protocols, new destinations.
 - **Dev session security**: start a session while you run local LLMs (Ollama, Hugging Face), AI agents (Claude Code) and Node projects, and see what they actually do: outbound connections per process with DNS names and bytes, shells, downloaders, `osascript` or `launchctl` spawned under node/npm/python/claude, programs left running, new launch agents, crontab and shell-config changes, edits to `~/.ssh`, `~/.aws` and `.env` files, npm packages with install scripts or known vulnerabilities, and LuLu allow rules that are too broad or past their time. One Markdown/JSON report at the end.
+- **Tools › Recover files**: get back deleted files from the Trash, editor history (VS Code, Cursor, Windsurf, Antigravity), lost git commits and staged files, and Time Machine, always as a copy; and check a memory card or USB stick for the honest chance of recovering it.
 - **Heavy processes**: lists what is eating CPU or memory and says which are safe to stop. macOS, root-owned and the session's own processes are never killed.
 - **MCP server**: exposes all of it to AI clients such as Claude (`macguard mcp`).
 - **Watcher (opt-in)**: alerts on new open ports, gateway MAC changes, DNS or `/etc/hosts` changes. Off by default.
@@ -94,6 +95,10 @@ Requirements: macOS 13 or later, plus Apple's Command Line Tools for `/usr/bin/p
 | `macguard scan-deps [PATH] [--online]` | `package-lock.json` (v1–v3): packages with `preinstall`/`install`/`postinstall` scripts; `--online` adds known vulnerabilities from OSV.dev. |
 | `macguard lulu [--all] [--tag UUID --hours N]` | Read-only audit of LuLu's allow rules; `--tag` sets a reminder to revoke a temporary permission. |
 | `macguard alerts [--min warning]` | The local security alert log. |
+| `macguard tools` | The Tools section: what each tool does, and which optional helpers (PhotoRec, ddrescue, Sleuth Kit, c2patool, exiftool) are installed. |
+| `macguard recover [--search TEXT] [--source trash,history,git,timemachine]` | Find deleted files you can get back: the Trash, editor local history, lost git commits and staged files (`--repo`, default the current folder), Time Machine versions (`--path`). Lists local snapshots, and where iCloud Drive, Photos and Notes keep deleted items. `--finder` reads a protected Trash through Finder. |
+| `macguard recover --search TEXT --restore ID [--to DIR] --apply` | Restore a **copy** (default `~/Downloads/Recovered <date>`). Never moves or overwrites; a lost commit becomes a branch `recovered/<sha>`. Dry run without `--apply`. |
+| `macguard recover analyze [diskN]` | Connected memory cards and disks with an honest chance of recovery; with a disk, its filesystems, encryption, SMART status and what to do. |
 | `macguard mcp` | MCP server on stdio for AI clients. See below. |
 | `macguard watch` | Monitor in the foreground until Ctrl-C (`--once`, `--reset`). |
 | `macguard ui` | Local web UI at `http://127.0.0.1:8787`. |
@@ -128,6 +133,8 @@ claude mcp add mac-cleanup -- /usr/bin/python3 /path/to/mac-cleanup/macguard.py 
 | `persistence_changes`, `lulu_audit`, `security_alerts` | Persistence diff, LuLu allow-rule audit, the alert log. Read-only. |
 | `lulu_reminder` | Remind the user to revoke a LuLu rule after N hours. Never edits LuLu. |
 | `scan_dependencies` | Install scripts in a `package-lock.json`; `online: true` needs `confirm_online: true` (sends package names and versions to OSV.dev). |
+| `tools_list`, `recover_search`, `recover_analyze` | The Tools section, recoverable files, memory card analysis. Read-only. |
+| `recover_restore` | Restore a copy of one found item; needs `confirm: true`. |
 | `doctor`, `recent_events` | Prerequisites, and the event log with settings. |
 
 `apply_cleanup` and `kill_process` are marked destructive, so clients ask before running them. The server is standard-library Python like the rest.
@@ -177,20 +184,22 @@ Every alert has a severity (**info**, **warning**, **critical**), is written to 
 
 **Phase 2 (needs Apple entitlements, not built):** an Endpoint Security system extension for real-time exec and file-open/read events, and a Network Extension content filter for live blocking and time-limited allow rules that revoke themselves. Both need an Apple Developer Program membership and Apple's approval for the Endpoint Security entitlement. Everything above keeps working without them.
 
-## Coming next: Tools
+## Tools
 
-A **Tools** section for one-off jobs, all on your Mac ([design](docs/TOOLS.md)):
+A **Tools** section for one-off jobs, all on your Mac ([design](docs/TOOLS.md)). In the app it's the **Tools** panel.
 
-- **Recover files**: get back deleted files from the Trash, Time Machine, local snapshots and git, and from memory
-  cards and USB sticks, without ever writing to them ([design](docs/RECOVERY.md)).
-- **AI image check** and **AI voice check**: drop in a picture or a voice clip and see whether it carries Content
+- **Recover files** (ready, phase R1): search the Trash, editor history, lost git work and Time Machine, and
+  restore a copy; check a memory card or USB stick and get an honest verdict with what to do
+  ([design](docs/RECOVERY.md)). Deep recovery of cards comes next (R2). Files deleted from the Mac's internal SSD after
+  emptying the Trash can't be found by scanning, and the tool says so.
+- **Coming next: AI image check** and **AI voice check**: drop in a picture or a voice clip and see whether it carries Content
   Credentials, metadata or other signs of being made by AI, with how strong each sign is. It never claims a file is
   "real" ([design](docs/AI-DETECTION.md)).
 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 263 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 286 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 

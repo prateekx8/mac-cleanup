@@ -24,6 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import macguard as mg  # noqa: E402
 import macguard_capture as cap  # noqa: E402
 import macguard_devsec as sec  # noqa: E402
+import macguard_recover as rec  # noqa: E402
+import macguard_tools as mtools  # noqa: E402
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 PLAN_TTL = 15 * 60
@@ -294,6 +296,42 @@ def t_security_alerts(a):
     return {"alerts": sec.read_alerts(a.get("limit", 100), a.get("min_severity", "info"))}
 
 
+def t_tools_list(a):
+    return {"tools": mtools.TOOLS, "helpers": mtools.helpers()}
+
+
+def t_recover_search(a):
+    sources = a.get("sources") or list(rec.SOURCES)
+    bad = set(sources) - set(rec.SOURCES)
+    if bad:
+        raise ValueError(f"unknown sources {sorted(bad)}; known: {list(rec.SOURCES)}")
+    r = rec.search(a.get("query"), tuple(sources), repo=a.get("repo"), path=a.get("path"), finder=bool(a.get("finder")))
+    r["items"] = r["items"][:a.get("limit", 100)]
+    r["next"].append("To restore one, show the user the item, then call recover_restore with the same query/sources "
+                     "and its id, and confirm=true.")
+    return r
+
+
+def t_recover_restore(a):
+    if a.get("confirm") is not True:
+        raise ValueError("refusing to restore without confirm=true (show the user the item first)")
+    sources = a.get("sources") or list(rec.SOURCES)
+    r = rec.search(a.get("query"), tuple(sources), repo=a.get("repo"), path=a.get("path"), finder=bool(a.get("finder")))
+    item = next((i for i in r["items"] if i["id"] == a["id"]), None)
+    if not item:
+        raise ValueError("no item with that id in this search; search again with the same query and sources")
+    return rec.restore(item, a.get("to"))
+
+
+def t_recover_analyze(a):
+    if not a.get("disk"):
+        return {"devices": rec.devices(), "next": "call again with disk=<id> for details"}
+    r = rec.analyze(a["disk"])
+    if not r:
+        raise ValueError(f"no disk {a['disk']}")
+    return r
+
+
 TOOLS = [
     ("disk_info", "Free/used space on the Mac's data volume.", _obj(), READ_ONLY, t_disk_info),
     ("scan_junk", "Size up rebuildable junk by category (Xcode, simulators, npm/pip/uv/Gradle/Cargo caches, Homebrew, Docker, "
@@ -410,6 +448,31 @@ TOOLS = [
      _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
            "min_severity": {"type": "string", "enum": ["info", "warning", "critical"], "default": "info"}}),
      READ_ONLY, t_security_alerts),
+    ("tools_list", "The Tools section (Recover files; AI image and voice check, planned) and which optional helpers "
+     "(PhotoRec, ddrescue, Sleuth Kit, c2patool, exiftool) are installed. Read-only.", _obj(), READ_ONLY, t_tools_list),
+    ("recover_search", "Find deleted or lost files that can be restored: the Trash (read through Finder when macOS "
+     "blocks direct access), editor local history (VS Code, Cursor, Windsurf, Antigravity), lost git commits and "
+     "staged files in a repo, and older versions in Time Machine (with path). Also lists local snapshots and where "
+     "iCloud Drive and Photos keep deleted items. Read-only.",
+     _obj({"query": {"type": "string", "description": "part of a name or path, or a pattern like *.jpg"},
+           "sources": {"type": "array", "items": {"type": "string", "enum": list(rec.SOURCES)}},
+           "repo": {"type": "string", "description": "git repository to search"},
+           "path": {"type": "string", "description": "file or folder to find Time Machine versions of"},
+           "finder": {"type": "boolean", "default": False, "description": "read a protected Trash through Finder "
+                      "(macOS may show the user a one-time permission prompt; ask first)"},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}), READ_ONLY, t_recover_search),
+    ("recover_restore", "Restore a COPY of one item from recover_search into a folder (default ~/Downloads/Recovered "
+     "<date>). Never moves or overwrites; a lost git commit becomes a new branch recovered/<sha>. Pass the same "
+     "query/sources, the item id, and confirm=true after the user agrees.",
+     _obj({"id": {"type": "string"}, "query": {"type": "string"},
+           "sources": {"type": "array", "items": {"type": "string", "enum": list(rec.SOURCES)}},
+           "repo": {"type": "string"}, "path": {"type": "string"}, "finder": {"type": "boolean"},
+           "to": {"type": "string", "description": "destination folder"},
+           "confirm": {"type": "boolean", "description": "Must be true"}}, ("id", "confirm")), {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}, t_recover_restore),
+    ("recover_analyze", "Memory cards and external disks: without disk, list connected ones with a quick verdict; with "
+     "disk (e.g. disk4), its filesystems, encryption, SMART status and the honest chance of recovering deleted "
+     "files, with what to do. The Mac's internal SSD is explained as not recoverable by scanning. Read-only.",
+     _obj({"disk": {"type": "string"}}), READ_ONLY, t_recover_analyze),
     ("doctor", "Check prerequisites (system Python, socket visibility, required and optional tools).", _obj(), READ_ONLY, t_doctor),
     ("recent_events", "Recent macguard events (cleanups, watcher alerts) and current settings.",
      _obj({"limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 30}}), READ_ONLY, t_recent_events),
@@ -444,7 +507,7 @@ def handle(msg):
                   "capabilities": {"tools": {"listChanged": False}},
                   "serverInfo": {"name": "mac-cleanup", "version": mg.__version__},
                   "instructions": "Disk cleanup, heavy processes, network history (network_history / network_alerts), security, apps and network checks for this Mac, "
-                                  "plus a dev session security monitor (dev_session, live_connections, process_tree, persistence_changes, lulu_audit, scan_dependencies). Everything "
+                                  "plus a dev session security monitor (dev_session, live_connections, process_tree, persistence_changes, lulu_audit, scan_dependencies) and Tools (recover_search, recover_restore, recover_analyze). Everything "
                                   "is read-only except apply_cleanup and kill_process: show the user the plan or process "
                                   "first and act only after they agree."}
     elif method == "ping":

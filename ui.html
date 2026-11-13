@@ -251,6 +251,16 @@ footer code{font-family:var(--mono)}
 .f .acts{margin-left:auto;display:flex;gap:6px;flex:none}
 .note{padding:0 22px 10px;color:var(--fg-3);font-size:12.5px}
 pre.diff{margin:6px 0 0;padding:10px 12px;border-radius:10px;background:var(--glass-2);font:11.5px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto}
+.toolcards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:0 22px 12px}
+.toolcard{border:1px solid var(--stroke);border-radius:16px;padding:14px 16px;background:var(--glass-2);text-align:left;color:var(--fg);font:inherit;cursor:pointer}
+.toolcard.on{border-color:var(--fg);box-shadow:0 0 0 1px var(--fg) inset}
+.toolcard b{display:block;font-size:15px;margin-bottom:4px}.toolcard small{color:var(--fg-3);font-size:12.5px;line-height:1.45;display:block}
+.toolcard .soon{float:right;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--fg-3)}
+.recsrc{padding:6px 22px 2px;font-weight:600;font-size:13px;color:var(--fg-2)}
+.chance{font-weight:700;text-transform:uppercase;font-size:11px;letter-spacing:.04em;padding:3px 9px;border-radius:999px}
+.chance.good{color:var(--ok);background:color-mix(in srgb,var(--ok) 16%,transparent)}.chance.possible{color:var(--med);background:color-mix(in srgb,var(--med) 16%,transparent)}
+.chance.low,.chance.very{color:var(--hi);background:color-mix(in srgb,var(--hi) 14%,transparent)}.chance.none{color:var(--fg-3);background:var(--glass-2)}
+@media (max-width:820px){.toolcards{grid-template-columns:1fr}}
 @media (max-width:820px){.stats{grid-template-columns:1fr 1fr}.stat.disk{grid-column:1/-1}.netinfo{grid-template-columns:1fr}.netinfo.perfinfo{grid-template-columns:1fr 1fr}}
 @media (max-width:520px){.bar .grow{display:none}.stats{grid-template-columns:1fr 1fr}.items{grid-template-columns:1fr}.hero{padding-top:48px}}
 </style></head>
@@ -322,6 +332,12 @@ pre.diff{margin:6px 0 0;padding:10px 12px;border-radius:10px;background:var(--gl
       <button data-ds="alerts" class="on">Alerts</button><button data-ds="conns">Connections</button><button data-ds="tree">Process tree</button>
       <button data-ds="persist">Persistence</button><button data-ds="lulu">LuLu</button><button data-ds="deps">Packages</button><button data-ds="report">Last report</button></div>
     <div id="devsec" class="empty">Start a session, or open a view to check right now.</div>
+  </section>
+
+  <section class="panel glass" id="toolsPanel">
+    <div class="ph"><span class="ic">🧰</span><div class="grow"><h2>Tools</h2><small>One-off jobs, all on this Mac: recover deleted files, and soon check if a picture or voice was made by AI</small></div></div>
+    <div class="toolcards" id="toolCards"></div>
+    <div id="toolBody"></div>
   </section>
   <section class="panel glass">
     <div class="ph"><span class="ic">📡</span><div class="grow"><h2>Network</h2><small>Open ports, connections, gateway and DNS</small></div>
@@ -1091,5 +1107,82 @@ $("sesBtn").onclick = async () => {
 };
 dsSession();
 setInterval(() => { if (ds.live && !document.hidden) { dsSession(); if (["alerts","conns","tree"].includes(ds.view)) dsShow(ds.view); } }, 4000);
+
+/* ---- Tools ---- */
+let tl = {tools:[], tool:"recover", items:[]};
+const CHANCE = {"good":"Good chance","possible":"Possible","low":"Low","very low":"Very low","none":"Not by scanning"};
+async function loadTools(){
+  try { const r = await api("/api/tools"); tl.tools = r.tools; tl.helpers = r.helpers; } catch(e){ return; }
+  $("toolCards").innerHTML = tl.tools.map(t => `<button class="toolcard ${t.id===tl.tool?"on":""}" data-tool="${esc(t.id)}">
+      ${t.status!=="ready"?'<span class="soon">coming next</span>':""}<b>${esc(t.name)}</b><small>${esc(t.what)}</small></button>`).join("");
+  $("toolCards").querySelectorAll("[data-tool]").forEach(b => b.onclick = () => { tl.tool = b.dataset.tool; loadTools(); });
+  showTool();
+}
+function showTool(){
+  const t = tl.tools.find(x => x.id === tl.tool) || tl.tools[0], el = $("toolBody");
+  if (t.status !== "ready") {
+    el.innerHTML = `<div class="note">${esc(t.name)} is designed and comes next. You'll give it ${esc(t.gives)}; it checks it on this Mac and shows the evidence and how strong it is. It never calls a file "real". Design: <code>${esc(t.doc)}</code></div>`;
+    return;
+  }
+  el.innerHTML = `<div class="legend capform"><input id="recQ" class="search" placeholder="File name, part of a path, or *.jpg (empty = everything)" aria-label="What to find">
+      <input id="recRepo" class="search" placeholder="Git repo folder (optional)" aria-label="Git repository">
+      <button class="btn primary sm" id="recBtn">Search</button></div>
+    <div id="recOut" class="empty">Searches the Trash, editor history (VS Code, Cursor, Windsurf, Antigravity), lost git work and Time Machine. Restoring always makes a copy.</div>
+    <div class="ph" style="padding-top:6px"><span class="ic">💾</span><div class="grow"><h2 style="font-size:16px">Memory cards and disks</h2><small>What's on a card or USB stick, and the honest chance of getting deleted files back</small></div>
+      <button class="btn ghost sm" id="devBtn">Check connected</button></div>
+    <div id="devOut" class="empty">Plug in the card (in a reader), then press Check connected. Stop using a card as soon as you notice missing files.</div>`;
+  $("recBtn").onclick = recSearch; $("recQ").onkeydown = e => { if (e.key === "Enter") recSearch(); };
+  $("devBtn").onclick = recDevices;
+}
+async function recSearch(){
+  const btn = $("recBtn"), out = $("recOut"); busy(btn, true); out.className = "empty"; out.innerHTML = '<span class="spin"></span>';
+  try {
+    const p = new URLSearchParams({q: $("recQ").value.trim()}); const repo = $("recRepo").value.trim(); if (repo) p.set("repo", repo);
+    if (tl.finder) p.set("finder", "1");
+    const r = await api("/api/recover/search?" + p.toString()); tl.items = r.items; out.className = "";
+    const labels = {trash:"Trash", history:"Editor history (older versions)", git:"Git: lost commits and files", timemachine:"Time Machine"};
+    const groups = {}; r.items.forEach((it,i) => (groups[it.source] = groups[it.source] || []).push([it,i]));
+    let h = `<div class="note">${esc(r.headline)}${r.truncated?" (first 500)":""}</div>`;
+    for (const [src, rows] of Object.entries(groups)) {
+      h += `<div class="recsrc">${esc(labels[src]||src)} · ${rows.length}</div><div class="list">` + rows.slice(0,100).map(([it,i]) => `<div class="f"><div class="body">${esc(it.name)}
+        <small>${esc(it.modified||"")}${it.size?" · "+human(it.size):""}${it.original?" · was "+esc(it.original):""}${it.app?" · "+esc(it.app):""}${it.kind==="commit"?" · commit "+esc(it.sha.slice(0,10)):""}</small></div>
+        <div class="acts"><button class="btn ghost sm" data-restore="${i}">${it.kind==="commit"?"Restore as branch":"Restore a copy"}</button></div></div>`).join("") + "</div>";
+    }
+    if (r.notes.length) h += `<div class="note">${r.notes.map(esc).join("<br>")}</div>`;
+    if (r.notes.some(n => n.includes("protects the Trash")) && !tl.finder) h += `<div class="note"><button class="btn ghost sm" id="finderBtn">Read the Trash through Finder</button> macOS may ask once to allow it.</div>`;
+    h += `<div class="note"><b>Also look here</b><br>${r.guidance.map(g => `${esc(g.source)}: ${esc(g.where)} · ${esc(g.detail)}`).join("<br>")}<br>${r.next.map(esc).join("<br>")}</div>`;
+    out.innerHTML = h;
+    out.querySelectorAll("[data-restore]").forEach(b => b.onclick = () => recRestore(tl.items[+b.dataset.restore], b));
+    if ($("finderBtn")) $("finderBtn").onclick = () => { tl.finder = true; recSearch(); };
+  } catch(e){ out.textContent = "Failed: " + e.message; }
+  busy(btn, false, "Search");
+}
+async function recRestore(it, btn){
+  const to = prompt(`Restore a copy of "${it.name}".\n\nNothing is moved or overwritten. Copy it to this folder:`, "~/Downloads/Recovered");
+  if (to === null) return;
+  busy(btn, true);
+  try { const r = await api("/api/recover/restore", {id: it.id, to}); toast((r.ok ? "✔ " : "✘ ") + r.detail);
+        if (r.ok && r.path && r.path.startsWith("/")) api("/api/devsec/reveal", {path: r.path}).catch(()=>{}); }
+  catch(e){ toast("Restore failed: " + e.message); }
+  busy(btn, false);
+}
+async function recDevices(){
+  const btn = $("devBtn"), out = $("devOut"); busy(btn, true); out.className = "empty"; out.innerHTML = '<span class="spin"></span>';
+  try {
+    const r = await api("/api/recover/devices"); out.className = "";
+    out.innerHTML = r.devices.length ? `<div class="list">` + r.devices.map(d => `<div class="f"><span class="chance ${esc(d.chance.split(" ")[0])}">${esc(CHANCE[d.chance]||d.chance)}</span>
+        <div class="body">${esc(d.name||d.id)} <span style="color:var(--fg-3)">${esc(d.id)} · ${human(d.size)} · ${esc(d.protocol)}</span>
+        <small>${d.volumes.map(v => `${esc(v.name||v.id)}: ${esc(v.fs)}${v.encrypted?", encrypted":""}`).join(" · ")} — ${esc(d.why)}</small></div>
+        <div class="acts"><button class="btn ghost sm" data-disk="${esc(d.id)}">Details</button></div></div>`).join("") + "</div>"
+      : '<div class="empty">No external disks or memory cards connected.</div>';
+    out.querySelectorAll("[data-disk]").forEach(b => b.onclick = async () => {
+      const a = await api("/api/recover/analyze?disk=" + encodeURIComponent(b.dataset.disk));
+      b.closest(".f").insertAdjacentHTML("afterend", `<div class="note"><b>${esc(a.headline)}</b><br>${a.evidence.map(e => esc(e.detail)).join("<br>")}<br><br><b>What to do</b><br>${a.next.map(esc).join("<br>")}<br><small>${a.limits.map(esc).join(" ")}</small></div>`);
+      b.remove();
+    });
+  } catch(e){ out.textContent = "Failed: " + e.message; }
+  busy(btn, false, "Check again");
+}
+loadTools();
 </script>
 </body></html>

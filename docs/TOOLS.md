@@ -1,6 +1,6 @@
 # Tools: design
 
-**Status:** design, 13 Nov 2026. Nothing is built yet.
+**Status:** the Tools section and Recover files R1 are built (`macguard_tools.py`, `macguard_recover.py`). The AI image and voice checks are next.
 
 Mac Cleanup gets a **Tools** section: one-off utilities you open when you need them, next to the existing
 cleanup, security and monitoring parts. Every tool runs on your Mac. You give it something (a memory card, a photo,
