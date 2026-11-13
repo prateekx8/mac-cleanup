@@ -43,8 +43,8 @@ def fake_run(table, calls=None):
 class TestToolsRegistry(unittest.TestCase):
     def test_tools_and_result_shape(self):
         ids = [t["id"] for t in mtools.TOOLS]
-        self.assertEqual(ids, ["recover", "ai-image", "ai-voice"])
-        self.assertEqual([t["status"] for t in mtools.TOOLS], ["ready", "planned", "planned"])
+        self.assertEqual(ids, ["recover", "ai-image", "ai-voice", "photo-sort"])
+        self.assertEqual([t["status"] for t in mtools.TOOLS], ["ready", "planned", "planned", "planned"])
         r = mtools.result("recover", "found", "x", "strong", evidence=[{"kind": "trash"}])
         self.assertEqual(set(r), {"tool", "verdict", "headline", "confidence", "evidence", "limits", "next"})
         with self.assertRaises(AssertionError):
