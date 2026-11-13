@@ -1,5 +1,7 @@
 # Support and troubleshooting
 
+**Installing for the first time, or stuck installing?** The [step-by-step install guide](INSTALL.md) walks through it and has the full [troubleshooting tables](INSTALL.md#troubleshooting) (installer, app, web UI, dev session security).
+
 Start here every time:
 
 ```bash
@@ -16,7 +18,9 @@ The support bundle holds check results, your settings and the last 50 watch even
 | `zsh: command not found: macguard` | The command isn't installed | Run `./setup.sh`, then open a new terminal |
 | Network section is empty or shows "0 sockets" | macOS hides sockets from untrusted interpreters | Use `/usr/bin/python3` (the `macguard` command does this for you). In the app, rebuild it with `./build_app.sh` |
 | `doctor`: "System python" fails | Command Line Tools missing | `xcode-select --install` |
-| App says "The cleanup engine did not start" | Engine crashed | Read `~/.macguard/app.log` |
+| App says "The cleanup engine did not start" | Engine crashed | The page shows the last log lines and the steps; or read `~/.macguard/app.log` |
+| Dev session security panel says *Failed* in the app | App built before the feature | `./build_app.sh --install` |
+| `macguard: the mac-cleanup folder is gone` | Folder moved | Run `./setup.sh` from its new place |
 | App won't open: "unidentified developer" | Ad-hoc signed local build | Right-click the app, choose **Open**, then confirm once |
 | Docker installer cleanup does nothing | Docker Desktop is running | Quit Docker Desktop first |
 | Simulator cleanup shows 0 | No simulators are unavailable | Nothing to do |

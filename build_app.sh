@@ -16,6 +16,11 @@ MIN_OS=13.0
 rm -rf "$BUILD" "$APP" "$DIST/MacCleanup.dmg"
 mkdir -p "$BUILD" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+for t in swiftc lipo iconutil sips codesign hdiutil; do
+  command -v "$t" >/dev/null || { echo "Missing $t: install Apple's Command Line Tools (xcode-select --install), then retry."
+                                  echo "The CLI and web UI work without the app: ./setup.sh, then macguard ui"; exit 1; }
+done
+
 echo "==> Compiling native wrapper"
 for arch in arm64 x86_64; do
   swiftc -O -swift-version 5 -target "$arch-apple-macos$MIN_OS" -o "$BUILD/MacCleanup-$arch" "$DIR/app/main.swift"
@@ -33,7 +38,11 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 echo "==> Bundling engine"
-cp "$DIR/macguard.py" "$DIR/macguard_mcp.py" "$DIR/macguard_capture.py" "$DIR/ui.html" "$APP/Contents/Resources/"
+# every engine module (macguard.py loads the others on demand) plus the page
+cp "$DIR"/macguard*.py "$DIR/ui.html" "$APP/Contents/Resources/"
+# fail the build, not the user's first click, if a module is missing or broken
+/usr/bin/python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import macguard, macguard_mcp, macguard_capture, macguard_devsec" \
+  "$APP/Contents/Resources" || { echo "The bundled engine does not import; see the error above."; exit 1; }
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
