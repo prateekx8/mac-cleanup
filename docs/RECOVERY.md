@@ -1,6 +1,6 @@
 # Data recovery: research and design
 
-**Status:** research and design, 13 Nov 2026. Nothing is built yet. This is the plan we develop against.
+**Status:** R1 (light recovery and analyze) is built: `macguard recover`, the Recover files card, MCP `recover_*`, `macguard_recover.py`. R2–R4 are the plan below.
 It's the first tool in the new **Tools** section ([TOOLS.md](TOOLS.md)), which also gets the AI image and voice checks.
 
 **Goal:** help people get back files they deleted by mistake, on the Mac and on memory cards (SD, microSD, USB

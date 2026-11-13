@@ -177,6 +177,16 @@ If `macguard` itself is not found, use the full path instead: `/usr/bin/python3 
 | The file monitor says `files: polling` | FSEvents couldn't start, so it falls back to checking modification times. It is slower but still works. |
 | Lots of *"connects to an IP with no DNS name"* notes | These are info only. Many cloud services have no reverse DNS name. Warnings and critical alerts are what matter. |
 
+### Tools › Recover files
+
+| What you see | Fix |
+|---|---|
+| *macOS protects the Trash, so it wasn't searched* | Press **Read the Trash through Finder** (or add `--finder`). macOS asks once to let Mac Cleanup (or your terminal) control Finder: allow it. Or give Full Disk Access in **System Settings › Privacy & Security › Full Disk Access**. |
+| *Finder didn't answer in time* | A permission prompt may be waiting: answer it, then search again. A very large Trash is faster to search in Finder itself. |
+| *Time Machine isn't set up* | Nothing to restore from backups. Turn on Time Machine for next time; check iCloud's and Photos' Recently Deleted now. |
+| A memory card shows *Not by scanning* or *Very low* | It's the Mac's internal SSD or an encrypted APFS disk: deleted files there can't be found by scanning. Use backups. |
+| My memory card isn't listed | Use a card reader, check it shows in Finder or `diskutil list external`, then press **Check again**. |
+
 ### Still stuck?
 
 1. `macguard doctor --bundle`. It writes `~/.macguard/support-<time>.txt` with check results and settings, and no file contents or secrets. Read it before sharing.

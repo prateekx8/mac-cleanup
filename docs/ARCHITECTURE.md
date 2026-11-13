@@ -17,7 +17,8 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
 | Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and a quick self-check (`--app` builds the app, `--test` runs the suite). Every failure prints a `fix:` line; output goes to `~/.macguard/setup.log`. Walkthrough: [INSTALL.md](INSTALL.md). |
 | Dev session security | `macguard_devsec.py` | Network, process, persistence, sensitive-file, LuLu and npm monitors, and the session that runs them (`session`, `net --live`, `procs --tree`, `persist`, `scan-deps`, `lulu`, `alerts`). |
-| Tests | `tests/test_macguard.py`, `test_mcp.py`, `test_capture.py`, `test_devsec.py`, `test_install.py` | 263 tests (all files): unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tools | `macguard_tools.py`, `macguard_recover.py` | The Tools registry and shared result shape; Recover files R1 (`tools`, `recover`) |
+| Tests | `tests/test_macguard.py`, `test_mcp.py`, `test_capture.py`, `test_devsec.py`, `test_install.py`, `test_recover.py` | 286 tests (all files): unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 
@@ -151,6 +152,12 @@ flowchart LR
 - `lulu_rules()` decodes LuLu's `NSKeyedArchiver` plist with `plistlib` (UIDs resolved by hand). It never writes to it; reminders live in `devsec/lulu_tags.json`.
 - `scan_deps()` reads lockfiles offline. `osv_query()` sends `{package: {name, ecosystem: npm}, version}` in batches of 500, and `osv_details()` fetches summaries for at most 40 IDs.
 
+### Tools › Recover files (`macguard_recover.py`, phase R1)
+
+- `search()` collects items from four sources into one list: `search_trash()` (direct listing; when macOS blocks `~/.Trash`, it says so, and reads it through Finder only when asked: a 15 s count first, refusing above 2,000 items, then one bulk `alias list` call, because asking Finder per item takes minutes), `search_history()` (VS Code-style `User/History/*/entries.json` for Code, Cursor, Windsurf, Antigravity, VSCodium), `search_git()` (`git fsck --unreachable --no-reflogs`: commits lost to resets or deleted branches, and blobs that were staged then lost) and `timemachine_versions()` (a path inside each `tmutil listbackups` backup). It adds `local_snapshots()` (Time Machine ones only) and fixed guidance for iCloud Drive, Photos and Notes.
+- Every item has an id (a hash of source and path). `restore()` copies into a folder (default `~/Downloads/Recovered <date>`), never moves, never overwrites (`name (2).ext`), refuses the Trash and system folders, turns a commit into branch `recovered/<sha>` and a blob into a file. The UI restores only items from its last search (409 otherwise), like `/api/clean`.
+- `analyze()` reads `diskutil info/list -plist`, follows APFS physical stores to their containers, and gives a chance per volume: internal SSD = none (encryption and TRIM), encrypted APFS = very low, APFS on SSD = low, FAT/exFAT cards = good. Identifiers must match `disk\d+(s\d+)*`. Nothing here opens a raw device.
+
 ## Web UI security
 
 The UI server binds to **127.0.0.1 only**. Every API call needs:
@@ -194,6 +201,7 @@ sequenceDiagram
 | `devsec/sessions/<id>/` | `persist-start.json`, `persist-end.json`, `events.jsonl`, `connections.json`, `projects.json`, `orphans.json`, `report.json`, `report.md`, `monitor.log` |
 | `devsec/alerts.jsonl` (+ `.1`–`.5`) | every dev session alert, rotated at 1 MB |
 | `devsec/baselines.json`, `dns.json`, `persistence.json`, `lulu_tags.json` | project destinations, reverse-DNS cache, `persist` baseline, LuLu reminders |
+| `~/Downloads/Recovered <date>/` | copies restored by Recover files (outside `~/.macguard`, where you'll look for them) |
 
 ## Design decisions
 
