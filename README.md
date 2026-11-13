@@ -26,22 +26,27 @@ Standard-library Python plus a small Swift wrapper. No root, no telemetry, nothi
 
 ## Quick start
 
+**New to Terminal? Follow the [step-by-step install guide](docs/INSTALL.md)**, which also covers every common install problem.
+
 ```bash
 git clone https://github.com/prateekx8/mac-cleanup.git
 cd mac-cleanup
-./setup.sh                      # checks prerequisites, installs `macguard`, runs the tests
-./build_app.sh --install        # optional: native Mac Cleanup.app in /Applications
+./setup.sh            # a few seconds: checks prerequisites, installs `macguard`, runs a self-check
+./setup.sh --app      # optional: also builds the native Mac Cleanup.app into /Applications
 ```
 
-Requirements: macOS 13 or later, plus Apple's Command Line Tools (`xcode-select --install`) for `/usr/bin/python3` and `swiftc`.
+Then open a **new** Terminal window and run `macguard doctor`. Every ✘ line says how to fix it.
+
+Requirements: macOS 13 or later, plus Apple's Command Line Tools for `/usr/bin/python3` and `swiftc`. If they're missing, `setup.sh` opens Apple's installer for you.
 
 | I want… | Do this |
 |---|---|
-| The app | `./build_app.sh --install`, then open **Mac Cleanup** from Applications (or use `dist/MacCleanup.dmg`) |
+| The app | `./setup.sh --app`, then open **Mac Cleanup** from Applications |
 | One-click setup and the UI | Double-click **`MacCleanup.command`** in Finder |
 | The CLI | `./setup.sh`, then open a new terminal and run `macguard --help` |
+| Help with an install problem | [docs/INSTALL.md › Troubleshooting](docs/INSTALL.md#troubleshooting), or `macguard doctor` |
 
-`setup.sh` checks prerequisites (macOS, Apple's Command Line Tools for `/usr/bin/python3`, system tools), installs the `macguard` command into `~/.local/bin`, runs `macguard doctor` and the test suite. It's safe to re-run. `./setup.sh --uninstall` removes everything.
+`setup.sh` is safe to re-run. It prints numbered steps, and any failure comes with a `fix:` line; the full output is saved to `~/.macguard/setup.log`. `--test` also runs the full test suite. `./setup.sh --uninstall` removes everything.
 
 ## CLI
 
@@ -170,7 +175,7 @@ Every alert has a severity (**info**, **warning**, **critical**), is written to 
 ## Development
 
 ```bash
-/usr/bin/python3 -m unittest discover -s tests -v   # 251 tests
+/usr/bin/python3 -m unittest discover -s tests -v   # 263 tests
 ./build_app.sh                                      # dist/Mac Cleanup.app + dist/MacCleanup.dmg
 ```
 
@@ -178,6 +183,7 @@ Unit tests run against temporary directories and mocked system commands. They ne
 
 ## Docs
 
+- [Install guide and troubleshooting](docs/INSTALL.md)
 - [Architecture](docs/ARCHITECTURE.md): components, data flow, UI security model, app process model, with a [diagram](docs/architecture.png)
 - [Support and troubleshooting](docs/SUPPORT.md)
 

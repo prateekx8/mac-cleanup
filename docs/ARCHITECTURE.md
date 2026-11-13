@@ -15,9 +15,9 @@ mac-cleanup is one Python module (`macguard.py`, standard library only) with fou
 | Native app | `app/main.swift` | An AppKit window with a `WKWebView`. It starts the engine and shows the UI. |
 | App icon | `app/make_icon.swift` | Draws the original icon (gradient squircle with a sparkle) at build time. |
 | Packaging | `build_app.sh` | Builds a universal `Mac Cleanup.app` (arm64 + x86_64), ad-hoc signs it, and makes a DMG. |
-| Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and the tests. |
+| Setup | `setup.sh`, `MacCleanup.command` | Checks prerequisites, installs the `macguard` command, runs `doctor` and a quick self-check (`--app` builds the app, `--test` runs the suite). Every failure prints a `fix:` line; output goes to `~/.macguard/setup.log`. Walkthrough: [INSTALL.md](INSTALL.md). |
 | Dev session security | `macguard_devsec.py` | Network, process, persistence, sensitive-file, LuLu and npm monitors, and the session that runs them (`session`, `net --live`, `procs --tree`, `persist`, `scan-deps`, `lulu`, `alerts`). |
-| Tests | `tests/test_macguard.py`, `test_mcp.py`, `test_capture.py`, `test_devsec.py` | 251 tests (all files): unit tests on temp dirs and mocked system calls, plus live read-only checks. |
+| Tests | `tests/test_macguard.py`, `test_mcp.py`, `test_capture.py`, `test_devsec.py`, `test_install.py` | 263 tests (all files): unit tests on temp dirs and mocked system calls, plus live read-only checks. |
 
 ## Engines inside `macguard.py`
 

@@ -70,8 +70,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     func startServer() {
         guard let res = Bundle.main.resourcePath else { return fail("Missing app resources.") }
         let python = "/usr/bin/python3"
-        guard FileManager.default.isExecutableFile(atPath: python) else {
-            return fail("Python is missing. Install Apple's Command Line Tools:\n\nxcode-select --install")
+        // /usr/bin/python3 always exists, but without the Command Line Tools it is only a stub
+        // that pops up Apple's installer, so check for the tools themselves.
+        guard FileManager.default.isExecutableFile(atPath: python), launch("/usr/bin/xcode-select", ["-p"]) == 0 else {
+            launch("/usr/bin/xcode-select", ["--install"])
+            return fail("Mac Cleanup needs Apple's Command Line Tools (they include Python).\n\n"
+                        + "1. Click Install in the window that just opened (5–10 minutes).\n"
+                        + "2. Open Mac Cleanup again.\n\nNo window? In Terminal run: xcode-select --install")
         }
         port = freePort()
         let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".macguard")
@@ -89,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
               (try? data.write(to: path)) != nil else { return fail("Could not write ~/.macguard/ui-session.plist") }
         launchctl(["bootout", "gui/\(getuid())/\(label)"])
         if launchctl(["bootstrap", "gui/\(getuid())", path.path]) != 0 {
-            return fail("Could not start the cleanup engine.\nSee ~/.macguard/app.log")
+            return fail("Could not start the cleanup engine.", showLog: true)
         }
         waitForServer(tries: 80)
     }
@@ -101,15 +106,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 guard let self = self else { return }
                 if (resp as? HTTPURLResponse)?.statusCode == 200 { self.web.load(URLRequest(url: url)) }
                 else if tries > 0 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.waitForServer(tries: tries - 1) } }
-                else { self.fail("The cleanup engine did not start.\nSee ~/.macguard/app.log") }
+                else { self.fail("The cleanup engine did not start.", showLog: true) }
             }
         }.resume()
     }
 
     @discardableResult
-    func launchctl(_ args: [String]) -> Int32 {
+    func launchctl(_ args: [String]) -> Int32 { launch("/bin/launchctl", args) }
+
+    @discardableResult
+    func launch(_ tool: String, _ args: [String]) -> Int32 {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.executableURL = URL(fileURLWithPath: tool)
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
@@ -131,8 +139,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         return Int(UInt16(bigEndian: addr.sin_port))
     }
 
-    func fail(_ msg: String) {
-        web?.loadHTMLString(loadingPage(msg.replacingOccurrences(of: "\n", with: "<br>")), baseURL: nil)
+    func fail(_ msg: String, showLog: Bool = false) {
+        func esc(_ t: String) -> String {
+            t.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+        }
+        var html = "<div style='max-width:560px;text-align:left;line-height:1.55'><b style='font-size:17px'>"
+            + esc(msg).replacingOccurrences(of: "\n", with: "<br>") + "</b>"
+        if showLog {
+            let log = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".macguard/app.log")
+            let tail = ((try? String(contentsOf: log, encoding: .utf8)) ?? "")
+                .split(separator: "\n", omittingEmptySubsequences: false).suffix(12).joined(separator: "\n")
+            html += "<p>Try these in order:</p><ol>"
+                + "<li>Quit Mac Cleanup and open it again.</li>"
+                + "<li>In Terminal, in the mac-cleanup folder: <code>./setup.sh</code> then <code>macguard doctor</code>. "
+                + "Every ✘ line says how to fix it.</li>"
+                + "<li>Rebuild the app: <code>./build_app.sh --install</code>.</li>"
+                + "<li>Still stuck? <code>macguard doctor --bundle</code> and attach the file to a bug report.</li></ol>"
+                + "<p>Guide: <code>docs/INSTALL.md</code>, section Troubleshooting.</p>"
+            if !tail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                html += "<p>Last lines of ~/.macguard/app.log:</p><pre style='white-space:pre-wrap;font:11px Menlo;"
+                    + "background:rgba(127,127,127,.12);padding:10px;border-radius:8px'>" + esc(tail) + "</pre>"
+            }
+        }
+        web?.loadHTMLString(loadingPage(html + "</div>"), baseURL: nil)
     }
 
     // MARK: JS dialogs (confirm before deleting)
